@@ -1,0 +1,12 @@
+[package]
+name = "texplorer-ops"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Asynchronous file operations engine, conflict resolution, and Undo/Redo history for TExplorer"
+
+[dependencies]
+futures-channel.workspace = true
+texplorer-platform = { path = "../texplorer-platform" }
+uuid.workspace = true

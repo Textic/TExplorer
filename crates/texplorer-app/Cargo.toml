@@ -17,10 +17,13 @@ dirs.workspace = true
 futures-channel.workspace = true
 futures-util.workspace = true
 gpui-kit.workspace = true
+image.workspace = true
 reqwest.workspace = true
 serde.workspace = true
 sha2.workspace = true
+smallvec.workspace = true
 texplorer-core = { path = "../texplorer-core" }
+texplorer-ops = { path = "../texplorer-ops" }
 texplorer-platform = { path = "../texplorer-platform" }
 texplorer-vfs = { path = "../texplorer-vfs" }
 tokio.workspace = true

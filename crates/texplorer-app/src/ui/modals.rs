@@ -52,23 +52,6 @@ pub fn render_active_modal(
     modal: &ActiveModal,
     cx: &mut Context<Workspace>,
 ) -> impl IntoElement {
-    let backdrop = div()
-        .id("modal-overlay")
-        .absolute()
-        .inset_0()
-        .flex()
-        .items_center()
-        .justify_center()
-        .bg(gpui_kit::hsla(0.0, 0.0, 0.0, 0.62))
-        .on_mouse_down(
-            MouseButton::Left,
-            cx.listener(|this, _: &MouseDownEvent, window, cx| {
-                if !window.default_prevented() {
-                    this.close_modal(cx);
-                }
-            }),
-        );
-
     let card = match modal {
         ActiveModal::Settings => render_settings_card(ws, cx).into_any_element(),
         ActiveModal::TextPrompt {
@@ -82,7 +65,44 @@ pub fn render_active_modal(
         }
     };
 
-    backdrop.child(card)
+    div()
+        .id("modal-overlay")
+        .absolute()
+        .inset_0()
+        .flex()
+        .items_center()
+        .justify_center()
+        .occlude()
+        .child(
+            div()
+                .id("modal-backdrop")
+                .absolute()
+                .inset_0()
+                .bg(gpui_kit::hsla(0.0, 0.0, 0.0, 0.65))
+                .occlude()
+                .on_scroll(|_, _, cx| {
+                    cx.stop_propagation();
+                })
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _: &MouseDownEvent, _, cx| {
+                        this.close_modal(cx);
+                    }),
+                )
+                .on_mouse_down(
+                    MouseButton::Right,
+                    cx.listener(|this, _: &MouseDownEvent, _, cx| {
+                        this.close_modal(cx);
+                    }),
+                )
+                .on_mouse_down(
+                    MouseButton::Middle,
+                    cx.listener(|this, _: &MouseDownEvent, _, cx| {
+                        this.close_modal(cx);
+                    }),
+                ),
+        )
+        .child(div().relative().occlude().child(card))
 }
 
 fn render_text_prompt_card(
@@ -99,9 +119,7 @@ fn render_text_prompt_card(
         .border_color(solid(BORDER))
         .rounded(px(RADIUS_ROW))
         .overflow_hidden()
-        .on_mouse_down(MouseButton::Left, |_, window, _| {
-            window.prevent_default();
-        })
+        .occlude()
         .child(
             h_flex()
                 .w_full()
@@ -199,9 +217,7 @@ fn render_delete_confirm_card(paths: &[PathBuf], cx: &mut Context<Workspace>) ->
         .border_color(solid(BORDER))
         .rounded(px(RADIUS_ROW))
         .overflow_hidden()
-        .on_mouse_down(MouseButton::Left, |_, window, _| {
-            window.prevent_default();
-        })
+        .occlude()
         .child(
             h_flex()
                 .w_full()
@@ -333,9 +349,7 @@ fn render_settings_card(ws: &Workspace, cx: &mut Context<Workspace>) -> impl Int
         .border_color(solid(BORDER))
         .rounded(px(RADIUS_ROW))
         .overflow_hidden()
-        .on_mouse_down(MouseButton::Left, |_, window, _| {
-            window.prevent_default();
-        })
+        .occlude()
         // Header
         .child(
             h_flex()

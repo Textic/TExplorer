@@ -1,10 +1,13 @@
 use std::ops::Range;
+use std::path::PathBuf;
 
 use gpui_kit::{
-    Context, MouseButton, MouseDownEvent, SharedString,
+    Context, ExternalPaths, MouseButton, MouseDownEvent, ObjectFit, Render, SharedString, Window,
     assets::IconName as LucideIcon,
-    component::{Icon, Sizable as _, Size, StyledExt as _, h_flex, scroll::ScrollableElement as _, v_flex},
-    div, prelude::*, px, relative, uniform_list,
+    component::{
+        Icon, Sizable as _, Size, StyledExt as _, h_flex, scroll::ScrollableElement as _, v_flex,
+    },
+    div, img, prelude::*, px, relative, uniform_list,
 };
 use texplorer_core::{EntryFlags, Location, PaneSide, SortColumn, SortSpec};
 
@@ -16,8 +19,45 @@ use crate::theme::{
 use crate::ui::context_menu::ContextMenuTarget;
 use crate::ui::workspace::Workspace;
 
-/// Renders the "Home / This PC" overview dashboard with Quick Access cards,
-/// Pinned folders, and storage drive cards with real usage bars.
+/// Drag payload for internal file/folder drag & drop (into folders or across Dual-Pane).
+#[derive(Clone)]
+pub struct DraggedEntries {
+    pub paths: Vec<PathBuf>,
+    pub label: SharedString,
+}
+
+struct DragBadgeView {
+    label: SharedString,
+    accent_hex: u32,
+}
+
+impl Render for DragBadgeView {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        h_flex()
+            .px_2p5()
+            .py_1()
+            .gap_1p5()
+            .items_center()
+            .rounded(px(RADIUS_CONTROL))
+            .bg(solid(BG_ELEVATED))
+            .border_1()
+            .border_color(solid(self.accent_hex))
+            .child(
+                Icon::new(LucideIcon::FolderOpen)
+                    .xsmall()
+                    .text_color(solid(self.accent_hex)),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .font_medium()
+                    .text_color(solid(TEXT_PRIMARY))
+                    .child(self.label.clone()),
+            )
+    }
+}
+
+/// Renders the "Home / This PC" overview dashboard with Quick Access cards and Drive cards.
 pub fn render_home_view(
     ws: &Workspace,
     side: PaneSide,
@@ -42,7 +82,6 @@ pub fn render_home_view(
         .overflow_y_scrollbar()
         .p_5()
         .gap_6()
-        // Quick Access grid (respects user-hidden folders; right-click to remove)
         .when(!visible_quick_access.is_empty(), |el| {
             el.child(
                 v_flex()
@@ -161,7 +200,6 @@ pub fn render_home_view(
                     ),
             )
         })
-        // Devices & Drives grid
         .child(
             v_flex()
                 .gap_2p5()
@@ -274,12 +312,7 @@ pub fn render_home_view(
                                         .rounded(px(3.))
                                         .bg(solid(BG_BASE))
                                         .overflow_hidden()
-                                        .child(
-                                            div()
-                                                .h_full()
-                                                .w(relative(frac))
-                                                .bg(solid(bar_hex)),
-                                        ),
+                                        .child(div().h_full().w(relative(frac)).bg(solid(bar_hex))),
                                 )
                                 .child(
                                     h_flex()
@@ -304,7 +337,7 @@ pub fn render_home_view(
         )
 }
 
-/// Renders the virtualized tabular Details view (`28px` uniform rows + sortable headers).
+/// Renders the virtualized tabular Details view (`28px` uniform rows + Drag & Drop).
 pub fn render_details_view(
     ws: &Workspace,
     side: PaneSide,
@@ -319,15 +352,36 @@ pub fn render_details_view(
     let sort = model.sort;
     let is_loading = model.loading;
     let error = model.error.clone();
+    let pane_dir = model.location.as_local_path().map(|p| p.to_path_buf());
+    let accent_hex = ws.settings.accent.primary_hex();
     let list_id = match side {
         PaneSide::Left => "details-list-left",
         PaneSide::Right => "details-list-right",
     };
 
+    let pane_dir_int = pane_dir.clone();
+    let pane_dir_ext = pane_dir;
+
     v_flex()
         .size_full()
         .bg(solid(BG_BASE))
         .overflow_hidden()
+        .drag_over::<DraggedEntries>(move |style, _, _, _| {
+            style.border_1().border_color(solid(accent_hex))
+        })
+        .drag_over::<ExternalPaths>(move |style, _, _, _| {
+            style.border_1().border_color(solid(accent_hex))
+        })
+        .on_drop(cx.listener(move |this, drag: &DraggedEntries, window, cx| {
+            if let Some(ref dest) = pane_dir_int {
+                this.handle_dropped_paths(drag.paths.clone(), dest.clone(), false, window, cx);
+            }
+        }))
+        .on_drop(cx.listener(move |this, ext: &ExternalPaths, window, cx| {
+            if let Some(ref dest) = pane_dir_ext {
+                this.handle_dropped_paths(ext.paths().to_vec(), dest.clone(), true, window, cx);
+            }
+        }))
         .on_mouse_down(
             MouseButton::Right,
             cx.listener(move |this, ev: &MouseDownEvent, window, cx| {
@@ -336,7 +390,6 @@ pub fn render_details_view(
                 }
             }),
         )
-        // Elevated 30px sortable column header bar
         .child(
             h_flex()
                 .w_full()
@@ -409,12 +462,14 @@ fn render_details_rows(
     range: Range<usize>,
     cx: &mut Context<Workspace>,
 ) -> Vec<gpui_kit::AnyElement> {
+    let accent = ws.settings.accent;
+    let unit = ws.settings.size_unit;
+    let accent_hex = accent.primary_hex();
+
     let Some(tab) = ws.active_tab() else {
         return Vec::new();
     };
     let model = tab.model.pane(side);
-    let accent = ws.settings.accent;
-    let unit = ws.settings.size_unit;
 
     range
         .filter_map(|vis_idx| {
@@ -423,6 +478,9 @@ fn render_details_rows(
             let is_cursor = model.selection.cursor == Some(vis_idx);
             let (icon, icon_hex) = file_kind_visual(entry.kind, accent);
             let is_hidden = entry.is_hidden();
+            let local_path = entry.location.as_local_path().map(|p| p.to_path_buf());
+            let is_cut = local_path.as_ref().is_some_and(|p| ws.is_path_cut(p));
+            let is_dir = entry.is_dir();
             let name: SharedString = entry.name.clone().into();
             let modified: SharedString = format_timestamp(entry.modified_secs).into();
             let type_label: SharedString = entry.type_label.clone().into();
@@ -432,129 +490,171 @@ fn render_details_rows(
             };
             let is_symlink = entry.flags.contains(EntryFlags::IS_SYMLINK);
             let row_bg = if selected {
-                soft_tint(accent.primary_hex(), 0.16)
+                soft_tint(accent_hex, 0.16)
             } else if vis_idx % 2 == 1 {
                 solid(BG_SURFACE)
             } else {
                 solid(BG_BASE)
             };
 
-            Some(
-                h_flex()
-                    .id((
-                        match side {
-                            PaneSide::Left => "det-row-l",
-                            PaneSide::Right => "det-row-r",
-                        },
-                        vis_idx,
-                    ))
-                    .w_full()
-                    .h(px(28.))
-                    .px_2p5()
-                    .items_center()
-                    .cursor_pointer()
-                    .bg(row_bg)
-                    .border_b_1()
-                    .border_color(if is_cursor && selected {
-                        solid(accent.primary_hex())
+            let drag_payload = build_drag_payload(ws, side, local_path.as_ref(), &entry.name);
+            let drop_dir_int = if is_dir { local_path.clone() } else { None };
+            let drop_dir_ext = drop_dir_int.clone();
+
+            let row = h_flex()
+                .id((
+                    match side {
+                        PaneSide::Left => "det-row-l",
+                        PaneSide::Right => "det-row-r",
+                    },
+                    vis_idx,
+                ))
+                .w_full()
+                .h(px(28.))
+                .px_2p5()
+                .items_center()
+                .cursor_pointer()
+                .bg(row_bg)
+                .border_b_1()
+                .border_color(if is_cursor && selected {
+                    solid(accent_hex)
+                } else {
+                    gpui_kit::transparent_black()
+                })
+                .hover(move |s| {
+                    if selected {
+                        s
                     } else {
-                        gpui_kit::transparent_black()
+                        s.bg(solid(BG_ELEVATED))
+                    }
+                })
+                .when_some(drag_payload, |el, payload| {
+                    el.on_drag(payload, move |drag, _, _, cx| {
+                        cx.new(|_| DragBadgeView {
+                            label: drag.label.clone(),
+                            accent_hex,
+                        })
                     })
-                    .hover(move |s| {
-                        if selected {
-                            s
-                        } else {
-                            s.bg(solid(BG_ELEVATED))
-                        }
+                })
+                .when_some(drop_dir_int, |el, dest| {
+                    el.drag_over::<DraggedEntries>(move |style, _, _, _| {
+                        style.bg(soft_tint(accent_hex, 0.22))
                     })
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(move |this, ev: &MouseDownEvent, window, cx| {
-                            this.handle_entry_left_click(side, vis_idx, ev, window, cx);
-                        }),
-                    )
-                    .on_mouse_down(
-                        MouseButton::Right,
-                        cx.listener(move |this, ev: &MouseDownEvent, window, cx| {
-                            window.prevent_default();
-                            this.handle_entry_right_click(side, vis_idx, ev.position, cx);
-                        }),
-                    )
-                    // Name column
-                    .child(
-                        h_flex()
-                            .flex_1()
-                            .min_w_0()
-                            .pr_2()
-                            .gap_2()
-                            .items_center()
-                            .child(
-                                Icon::new(icon).small().text_color(if is_hidden {
-                                    solid(TEXT_MUTED)
-                                } else {
-                                    solid(icon_hex)
-                                }),
-                            )
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .truncate()
-                                    .text_xs()
-                                    .text_color(if is_hidden {
-                                        solid(TEXT_SECONDARY)
-                                    } else {
-                                        solid(TEXT_PRIMARY)
-                                    })
-                                    .child(name),
-                            )
-                            .when(is_symlink, |el| {
-                                el.child(
-                                    Icon::new(LucideIcon::Link)
-                                        .xsmall()
-                                        .text_color(solid(TEXT_MUTED)),
-                                )
+                    .on_drop(cx.listener(
+                        move |this, drag: &DraggedEntries, window, cx| {
+                            cx.stop_propagation();
+                            this.handle_dropped_paths(
+                                drag.paths.clone(),
+                                dest.clone(),
+                                false,
+                                window,
+                                cx,
+                            );
+                        },
+                    ))
+                })
+                .when_some(drop_dir_ext, |el, dest| {
+                    el.drag_over::<ExternalPaths>(move |style, _, _, _| {
+                        style.bg(soft_tint(accent_hex, 0.22))
+                    })
+                    .on_drop(cx.listener(
+                        move |this, ext: &ExternalPaths, window, cx| {
+                            cx.stop_propagation();
+                            this.handle_dropped_paths(
+                                ext.paths().to_vec(),
+                                dest.clone(),
+                                true,
+                                window,
+                                cx,
+                            );
+                        },
+                    ))
+                })
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, ev: &MouseDownEvent, window, cx| {
+                        this.handle_entry_left_click(side, vis_idx, ev, window, cx);
+                    }),
+                )
+                .on_mouse_down(
+                    MouseButton::Right,
+                    cx.listener(move |this, ev: &MouseDownEvent, window, cx| {
+                        window.prevent_default();
+                        this.handle_entry_right_click(side, vis_idx, ev, cx);
+                    }),
+                )
+                .child(
+                    h_flex()
+                        .flex_1()
+                        .min_w_0()
+                        .pr_2()
+                        .gap_2()
+                        .items_center()
+                        .child(
+                            Icon::new(icon).small().text_color(if is_hidden || is_cut {
+                                solid(TEXT_MUTED)
+                            } else {
+                                solid(icon_hex)
                             }),
-                    )
-                    // Modified column
-                    .child(
-                        div()
-                            .w(px(142.))
-                            .flex_shrink_0()
-                            .truncate()
-                            .text_xs()
-                            .text_color(solid(TEXT_SECONDARY))
-                            .child(modified),
-                    )
-                    // Type column
-                    .child(
-                        div()
-                            .w(px(126.))
-                            .flex_shrink_0()
-                            .truncate()
-                            .text_xs()
-                            .text_color(solid(TEXT_MUTED))
-                            .child(type_label),
-                    )
-                    // Size column
-                    .child(
-                        div()
-                            .w(px(92.))
-                            .flex_shrink_0()
-                            .text_right()
-                            .truncate()
-                            .text_xs()
-                            .text_color(solid(TEXT_SECONDARY))
-                            .child(size_label),
-                    )
-                    .into_any_element(),
-            )
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .truncate()
+                                .text_xs()
+                                .text_color(if is_cut {
+                                    solid(TEXT_MUTED)
+                                } else if is_hidden {
+                                    solid(TEXT_SECONDARY)
+                                } else {
+                                    solid(TEXT_PRIMARY)
+                                })
+                                .child(name),
+                        )
+                        .when(is_symlink, |el| {
+                            el.child(
+                                Icon::new(LucideIcon::Link)
+                                    .xsmall()
+                                    .text_color(solid(TEXT_MUTED)),
+                            )
+                        }),
+                )
+                .child(
+                    div()
+                        .w(px(142.))
+                        .flex_shrink_0()
+                        .truncate()
+                        .text_xs()
+                        .text_color(solid(TEXT_SECONDARY))
+                        .child(modified),
+                )
+                .child(
+                    div()
+                        .w(px(126.))
+                        .flex_shrink_0()
+                        .truncate()
+                        .text_xs()
+                        .text_color(solid(TEXT_MUTED))
+                        .child(type_label),
+                )
+                .child(
+                    div()
+                        .w(px(92.))
+                        .flex_shrink_0()
+                        .text_right()
+                        .truncate()
+                        .text_xs()
+                        .text_color(solid(TEXT_SECONDARY))
+                        .child(size_label),
+                );
+
+            Some(row.into_any_element())
         })
         .collect()
 }
 
-/// Renders a virtualized Grid of flat Obsidian Dark file tiles (6 tiles per row,
-/// virtualized row-by-row via `uniform_list` for smooth 120 FPS scrolling).
+/// Renders a virtualized Grid of flat Obsidian Dark tiles powered by native Windows Shell thumbnails.
 pub fn render_grid_view(
     ws: &Workspace,
     side: PaneSide,
@@ -568,17 +668,37 @@ pub fn render_grid_view(
     let total = model.filtered_indices.len();
     let is_loading = model.loading;
     let error = model.error.clone();
+    let pane_dir = model.location.as_local_path().map(|p| p.to_path_buf());
+    let accent_hex = ws.settings.accent.primary_hex();
     let cols = if tab.model.split_enabled { 4usize } else { 6usize };
     let row_count = total.div_ceil(cols);
     let list_id = match side {
         PaneSide::Left => "grid-list-left",
         PaneSide::Right => "grid-list-right",
     };
+    let pane_dir_int = pane_dir.clone();
+    let pane_dir_ext = pane_dir;
 
     v_flex()
         .size_full()
         .bg(solid(BG_BASE))
         .overflow_hidden()
+        .drag_over::<DraggedEntries>(move |style, _, _, _| {
+            style.border_1().border_color(solid(accent_hex))
+        })
+        .drag_over::<ExternalPaths>(move |style, _, _, _| {
+            style.border_1().border_color(solid(accent_hex))
+        })
+        .on_drop(cx.listener(move |this, drag: &DraggedEntries, window, cx| {
+            if let Some(ref dest) = pane_dir_int {
+                this.handle_dropped_paths(drag.paths.clone(), dest.clone(), false, window, cx);
+            }
+        }))
+        .on_drop(cx.listener(move |this, ext: &ExternalPaths, window, cx| {
+            if let Some(ref dest) = pane_dir_ext {
+                this.handle_dropped_paths(ext.paths().to_vec(), dest.clone(), true, window, cx);
+            }
+        }))
         .on_mouse_down(
             MouseButton::Right,
             cx.listener(move |this, ev: &MouseDownEvent, window, cx| {
@@ -613,13 +733,48 @@ fn render_grid_rows(
     range: Range<usize>,
     cx: &mut Context<Workspace>,
 ) -> Vec<gpui_kit::AnyElement> {
-    let Some(tab) = ws.active_tab() else {
-        return Vec::new();
-    };
-    let model = tab.model.pane(side);
     let accent = ws.settings.accent;
+    let accent_hex = accent.primary_hex();
     let unit = ws.settings.size_unit;
-    let total = model.filtered_indices.len();
+
+    // Collect visible entries for this range first so we can query/enqueue thumbnails cleanly.
+    let total = ws
+        .active_tab()
+        .map(|t| t.model.pane(side).filtered_indices.len())
+        .unwrap_or(0);
+    if total == 0 {
+        return Vec::new();
+    }
+
+    let first_idx = range.start * cols;
+    let last_idx = (range.end * cols).min(total);
+    let mut visible_items = Vec::with_capacity(last_idx.saturating_sub(first_idx));
+    if let Some(tab) = ws.active_tab() {
+        let model = tab.model.pane(side);
+        for vis_idx in first_idx..last_idx {
+            if let Some(entry) = model.visible_entry(vis_idx) {
+                visible_items.push((
+                    vis_idx,
+                    entry.clone(),
+                    model.selection.contains(vis_idx),
+                ));
+            }
+        }
+    }
+
+    // Resolve or enqueue native Windows Shell thumbnails strictly for the visible viewport range.
+    let mut thumbs: Vec<Option<std::sync::Arc<gpui_kit::RenderImage>>> =
+        Vec::with_capacity(visible_items.len());
+    for (_, entry, _) in &visible_items {
+        let thumb = if !entry.is_dir()
+            && let Some(local) = entry.location.as_local_path()
+        {
+            ws.get_or_request_thumbnail(local, entry.modified_secs, 96)
+        } else {
+            None
+        };
+        thumbs.push(thumb);
+    }
 
     range
         .map(|row_idx| {
@@ -628,17 +783,21 @@ fn render_grid_rows(
 
             h_flex()
                 .w_full()
-                .h(px(114.))
+                .h(px(122.))
                 .px_3()
                 .py_1p5()
                 .gap_2()
                 .items_center()
                 .children((start..end).filter_map(|vis_idx| {
-                    let entry = model.visible_entry(vis_idx)?;
-                    let selected = model.selection.contains(vis_idx);
+                    let offset = vis_idx.checked_sub(first_idx)?;
+                    let (_, entry, selected) = visible_items.get(offset)?;
+                    let thumb = thumbs.get(offset).cloned().flatten();
                     let (icon, icon_hex) = file_kind_visual(entry.kind, accent);
+                    let local_path = entry.location.as_local_path().map(|p| p.to_path_buf());
+                    let is_cut = local_path.as_ref().is_some_and(|p| ws.is_path_cut(p));
+                    let is_dir = entry.is_dir();
                     let name: SharedString = entry.name.clone().into();
-                    let sub: SharedString = if entry.is_dir() {
+                    let sub: SharedString = if is_dir {
                         "Folder".into()
                     } else if let Some(bytes) = entry.size {
                         format_size(bytes, unit).into()
@@ -646,6 +805,49 @@ fn render_grid_rows(
                         entry.type_label.clone().into()
                     };
 
+                    let drag_payload =
+                        build_drag_payload(ws, side, local_path.as_ref(), &entry.name);
+                    let drop_dir_int = if is_dir { local_path.clone() } else { None };
+                    let drop_dir_ext = drop_dir_int.clone();
+
+                    let visual = if let Some(render_img) = thumb {
+                        div()
+                            .w(px(64.))
+                            .h(px(52.))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .overflow_hidden()
+                            .rounded(px(RADIUS_CONTROL))
+                            .child(
+                                img(render_img)
+                                    .max_w_full()
+                                    .max_h_full()
+                                    .object_fit(ObjectFit::Contain),
+                            )
+                            .into_any_element()
+                    } else {
+                        div()
+                            .w(px(40.))
+                            .h(px(40.))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded(px(RADIUS_CONTROL))
+                            .bg(soft_tint(icon_hex, 0.14))
+                            .child(
+                                Icon::new(icon)
+                                    .with_size(Size::Medium)
+                                    .text_color(if is_cut {
+                                        solid(TEXT_MUTED)
+                                    } else {
+                                        solid(icon_hex)
+                                    }),
+                            )
+                            .into_any_element()
+                    };
+
+                    let selected_val = *selected;
                     Some(
                         v_flex()
                             .id((
@@ -664,23 +866,65 @@ fn render_grid_rows(
                             .justify_center()
                             .rounded(px(RADIUS_ROW))
                             .cursor_pointer()
-                            .bg(if selected {
-                                soft_tint(accent.primary_hex(), 0.16)
+                            .bg(if selected_val {
+                                soft_tint(accent_hex, 0.16)
                             } else {
                                 solid(BG_SURFACE)
                             })
                             .border_1()
-                            .border_color(if selected {
-                                solid(accent.primary_hex())
+                            .border_color(if selected_val {
+                                solid(accent_hex)
                             } else {
                                 solid(BORDER_SUBTLE)
                             })
                             .hover(move |s| {
-                                if selected {
+                                if selected_val {
                                     s
                                 } else {
                                     s.bg(solid(BG_ELEVATED)).border_color(solid(BORDER))
                                 }
+                            })
+                            .when_some(drag_payload, |el, payload| {
+                                el.on_drag(payload, move |drag, _, _, cx| {
+                                    cx.new(|_| DragBadgeView {
+                                        label: drag.label.clone(),
+                                        accent_hex,
+                                    })
+                                })
+                            })
+                            .when_some(drop_dir_int, |el, dest| {
+                                el.drag_over::<DraggedEntries>(move |style, _, _, _| {
+                                    style.border_color(solid(accent_hex))
+                                })
+                                .on_drop(cx.listener(
+                                    move |this, drag: &DraggedEntries, window, cx| {
+                                        cx.stop_propagation();
+                                        this.handle_dropped_paths(
+                                            drag.paths.clone(),
+                                            dest.clone(),
+                                            false,
+                                            window,
+                                            cx,
+                                        );
+                                    },
+                                ))
+                            })
+                            .when_some(drop_dir_ext, |el, dest| {
+                                el.drag_over::<ExternalPaths>(move |style, _, _, _| {
+                                    style.border_color(solid(accent_hex))
+                                })
+                                .on_drop(cx.listener(
+                                    move |this, ext: &ExternalPaths, window, cx| {
+                                        cx.stop_propagation();
+                                        this.handle_dropped_paths(
+                                            ext.paths().to_vec(),
+                                            dest.clone(),
+                                            true,
+                                            window,
+                                            cx,
+                                        );
+                                    },
+                                ))
                             })
                             .on_mouse_down(
                                 MouseButton::Left,
@@ -692,24 +936,10 @@ fn render_grid_rows(
                                 MouseButton::Right,
                                 cx.listener(move |this, ev: &MouseDownEvent, window, cx| {
                                     window.prevent_default();
-                                    this.handle_entry_right_click(side, vis_idx, ev.position, cx);
+                                    this.handle_entry_right_click(side, vis_idx, ev, cx);
                                 }),
                             )
-                            .child(
-                                div()
-                                    .w(px(36.))
-                                    .h(px(36.))
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .rounded(px(RADIUS_CONTROL))
-                                    .bg(soft_tint(icon_hex, 0.14))
-                                    .child(
-                                        Icon::new(icon)
-                                            .with_size(Size::Medium)
-                                            .text_color(solid(icon_hex)),
-                                    ),
-                            )
+                            .child(visual)
                             .child(
                                 div()
                                     .w_full()
@@ -717,7 +947,11 @@ fn render_grid_rows(
                                     .text_center()
                                     .text_xs()
                                     .font_medium()
-                                    .text_color(solid(TEXT_PRIMARY))
+                                    .text_color(if is_cut {
+                                        solid(TEXT_MUTED)
+                                    } else {
+                                        solid(TEXT_PRIMARY)
+                                    })
                                     .child(name),
                             )
                             .child(
@@ -728,14 +962,13 @@ fn render_grid_rows(
                             ),
                     )
                 }))
-                // Pad incomplete trailing row so tiles stay uniform width
                 .children((end..start + cols).map(|_| div().flex_1().min_w_0()))
                 .into_any_element()
         })
         .collect()
 }
 
-/// Renders a high-density Compact virtualized list (`24px` rows) for rapid keyboard browsing.
+/// Renders a high-density Compact virtualized list (`24px` rows + Drag & Drop).
 pub fn render_compact_view(
     ws: &Workspace,
     side: PaneSide,
@@ -749,15 +982,35 @@ pub fn render_compact_view(
     let row_count = model.filtered_indices.len();
     let is_loading = model.loading;
     let error = model.error.clone();
+    let pane_dir = model.location.as_local_path().map(|p| p.to_path_buf());
+    let accent_hex = ws.settings.accent.primary_hex();
     let list_id = match side {
         PaneSide::Left => "compact-list-left",
         PaneSide::Right => "compact-list-right",
     };
+    let pane_dir_int = pane_dir.clone();
+    let pane_dir_ext = pane_dir;
 
     v_flex()
         .size_full()
         .bg(solid(BG_BASE))
         .overflow_hidden()
+        .drag_over::<DraggedEntries>(move |style, _, _, _| {
+            style.border_1().border_color(solid(accent_hex))
+        })
+        .drag_over::<ExternalPaths>(move |style, _, _, _| {
+            style.border_1().border_color(solid(accent_hex))
+        })
+        .on_drop(cx.listener(move |this, drag: &DraggedEntries, window, cx| {
+            if let Some(ref dest) = pane_dir_int {
+                this.handle_dropped_paths(drag.paths.clone(), dest.clone(), false, window, cx);
+            }
+        }))
+        .on_drop(cx.listener(move |this, ext: &ExternalPaths, window, cx| {
+            if let Some(ref dest) = pane_dir_ext {
+                this.handle_dropped_paths(ext.paths().to_vec(), dest.clone(), true, window, cx);
+            }
+        }))
         .on_mouse_down(
             MouseButton::Right,
             cx.listener(move |this, ev: &MouseDownEvent, window, cx| {
@@ -791,24 +1044,29 @@ fn render_compact_rows(
     range: Range<usize>,
     cx: &mut Context<Workspace>,
 ) -> Vec<gpui_kit::AnyElement> {
+    let accent = ws.settings.accent;
+    let accent_hex = accent.primary_hex();
+    let unit = ws.settings.size_unit;
+
     let Some(tab) = ws.active_tab() else {
         return Vec::new();
     };
     let model = tab.model.pane(side);
-    let accent = ws.settings.accent;
-    let unit = ws.settings.size_unit;
 
     range
         .filter_map(|vis_idx| {
             let entry = model.visible_entry(vis_idx)?;
             let selected = model.selection.contains(vis_idx);
             let (icon, icon_hex) = file_kind_visual(entry.kind, accent);
+            let local_path = entry.location.as_local_path().map(|p| p.to_path_buf());
+            let is_cut = local_path.as_ref().is_some_and(|p| ws.is_path_cut(p));
             let name: SharedString = entry.name.clone().into();
             let size: SharedString = entry
                 .size
                 .map(|b| format_size(b, unit))
                 .unwrap_or_default()
                 .into();
+            let drag_payload = build_drag_payload(ws, side, local_path.as_ref(), &entry.name);
 
             Some(
                 h_flex()
@@ -826,7 +1084,7 @@ fn render_compact_rows(
                     .items_center()
                     .cursor_pointer()
                     .bg(if selected {
-                        soft_tint(accent.primary_hex(), 0.16)
+                        soft_tint(accent_hex, 0.16)
                     } else {
                         solid(BG_BASE)
                     })
@@ -836,6 +1094,14 @@ fn render_compact_rows(
                         } else {
                             s.bg(solid(BG_ELEVATED))
                         }
+                    })
+                    .when_some(drag_payload, |el, payload| {
+                        el.on_drag(payload, move |drag, _, _, cx| {
+                            cx.new(|_| DragBadgeView {
+                                label: drag.label.clone(),
+                                accent_hex,
+                            })
+                        })
                     })
                     .on_mouse_down(
                         MouseButton::Left,
@@ -847,17 +1113,25 @@ fn render_compact_rows(
                         MouseButton::Right,
                         cx.listener(move |this, ev: &MouseDownEvent, window, cx| {
                             window.prevent_default();
-                            this.handle_entry_right_click(side, vis_idx, ev.position, cx);
+                            this.handle_entry_right_click(side, vis_idx, ev, cx);
                         }),
                     )
-                    .child(Icon::new(icon).xsmall().text_color(solid(icon_hex)))
+                    .child(Icon::new(icon).xsmall().text_color(if is_cut {
+                        solid(TEXT_MUTED)
+                    } else {
+                        solid(icon_hex)
+                    }))
                     .child(
                         div()
                             .flex_1()
                             .min_w_0()
                             .truncate()
                             .text_xs()
-                            .text_color(solid(TEXT_PRIMARY))
+                            .text_color(if is_cut {
+                                solid(TEXT_MUTED)
+                            } else {
+                                solid(TEXT_PRIMARY)
+                            })
                             .child(name),
                     )
                     .child(
@@ -870,6 +1144,27 @@ fn render_compact_rows(
             )
         })
         .collect()
+}
+
+fn build_drag_payload(
+    ws: &Workspace,
+    side: PaneSide,
+    entry_path: Option<&PathBuf>,
+    entry_name: &str,
+) -> Option<DraggedEntries> {
+    let path = entry_path?;
+    let selected = ws.selected_local_paths(side);
+    let paths = if selected.iter().any(|p| p == path) {
+        selected
+    } else {
+        vec![path.clone()]
+    };
+    let label: SharedString = if paths.len() == 1 {
+        entry_name.to_string().into()
+    } else {
+        format!("{} items", paths.len()).into()
+    };
+    Some(DraggedEntries { paths, label })
 }
 
 fn sort_header_cell(

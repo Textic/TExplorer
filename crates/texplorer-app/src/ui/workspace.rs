@@ -1,12 +1,14 @@
+use std::collections::{HashSet, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use futures_channel::mpsc::{UnboundedReceiver, UnboundedSender, unbounded};
 use futures_util::StreamExt as _;
 use gpui_kit::{
     ClipboardItem, Context, Entity, FocusHandle, Focusable, KeyDownEvent, MouseDownEvent, Pixels,
-    Point, ScrollStrategy, SharedString, Subscription, UniformListScrollHandle, Window,
+    Point, RenderImage, ScrollStrategy, SharedString, Subscription, UniformListScrollHandle,
+    Window,
     component::{
         h_flex,
         input::{InputEvent, InputState},
@@ -19,14 +21,22 @@ use texplorer_core::{
     AccentPreset, AppSettings, FileEntry, KnownFolder, KnownFolderKind, Location, PaneSide,
     SizeUnit, SortColumn, TabModel, ViewMode, VolumeInfo,
 };
+use texplorer_ops::{
+    ConflictDecision, ConflictPrompt, ConflictResolution, TransferControl, TransferEvent,
+    TransferKind, TransferSnapshot, TransferStatus, UndoAction, UndoHistory, spawn_transfer_job,
+};
 use texplorer_platform::{
-    DefaultExplorerStatus, DirectoryWatcher, LaunchIntent, delete_permanently,
-    enable_default_explorer, find_textree_exe, list_known_folders, list_volumes, list_wsl_distros,
-    move_to_trash, open_in_editor, open_item, open_terminal_here, query_default_explorer_status,
-    restore_windows_explorer, reveal_in_windows_explorer, show_properties_dialog,
+    DefaultExplorerStatus, DirectoryWatcher, LaunchIntent, ShellWorker, cursor_screen_pos,
+    delete_permanently, enable_default_explorer, find_textree_exe, get_clipboard_files,
+    list_known_folders, list_volumes, list_wsl_distros, move_to_trash, open_in_editor, open_item,
+    open_terminal_here, query_default_explorer_status, restore_windows_explorer,
+    reveal_in_windows_explorer, set_clipboard_files, show_properties_dialog,
 };
 use uuid::Uuid;
 
+use crate::preview::{
+    PreviewPayload, ThumbnailCache, ThumbnailKey, load_preview_blocking, raw_bgra_to_render_image,
+};
 use crate::theme::{
     BG_BASE, BG_ELEVATED, BORDER, RADIUS_ROW, STATUS_ERROR, STATUS_INFO, STATUS_SUCCESS,
     TEXT_PRIMARY, apply_obsidian_theme, crisp_resize_handle_appearance, solid,
@@ -36,7 +46,9 @@ use crate::ui::header::render_header;
 use crate::ui::inspector::render_inspector;
 use crate::ui::modals::{ActiveModal, TextPromptKind, render_active_modal};
 use crate::ui::pane::render_pane;
+use crate::ui::quicklook::render_quicklook_modal;
 use crate::ui::sidebar::render_sidebar;
+use crate::ui::transfers::{render_conflict_modal, render_transfer_drawer};
 use crate::updater::{
     self, REPO_URL, StagedUpdate, UpdateInfo, UpdateState, open_url_in_browser,
     spawn_detached_updater,
@@ -61,6 +73,11 @@ gpui_kit::actions!(
         ToggleInspector,
         ToggleHiddenFiles,
         SelectAllItems,
+        CopySelected,
+        CutSelected,
+        PasteItems,
+        UndoActionCmd,
+        RedoActionCmd,
         CreateNewFolder,
         RenameSelected,
         DeleteToTrash,
@@ -108,6 +125,17 @@ enum BgEvent {
         info: UpdateInfo,
         result: Result<StagedUpdate, String>,
     },
+    ThumbnailReady {
+        key: ThumbnailKey,
+        image: Option<Arc<RenderImage>>,
+    },
+    PreviewReady {
+        generation: u64,
+        path: PathBuf,
+        payload: PreviewPayload,
+    },
+    Transfer(TransferEvent),
+    NativeShellMenuDone(Result<(), String>),
 }
 
 #[derive(Clone)]
@@ -117,7 +145,13 @@ struct ToastBanner {
     id: u64,
 }
 
-/// UI-bound state for a single explorer pane (scroll handle, editable address/filter inputs, live watcher).
+/// Active or recently finished background transfer job tracked by the UI drawer.
+pub struct TransferJobState {
+    pub snapshot: TransferSnapshot,
+    pub control: Arc<TransferControl>,
+}
+
+/// UI-bound state for a single explorer pane.
 pub struct PaneUiState {
     pub scroll_handle: UniformListScrollHandle,
     pub address_input: Entity<InputState>,
@@ -150,7 +184,7 @@ impl TabUiState {
     }
 }
 
-/// Root GPUI view coordinating tabs, dual-pane splits, sidebar, inspector, and async I/O.
+/// Root GPUI view coordinating tabs, dual-pane splits, transfers, preview/QuickLook, and OS shell.
 pub struct Workspace {
     focus_handle: FocusHandle,
     pub settings: AppSettings,
@@ -164,6 +198,17 @@ pub struct Workspace {
     pub context_menu: Option<ContextMenuState>,
     pub active_modal: Option<ActiveModal>,
     modal_subs: Vec<Subscription>,
+    pub quicklook_open: bool,
+    pub preview_path: Option<PathBuf>,
+    pub preview_payload: PreviewPayload,
+    preview_generation: u64,
+    pub transfers: Vec<TransferJobState>,
+    pub conflict_queue: VecDeque<ConflictPrompt>,
+    pub conflict_apply_to_all: bool,
+    undo_history: UndoHistory,
+    cut_paths: HashSet<PathBuf>,
+    shell_worker: ShellWorker,
+    thumbnails: ThumbnailCache,
     toast: Option<ToastBanner>,
     toast_seq: u64,
     type_ahead_buf: String,
@@ -182,7 +227,6 @@ impl Workspace {
         let (bg_tx, mut bg_rx) = unbounded::<BgEvent>();
         let ipc_forward_tx = bg_tx.clone();
 
-        // Forward single-instance Named Pipe events into the unified background stream.
         tokio_runtime().spawn(async move {
             while let Some(intent) = ipc_rx.next().await {
                 let _ = ipc_forward_tx.unbounded_send(BgEvent::ExternalIntent(intent));
@@ -193,6 +237,7 @@ impl Workspace {
         let known_folders = list_known_folders();
         let wsl_distros = list_wsl_distros();
         let default_explorer_status = query_default_explorer_status();
+        let shell_worker = ShellWorker::spawn();
 
         let (initial_location, pending_select) = match initial_intent {
             LaunchIntent::OpenLocation(path) => (Location::local(path), None),
@@ -222,6 +267,17 @@ impl Workspace {
             context_menu: None,
             active_modal: None,
             modal_subs: Vec::new(),
+            quicklook_open: false,
+            preview_path: None,
+            preview_payload: PreviewPayload::Loading,
+            preview_generation: 0,
+            transfers: Vec::new(),
+            conflict_queue: VecDeque::new(),
+            conflict_apply_to_all: false,
+            undo_history: UndoHistory::default(),
+            cut_paths: HashSet::new(),
+            shell_worker,
+            thumbnails: ThumbnailCache::default(),
             toast: None,
             toast_seq: 0,
             type_ahead_buf: String::new(),
@@ -229,7 +285,6 @@ impl Workspace {
             bg_tx,
         };
 
-        // Drain background events safely on GPUI's foreground executor.
         cx.spawn_in(window, async move |weak, cx| {
             while let Some(event) = bg_rx.next().await {
                 let alive = weak.update_in(cx, |this, window, cx| {
@@ -256,6 +311,36 @@ impl Workspace {
 
     pub fn active_tab_mut(&mut self) -> Option<&mut TabUiState> {
         self.tabs.get_mut(self.active_tab_index)
+    }
+
+    pub fn is_path_cut(&self, path: &Path) -> bool {
+        self.cut_paths.contains(path)
+    }
+
+    /// Returns a cached native Shell thumbnail or queues a deduplicated COM STA lookup.
+    pub fn get_or_request_thumbnail(
+        &mut self,
+        path: &Path,
+        modified_secs: i64,
+        size_px: i32,
+    ) -> Option<Arc<RenderImage>> {
+        let key = ThumbnailKey {
+            path: path.to_path_buf(),
+            modified_secs,
+            size_px,
+        };
+        if let Some(cached) = self.thumbnails.get(&key) {
+            return cached.clone();
+        }
+        if self.thumbnails.try_mark_in_flight(key.clone()) {
+            let tx = self.bg_tx.clone();
+            let path_owned = path.to_path_buf();
+            self.shell_worker.request_thumbnail(path_owned, size_px, move |raw| {
+                let image = raw.and_then(raw_bgra_to_render_image);
+                let _ = tx.unbounded_send(BgEvent::ThumbnailReady { key, image });
+            });
+        }
+        None
     }
 
     fn create_pane_ui(
@@ -338,6 +423,7 @@ impl Workspace {
                             pane.error = Some(err);
                         }
                     }
+                    self.sync_preview_for_selection(cx);
                     cx.notify();
                 }
             }
@@ -458,7 +544,148 @@ impl Workspace {
                     cx.notify();
                 }
             },
+            BgEvent::ThumbnailReady { key, image } => {
+                self.thumbnails.insert(key, image);
+                cx.notify();
+            }
+            BgEvent::PreviewReady {
+                generation,
+                path,
+                payload,
+            } => {
+                if generation == self.preview_generation {
+                    self.preview_path = Some(path);
+                    self.preview_payload = payload;
+                    cx.notify();
+                }
+            }
+            BgEvent::Transfer(xfer_ev) => match xfer_ev {
+                TransferEvent::Progress(snap) => {
+                    if let Some(job) = self
+                        .transfers
+                        .iter_mut()
+                        .find(|j| j.snapshot.job_id == snap.job_id)
+                    {
+                        job.snapshot = snap;
+                        cx.notify();
+                    }
+                }
+                TransferEvent::Conflict(prompt) => {
+                    self.conflict_apply_to_all = false;
+                    self.conflict_queue.push_back(prompt);
+                    cx.notify();
+                }
+                TransferEvent::Finished {
+                    snapshot,
+                    undo_action,
+                } => {
+                    let target_dir = snapshot.target_dir.clone();
+                    let status = snapshot.status.clone();
+                    let kind = snapshot.kind;
+                    if let Some(job) = self
+                        .transfers
+                        .iter_mut()
+                        .find(|j| j.snapshot.job_id == snapshot.job_id)
+                    {
+                        job.snapshot = snapshot;
+                    }
+                    if let Some(undo) = undo_action {
+                        self.undo_history.push(undo);
+                    }
+                    if kind == TransferKind::Move && matches!(status, TransferStatus::Completed) {
+                        self.cut_paths.clear();
+                    }
+                    self.refresh_panes_showing(&target_dir, cx);
+                    if let TransferStatus::Failed(err) = status {
+                        self.show_toast(err, STATUS_ERROR, window, cx);
+                    }
+                    cx.notify();
+                }
+            },
+            BgEvent::NativeShellMenuDone(res) => {
+                if let Err(err) = res {
+                    self.show_toast(err, STATUS_ERROR, window, cx);
+                } else {
+                    self.refresh_visible_panes(cx);
+                }
+            }
         }
+    }
+
+    fn refresh_panes_showing(&mut self, dir: &Path, cx: &mut Context<Self>) {
+        let mut to_reload = Vec::new();
+        for tab in &self.tabs {
+            for side in [PaneSide::Left, PaneSide::Right] {
+                if side == PaneSide::Right && !tab.model.split_enabled {
+                    continue;
+                }
+                if tab.model.pane(side).location.as_local_path() == Some(dir) {
+                    to_reload.push((tab.model.id, side));
+                }
+            }
+        }
+        for (tab_id, side) in to_reload {
+            self.reload_pane_by_id(tab_id, side, cx);
+        }
+    }
+
+    fn refresh_visible_panes(&mut self, cx: &mut Context<Self>) {
+        let Some(tab) = self.active_tab() else {
+            return;
+        };
+        let tab_id = tab.model.id;
+        let is_split = tab.model.split_enabled;
+        self.reload_pane_by_id(tab_id, PaneSide::Left, cx);
+        if is_split {
+            self.reload_pane_by_id(tab_id, PaneSide::Right, cx);
+        }
+    }
+
+    /// Triggers an asynchronous preview load whenever Inspector or QuickLook is visible.
+    fn sync_preview_for_selection(&mut self, cx: &mut Context<Self>) {
+        if !self.settings.show_inspector && !self.quicklook_open {
+            return;
+        }
+        let target = self
+            .active_tab()
+            .and_then(|t| t.model.active_pane_ref().primary_selected_entry())
+            .and_then(|e| Some((e.location.as_local_path()?.to_path_buf(), e.kind)));
+
+        let Some((path, kind)) = target else {
+            self.preview_path = None;
+            self.preview_payload = PreviewPayload::Loading;
+            return;
+        };
+
+        if self.preview_path.as_ref() == Some(&path)
+            && !matches!(self.preview_payload, PreviewPayload::Loading)
+        {
+            return;
+        }
+
+        self.preview_generation = self.preview_generation.wrapping_add(1);
+        let generation = self.preview_generation;
+        self.preview_path = Some(path.clone());
+        self.preview_payload = PreviewPayload::Loading;
+
+        let worker = self.shell_worker.clone();
+        let tx = self.bg_tx.clone();
+        tokio_runtime().spawn(async move {
+            let p_clone = path.clone();
+            let payload = tokio::task::spawn_blocking(move || {
+                load_preview_blocking(p_clone, kind, worker)
+            })
+            .await
+            .unwrap_or_else(|_| PreviewPayload::Unsupported {
+                reason: "Preview worker failed.".to_string(),
+            });
+            let _ = tx.unbounded_send(BgEvent::PreviewReady {
+                generation,
+                path,
+                payload,
+            });
+        });
+        cx.notify();
     }
 
     pub fn open_new_tab(
@@ -500,13 +727,13 @@ impl Workspace {
         if index < self.tabs.len() {
             self.active_tab_index = index;
             self.context_menu = None;
+            self.sync_preview_for_selection(cx);
             cx.notify();
         }
     }
 
     pub fn close_tab_at(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
         if self.tabs.len() <= 1 {
-            // Closing the last tab resets it to Home rather than exiting unexpectedly.
             self.navigate_active_pane(Location::Home, window, cx);
             return;
         }
@@ -516,6 +743,7 @@ impl Workspace {
                 self.active_tab_index = self.tabs.len() - 1;
             }
             self.context_menu = None;
+            self.sync_preview_for_selection(cx);
             cx.notify();
         }
     }
@@ -569,6 +797,7 @@ impl Workspace {
             };
             if tab.model.active_pane != effective {
                 tab.model.active_pane = effective;
+                self.sync_preview_for_selection(cx);
                 cx.notify();
             }
         }
@@ -711,9 +940,10 @@ impl Workspace {
         let tx = self.bg_tx.clone();
         tokio_runtime().spawn(async move {
             let loc_clone = location.clone();
-            let result = tokio::task::spawn_blocking(move || texplorer_vfs::list_location(&loc_clone))
-                .await
-                .unwrap_or_else(|e| Err(format!("Directory task panicked: {e}")));
+            let result =
+                tokio::task::spawn_blocking(move || texplorer_vfs::list_location(&loc_clone))
+                    .await
+                    .unwrap_or_else(|e| Err(format!("Directory task panicked: {e}")));
             let _ = tx.unbounded_send(BgEvent::DirectoryLoaded {
                 tab_id,
                 side,
@@ -729,7 +959,12 @@ impl Workspace {
         let Some(tab) = self.tabs.iter_mut().find(|t| t.model.id == tab_id) else {
             return;
         };
-        let dir_opt = tab.model.pane(side).location.as_local_path().map(|p| p.to_path_buf());
+        let dir_opt = tab
+            .model
+            .pane(side)
+            .location
+            .as_local_path()
+            .map(|p| p.to_path_buf());
         let ui = tab.pane_ui_mut(side);
         ui.watcher = None;
         if let Some(dir) = dir_opt
@@ -915,6 +1150,7 @@ impl Workspace {
         if let Some((loc, is_dir)) = open_target {
             self.open_location_or_file(loc, is_dir, window, cx);
         } else {
+            self.sync_preview_for_selection(cx);
             cx.notify();
         }
     }
@@ -923,7 +1159,7 @@ impl Workspace {
         &mut self,
         side: PaneSide,
         vis_idx: usize,
-        position: Point<Pixels>,
+        ev: &MouseDownEvent,
         cx: &mut Context<Self>,
     ) {
         let entry_opt = {
@@ -938,8 +1174,19 @@ impl Workspace {
             pane.visible_entry(vis_idx).cloned()
         };
 
+        self.sync_preview_for_selection(cx);
+
+        // Shift + Right Click invokes the native Windows Shell menu directly.
+        if ev.modifiers.shift {
+            let paths = self.selected_local_paths(side);
+            if !paths.is_empty() {
+                self.show_native_windows_menu(paths, cx);
+                return;
+            }
+        }
+
         if let Some(entry) = entry_opt {
-            self.open_context_menu(position, ContextMenuTarget::Entry { side, entry }, cx);
+            self.open_context_menu(ev.position, ContextMenuTarget::Entry { side, entry }, cx);
         }
     }
 
@@ -995,6 +1242,228 @@ impl Workspace {
             && let Err(err) = open_item(path)
         {
             self.show_toast(err, STATUS_ERROR, window, cx);
+        }
+    }
+
+    // --- Phase 2: Clipboard (CF_HDROP), Drag & Drop, Transfer Queue, Conflicts, Undo/Redo, QuickLook ---
+
+    pub fn copy_or_cut_selected(
+        &mut self,
+        side: PaneSide,
+        is_cut: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let paths = self.selected_local_paths(side);
+        if paths.is_empty() {
+            return;
+        }
+        match set_clipboard_files(&paths, is_cut) {
+            Ok(()) => {
+                self.cut_paths.clear();
+                if is_cut {
+                    self.cut_paths.extend(paths.iter().cloned());
+                }
+                let verb = if is_cut { "Cut" } else { "Copied" };
+                let msg = if paths.len() == 1 {
+                    format!("{verb} 1 item to clipboard")
+                } else {
+                    format!("{verb} {} items to clipboard", paths.len())
+                };
+                self.show_toast(msg, STATUS_SUCCESS, window, cx);
+            }
+            Err(err) => self.show_toast(err, STATUS_ERROR, window, cx),
+        }
+    }
+
+    pub fn paste_clipboard_into(
+        &mut self,
+        dest_dir: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match get_clipboard_files() {
+            Ok(Some(clip)) => {
+                let kind = if clip.is_cut {
+                    TransferKind::Move
+                } else {
+                    TransferKind::Copy
+                };
+                self.enqueue_transfer(kind, clip.paths, dest_dir, cx);
+            }
+            Ok(None) => {
+                self.show_toast("Clipboard does not contain files.", STATUS_INFO, window, cx);
+            }
+            Err(err) => self.show_toast(err, STATUS_ERROR, window, cx),
+        }
+    }
+
+    pub fn handle_dropped_paths(
+        &mut self,
+        sources: Vec<PathBuf>,
+        dest_dir: PathBuf,
+        force_copy: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if sources.is_empty() || !dest_dir.is_dir() {
+            return;
+        }
+        let kind = if force_copy || !same_volume(&sources[0], &dest_dir) {
+            TransferKind::Copy
+        } else {
+            TransferKind::Move
+        };
+        self.enqueue_transfer(kind, sources, dest_dir, cx);
+        let _ = window;
+    }
+
+    fn enqueue_transfer(
+        &mut self,
+        kind: TransferKind,
+        sources: Vec<PathBuf>,
+        dest_dir: PathBuf,
+        cx: &mut Context<Self>,
+    ) {
+        let (xfer_tx, mut xfer_rx) = unbounded::<TransferEvent>();
+        let (job_id, control) = spawn_transfer_job(kind, sources.clone(), dest_dir.clone(), xfer_tx);
+
+        let title = if sources.len() == 1 {
+            let name = sources[0]
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            format!("{} \"{name}\"", kind.verb_present())
+        } else {
+            format!("{} {} items", kind.verb_present(), sources.len())
+        };
+
+        self.transfers.push(TransferJobState {
+            snapshot: TransferSnapshot {
+                job_id,
+                kind,
+                title,
+                target_dir: dest_dir,
+                status: TransferStatus::Queued,
+                files_done: 0,
+                files_total: sources.len() as u64,
+                bytes_done: 0,
+                bytes_total: 0,
+                speed_bytes_per_sec: 0.0,
+                current_item: String::new(),
+            },
+            control,
+        });
+
+        let bg_tx = self.bg_tx.clone();
+        tokio_runtime().spawn(async move {
+            while let Some(ev) = xfer_rx.next().await {
+                if bg_tx.unbounded_send(BgEvent::Transfer(ev)).is_err() {
+                    break;
+                }
+            }
+        });
+        cx.notify();
+    }
+
+    pub fn toggle_pause_transfer(&mut self, job_id: Uuid, cx: &mut Context<Self>) {
+        if let Some(job) = self.transfers.iter().find(|j| j.snapshot.job_id == job_id) {
+            job.control.toggle_pause();
+            cx.notify();
+        }
+    }
+
+    pub fn cancel_transfer(&mut self, job_id: Uuid, cx: &mut Context<Self>) {
+        if let Some(job) = self.transfers.iter().find(|j| j.snapshot.job_id == job_id) {
+            job.control.cancel();
+            cx.notify();
+        }
+    }
+
+    pub fn dismiss_transfer(&mut self, job_id: Uuid, cx: &mut Context<Self>) {
+        self.transfers.retain(|j| j.snapshot.job_id != job_id);
+        cx.notify();
+    }
+
+    pub fn clear_finished_transfers(&mut self, cx: &mut Context<Self>) {
+        self.transfers.retain(|j| !j.snapshot.status.is_terminal());
+        cx.notify();
+    }
+
+    pub fn toggle_conflict_apply_all(&mut self, cx: &mut Context<Self>) {
+        self.conflict_apply_to_all = !self.conflict_apply_to_all;
+        cx.notify();
+    }
+
+    pub fn resolve_active_conflict(
+        &mut self,
+        resolution: ConflictResolution,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(mut prompt) = self.conflict_queue.pop_front() {
+            prompt.respond(ConflictDecision {
+                resolution,
+                apply_to_all: self.conflict_apply_to_all,
+            });
+            self.conflict_apply_to_all = false;
+            cx.notify();
+        }
+    }
+
+    pub fn undo_last_action(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        match self.undo_history.undo() {
+            Ok(msg) => {
+                self.refresh_visible_panes(cx);
+                self.show_toast(msg, STATUS_INFO, window, cx);
+            }
+            Err(err) => self.show_toast(err, STATUS_ERROR, window, cx),
+        }
+    }
+
+    pub fn redo_last_action(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        match self.undo_history.redo() {
+            Ok(msg) => {
+                self.refresh_visible_panes(cx);
+                self.show_toast(msg, STATUS_INFO, window, cx);
+            }
+            Err(err) => self.show_toast(err, STATUS_ERROR, window, cx),
+        }
+    }
+
+    pub fn show_native_windows_menu(&mut self, paths: Vec<PathBuf>, _cx: &mut Context<Self>) {
+        if paths.is_empty() {
+            return;
+        }
+        let (x, y) = cursor_screen_pos();
+        let tx = self.bg_tx.clone();
+        self.shell_worker
+            .show_native_context_menu(paths, x, y, move |res| {
+                let _ = tx.unbounded_send(BgEvent::NativeShellMenuDone(res));
+            });
+    }
+
+    pub fn toggle_quicklook(&mut self, cx: &mut Context<Self>) {
+        if self.quicklook_open {
+            self.quicklook_open = false;
+            cx.notify();
+            return;
+        }
+        let has_selection = self
+            .active_tab()
+            .and_then(|t| t.model.active_pane_ref().primary_selected_entry())
+            .is_some();
+        if has_selection {
+            self.quicklook_open = true;
+            self.context_menu = None;
+            self.sync_preview_for_selection(cx);
+            cx.notify();
+        }
+    }
+
+    pub fn close_quicklook(&mut self, cx: &mut Context<Self>) {
+        if self.quicklook_open {
+            self.quicklook_open = false;
+            cx.notify();
         }
     }
 
@@ -1067,12 +1536,16 @@ impl Workspace {
     pub fn toggle_inspector(&mut self, cx: &mut Context<Self>) {
         self.settings.show_inspector = !self.settings.show_inspector;
         let _ = self.settings.save();
+        if self.settings.show_inspector {
+            self.sync_preview_for_selection(cx);
+        }
         cx.notify();
     }
 
     pub fn open_settings_modal(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
         self.default_explorer_status = query_default_explorer_status();
         self.context_menu = None;
+        self.quicklook_open = false;
         self.active_modal = Some(ActiveModal::Settings);
         cx.notify();
     }
@@ -1167,18 +1640,30 @@ impl Workspace {
         let value = input.read(cx).value().to_string();
         let outcome = match kind {
             TextPromptKind::NewFolder { side, parent } => {
-                texplorer_vfs::create_folder(&parent, &value).map(|p| (side, p))
+                texplorer_vfs::create_folder(&parent, &value)
+                    .map(|p| (side, p.clone(), UndoAction::CreateDir { path: p }))
             }
             TextPromptKind::NewFile { side, parent } => {
-                texplorer_vfs::create_file(&parent, &value).map(|p| (side, p))
+                texplorer_vfs::create_file(&parent, &value)
+                    .map(|p| (side, p.clone(), UndoAction::CreateFile { path: p }))
             }
             TextPromptKind::Rename { side, target } => {
-                texplorer_vfs::rename_item(&target, &value).map(|p| (side, p))
+                texplorer_vfs::rename_item(&target, &value).map(|new_p| {
+                    (
+                        side,
+                        new_p.clone(),
+                        UndoAction::Rename {
+                            from: target,
+                            to: new_p,
+                        },
+                    )
+                })
             }
         };
 
         match outcome {
-            Ok((side, created_path)) => {
+            Ok((side, created_path, undo_action)) => {
+                self.undo_history.push(undo_action);
                 let name = created_path
                     .file_name()
                     .map(|n| n.to_string_lossy().into_owned());
@@ -1248,7 +1733,7 @@ impl Workspace {
         }
     }
 
-    fn selected_local_paths(&self, side: PaneSide) -> Vec<PathBuf> {
+    pub fn selected_local_paths(&self, side: PaneSide) -> Vec<PathBuf> {
         let Some(tab) = self.active_tab() else {
             return Vec::new();
         };
@@ -1292,7 +1777,7 @@ impl Workspace {
                 let _ = self.settings.save();
                 self.default_explorer_status = query_default_explorer_status();
                 self.set_toast_simple(
-                    "T Explorer is now your default Windows file manager",
+                    "TExplorer is now your default Windows file manager",
                     STATUS_SUCCESS,
                     cx,
                 );
@@ -1459,8 +1944,12 @@ impl Workspace {
         cx.notify();
     }
 
+    fn is_modal_blocking(&self) -> bool {
+        self.active_modal.is_some() || !self.conflict_queue.is_empty()
+    }
+
     fn handle_key_down(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
-        if self.active_modal.is_some() || !self.focus_handle.is_focused(window) {
+        if self.is_modal_blocking() || !self.focus_handle.is_focused(window) {
             return;
         }
         let key = ev.keystroke.key.as_str();
@@ -1473,13 +1962,20 @@ impl Workspace {
             return;
         };
 
+        // Space toggles QuickLook when the file list has focus (never while editing inputs).
+        if key == "space" {
+            self.toggle_quicklook(cx);
+            return;
+        }
+
         match key {
             "up" | "down" => {
                 let delta = if key == "up" { -1 } else { 1 };
-                if let Some(tab) = self.active_tab_mut() {
+                let extend = mods.shift && !self.quicklook_open;
+                let moved = if let Some(tab) = self.active_tab_mut() {
                     let pane = tab.model.pane_mut(side);
                     let total = pane.filtered_indices.len();
-                    if let Some(idx) = pane.selection.move_cursor(delta, total, mods.shift) {
+                    if let Some(idx) = pane.selection.move_cursor(delta, total, extend) {
                         let scroll_idx = match pane.view_mode {
                             ViewMode::Grid => {
                                 let cols = if tab.model.split_enabled { 4 } else { 6 };
@@ -1490,8 +1986,16 @@ impl Workspace {
                         tab.pane_ui(side)
                             .scroll_handle
                             .scroll_to_item(scroll_idx, ScrollStrategy::Nearest);
-                        cx.notify();
+                        true
+                    } else {
+                        false
                     }
+                } else {
+                    false
+                };
+                if moved {
+                    self.sync_preview_for_selection(cx);
+                    cx.notify();
                 }
             }
             "enter" => {
@@ -1502,22 +2006,23 @@ impl Workspace {
                         .map(|e| (e.location.clone(), e.is_dir()))
                 });
                 if let Some((loc, is_dir)) = target {
+                    self.quicklook_open = false;
                     self.open_location_or_file(loc, is_dir, window, cx);
                 }
             }
-            "backspace" => {
+            "backspace" if !self.quicklook_open => {
                 self.go_up(side, window, cx);
             }
-            "tab" => {
+            "tab" if !self.quicklook_open => {
                 if let Some(tab) = self.active_tab_mut()
                     && tab.model.split_enabled
                 {
                     tab.model.active_pane = tab.model.active_pane.opposite();
+                    self.sync_preview_for_selection(cx);
                     cx.notify();
                 }
             }
-            _ => {
-                // Explorer-style type-ahead jump when typing printable characters.
+            _ if !self.quicklook_open => {
                 if let Some(ch) = ev.keystroke.key_char.as_deref()
                     && ch.len() == 1
                     && !ch.chars().all(|c| c.is_control())
@@ -1529,7 +2034,7 @@ impl Workspace {
                     self.type_ahead_buf.push_str(ch);
                     let prefix = self.type_ahead_buf.clone();
 
-                    if let Some(tab) = self.active_tab_mut() {
+                    let jumped = if let Some(tab) = self.active_tab_mut() {
                         let pane = tab.model.pane_mut(side);
                         if let Some(vis_idx) = pane.find_type_ahead(&prefix) {
                             pane.selection.select_only(vis_idx);
@@ -1543,12 +2048,32 @@ impl Workspace {
                             tab.pane_ui(side)
                                 .scroll_handle
                                 .scroll_to_item(scroll_idx, ScrollStrategy::Center);
-                            cx.notify();
+                            true
+                        } else {
+                            false
                         }
+                    } else {
+                        false
+                    };
+                    if jumped {
+                        self.sync_preview_for_selection(cx);
+                        cx.notify();
                     }
                 }
             }
+            _ => {}
         }
+    }
+}
+
+fn same_volume(a: &Path, b: &Path) -> bool {
+    use std::path::Component;
+    match (a.components().next(), b.components().next()) {
+        (Some(Component::Prefix(pa)), Some(Component::Prefix(pb))) => pa
+            .as_os_str()
+            .to_string_lossy()
+            .eq_ignore_ascii_case(&pb.as_os_str().to_string_lossy()),
+        _ => true,
     }
 }
 
@@ -1588,8 +2113,8 @@ impl Render for Workspace {
                 .child(resizable_panel().child(main_panes))
                 .child(
                     resizable_panel()
-                        .size(px(296.))
-                        .size_range(px(230.)..px(460.))
+                        .size(px(304.))
+                        .size_range(px(240.)..px(480.))
                         .fixed()
                         .child(render_inspector(self, cx)),
                 )
@@ -1614,6 +2139,16 @@ impl Render for Workspace {
             center_and_inspector
         };
 
+        let quicklook_entry = if self.quicklook_open {
+            self.active_tab()
+                .and_then(|t| t.model.active_pane_ref().primary_selected_entry())
+                .cloned()
+        } else {
+            None
+        };
+        let quicklook_payload = self.preview_payload.clone();
+        let has_transfers = !self.transfers.is_empty();
+
         v_flex()
             .id("texplorer-workspace")
             .key_context("TExplorerWorkspace")
@@ -1625,6 +2160,9 @@ impl Render for Workspace {
             .overflow_hidden()
             .on_key_down(cx.listener(Self::handle_key_down))
             .on_action(cx.listener(|this, _: &NewTab, window, cx| {
+                if this.is_modal_blocking() {
+                    return;
+                }
                 if !this.settings.show_tabs {
                     this.settings.show_tabs = true;
                     let _ = this.settings.save();
@@ -1632,16 +2170,25 @@ impl Render for Workspace {
                 this.open_new_tab(Location::Home, window, cx);
             }))
             .on_action(cx.listener(|this, _: &CloseTab, window, cx| {
+                if this.is_modal_blocking() {
+                    return;
+                }
                 let idx = this.active_tab_index;
                 this.close_tab_at(idx, window, cx);
             }))
             .on_action(cx.listener(|this, _: &NextTab, window, cx| {
+                if this.is_modal_blocking() {
+                    return;
+                }
                 if !this.tabs.is_empty() {
                     let next = (this.active_tab_index + 1) % this.tabs.len();
                     this.select_tab(next, window, cx);
                 }
             }))
             .on_action(cx.listener(|this, _: &PrevTab, window, cx| {
+                if this.is_modal_blocking() {
+                    return;
+                }
                 if !this.tabs.is_empty() {
                     let prev = if this.active_tab_index == 0 {
                         this.tabs.len() - 1
@@ -1652,17 +2199,27 @@ impl Render for Workspace {
                 }
             }))
             .on_action(cx.listener(|this, _: &ToggleSplitPane, window, cx| {
+                if this.is_modal_blocking() {
+                    return;
+                }
                 this.toggle_split_active_tab(window, cx);
             }))
             .on_action(cx.listener(|this, _: &SwitchActivePane, _, cx| {
+                if this.is_modal_blocking() {
+                    return;
+                }
                 if let Some(tab) = this.active_tab_mut()
                     && tab.model.split_enabled
                 {
                     tab.model.active_pane = tab.model.active_pane.opposite();
+                    this.sync_preview_for_selection(cx);
                     cx.notify();
                 }
             }))
             .on_action(cx.listener(|this, _: &FocusAddressBar, window, cx| {
+                if this.is_modal_blocking() {
+                    return;
+                }
                 let side = this
                     .active_tab()
                     .map(|t| t.model.active_pane)
@@ -1670,6 +2227,9 @@ impl Render for Workspace {
                 this.begin_edit_address(side, window, cx);
             }))
             .on_action(cx.listener(|this, _: &GoBack, window, cx| {
+                if this.is_modal_blocking() {
+                    return;
+                }
                 let side = this
                     .active_tab()
                     .map(|t| t.model.active_pane)
@@ -1677,6 +2237,9 @@ impl Render for Workspace {
                 this.go_back(side, window, cx);
             }))
             .on_action(cx.listener(|this, _: &GoForward, window, cx| {
+                if this.is_modal_blocking() {
+                    return;
+                }
                 let side = this
                     .active_tab()
                     .map(|t| t.model.active_pane)
@@ -1684,6 +2247,9 @@ impl Render for Workspace {
                 this.go_forward(side, window, cx);
             }))
             .on_action(cx.listener(|this, _: &GoUp, window, cx| {
+                if this.is_modal_blocking() {
+                    return;
+                }
                 let side = this
                     .active_tab()
                     .map(|t| t.model.active_pane)
@@ -1691,6 +2257,9 @@ impl Render for Workspace {
                 this.go_up(side, window, cx);
             }))
             .on_action(cx.listener(|this, _: &RefreshPane, window, cx| {
+                if this.is_modal_blocking() {
+                    return;
+                }
                 let side = this
                     .active_tab()
                     .map(|t| t.model.active_pane)
@@ -1698,6 +2267,9 @@ impl Render for Workspace {
                 this.refresh_pane(side, window, cx);
             }))
             .on_action(cx.listener(|this, _: &FocusFilter, window, cx| {
+                if this.is_modal_blocking() {
+                    return;
+                }
                 if let Some(tab) = this.active_tab() {
                     let side = tab.model.active_pane;
                     let input = tab.pane_ui(side).filter_input.clone();
@@ -1705,12 +2277,21 @@ impl Render for Workspace {
                 }
             }))
             .on_action(cx.listener(|this, _: &ToggleSidebar, _, cx| {
+                if this.is_modal_blocking() {
+                    return;
+                }
                 this.toggle_sidebar(cx);
             }))
             .on_action(cx.listener(|this, _: &ToggleInspector, _, cx| {
+                if this.is_modal_blocking() {
+                    return;
+                }
                 this.toggle_inspector(cx);
             }))
             .on_action(cx.listener(|this, _: &ToggleHiddenFiles, _, cx| {
+                if this.is_modal_blocking() {
+                    return;
+                }
                 let side = this
                     .active_tab()
                     .map(|t| t.model.active_pane)
@@ -1718,6 +2299,9 @@ impl Render for Workspace {
                 this.toggle_hidden_for_pane(side, cx);
             }))
             .on_action(cx.listener(|this, _: &SelectAllItems, _, cx| {
+                if this.is_modal_blocking() {
+                    return;
+                }
                 if let Some(tab) = this.active_tab_mut() {
                     let pane = tab.model.active_pane_mut();
                     let total = pane.filtered_indices.len();
@@ -1725,7 +2309,57 @@ impl Render for Workspace {
                     cx.notify();
                 }
             }))
+            .on_action(cx.listener(|this, _: &CopySelected, window, cx| {
+                if this.is_modal_blocking() {
+                    return;
+                }
+                let side = this
+                    .active_tab()
+                    .map(|t| t.model.active_pane)
+                    .unwrap_or(PaneSide::Left);
+                this.copy_or_cut_selected(side, false, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &CutSelected, window, cx| {
+                if this.is_modal_blocking() {
+                    return;
+                }
+                let side = this
+                    .active_tab()
+                    .map(|t| t.model.active_pane)
+                    .unwrap_or(PaneSide::Left);
+                this.copy_or_cut_selected(side, true, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &PasteItems, window, cx| {
+                if this.is_modal_blocking() {
+                    return;
+                }
+                let dir = this.active_tab().and_then(|t| {
+                    t.model
+                        .active_pane_ref()
+                        .location
+                        .as_local_path()
+                        .map(|p| p.to_path_buf())
+                });
+                if let Some(dest) = dir {
+                    this.paste_clipboard_into(dest, window, cx);
+                }
+            }))
+            .on_action(cx.listener(|this, _: &UndoActionCmd, window, cx| {
+                if this.is_modal_blocking() {
+                    return;
+                }
+                this.undo_last_action(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &RedoActionCmd, window, cx| {
+                if this.is_modal_blocking() {
+                    return;
+                }
+                this.redo_last_action(window, cx);
+            }))
             .on_action(cx.listener(|this, _: &CreateNewFolder, window, cx| {
+                if this.is_modal_blocking() {
+                    return;
+                }
                 let info = this.active_tab().and_then(|t| {
                     let side = t.model.active_pane;
                     t.model
@@ -1739,6 +2373,9 @@ impl Render for Workspace {
                 }
             }))
             .on_action(cx.listener(|this, _: &RenameSelected, window, cx| {
+                if this.is_modal_blocking() {
+                    return;
+                }
                 let info = this.active_tab().and_then(|t| {
                     let side = t.model.active_pane;
                     let entry = t.model.pane(side).primary_selected_entry()?;
@@ -1750,6 +2387,9 @@ impl Render for Workspace {
                 }
             }))
             .on_action(cx.listener(|this, _: &DeleteToTrash, window, cx| {
+                if this.is_modal_blocking() {
+                    return;
+                }
                 let side = this
                     .active_tab()
                     .map(|t| t.model.active_pane)
@@ -1757,6 +2397,9 @@ impl Render for Workspace {
                 this.trash_selected(side, window, cx);
             }))
             .on_action(cx.listener(|this, _: &DeletePermanent, _, cx| {
+                if this.is_modal_blocking() {
+                    return;
+                }
                 let side = this
                     .active_tab()
                     .map(|t| t.model.active_pane)
@@ -1769,6 +2412,9 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &CancelOrDismiss, window, cx| {
                 if this.context_menu.is_some() {
                     this.dismiss_context_menu(cx);
+                } else if this.quicklook_open {
+                    this.close_quicklook(cx);
+                    this.focus_handle.focus(window, cx);
                 } else if this.active_modal.is_some() {
                     this.close_modal(cx);
                     this.focus_handle.focus(window, cx);
@@ -1791,22 +2437,16 @@ impl Render for Workspace {
             .child(render_header(self, window, cx))
             // Edge-to-edge split body
             .child(div().flex_1().min_h_0().w_full().overflow_hidden().child(body))
-            // Floating context menu overlay
-            .when_some(self.context_menu.clone(), |el, menu| {
-                el.child(render_context_menu(self, &menu, window, cx))
-            })
-            // Active modal overlay (Settings / Prompts / Confirmations)
-            .when_some(self.active_modal.clone(), |el, modal| {
-                el.child(render_active_modal(self, &modal, cx))
-            })
-            // Subtle bottom-right toast banner
+            // Bottom-right floating transfer queue drawer
+            .when(has_transfers, |el| el.child(render_transfer_drawer(self, cx)))
+            // Subtle bottom-right toast banner (lifted above transfer drawer when visible)
             .when_some(self.toast.clone(), |el, toast| {
                 el.child(
                     h_flex()
                         .id("toast-banner")
                         .absolute()
                         .right(px(16.))
-                        .bottom(px(34.))
+                        .bottom(if has_transfers { px(16.) } else { px(34.) })
                         .px_3()
                         .py_2()
                         .gap_2()
@@ -1829,6 +2469,22 @@ impl Render for Workspace {
                                 .child(toast.message),
                         ),
                 )
+            })
+            // Floating context menu overlay
+            .when_some(self.context_menu.clone(), |el, menu| {
+                el.child(render_context_menu(self, &menu, window, cx))
+            })
+            // QuickLook Spacebar modal overlay
+            .when_some(quicklook_entry, |el, entry| {
+                el.child(render_quicklook_modal(self, &entry, &quicklook_payload, cx))
+            })
+            // Active modal overlay (Settings / Prompts / Confirmations)
+            .when_some(self.active_modal.clone(), |el, modal| {
+                el.child(render_active_modal(self, &modal, cx))
+            })
+            // Highest-priority Conflict Resolution modal
+            .when_some(self.conflict_queue.front(), |el, prompt| {
+                el.child(render_conflict_modal(self, prompt, cx))
             })
     }
 }

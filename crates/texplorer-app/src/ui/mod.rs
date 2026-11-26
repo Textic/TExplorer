@@ -3,6 +3,8 @@ pub mod header;
 pub mod inspector;
 pub mod modals;
 pub mod pane;
+pub mod quicklook;
 pub mod sidebar;
+pub mod transfers;
 pub mod views;
 pub mod workspace;

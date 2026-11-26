@@ -1,5 +1,5 @@
 use gpui_kit::{
-    Context, SharedString,
+    Context, ObjectFit, SharedString, StyledText,
     assets::IconName as LucideIcon,
     component::{
         Icon, Sizable as _, Size, StyledExt as _,
@@ -8,10 +8,11 @@ use gpui_kit::{
         scroll::ScrollableElement as _,
         v_flex,
     },
-    div, prelude::*, px,
+    div, img, prelude::*, px,
 };
 use texplorer_core::EntryFlags;
 
+use crate::preview::PreviewPayload;
 use crate::theme::{
     BG_BASE, BG_ELEVATED, BG_SURFACE, BORDER_SUBTLE, RADIUS_CONTROL, RADIUS_ROW, TEXT_MUTED,
     TEXT_PRIMARY, TEXT_SECONDARY, file_kind_visual, format_size, format_timestamp, soft_tint,
@@ -19,7 +20,7 @@ use crate::theme::{
 };
 use crate::ui::workspace::Workspace;
 
-/// Renders the collapsible right-hand Preview & Inspector panel (`Alt+P`).
+/// Renders the collapsible right-hand Preview & Inspector panel (`Alt+P`) with live inline preview.
 pub fn render_inspector(ws: &Workspace, cx: &mut Context<Workspace>) -> impl IntoElement {
     let accent = ws.settings.accent;
     let unit = ws.settings.size_unit;
@@ -50,14 +51,31 @@ pub fn render_inspector(ws: &Workspace, cx: &mut Context<Workspace>) -> impl Int
                         .child("INSPECTOR"),
                 )
                 .child(
-                    Button::new("insp-close")
-                        .with_size(Size::XSmall)
-                        .ghost()
-                        .icon(LucideIcon::X)
-                        .tooltip("Close Inspector (Alt+P)")
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.toggle_inspector(cx);
-                        })),
+                    h_flex()
+                        .items_center()
+                        .gap_1()
+                        .when(primary.is_some(), |el| {
+                            el.child(
+                                Button::new("insp-quicklook-btn")
+                                    .with_size(Size::XSmall)
+                                    .ghost()
+                                    .icon(LucideIcon::Eye)
+                                    .tooltip("QuickLook (Space)")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.toggle_quicklook(cx);
+                                    })),
+                            )
+                        })
+                        .child(
+                            Button::new("insp-close")
+                                .with_size(Size::XSmall)
+                                .ghost()
+                                .icon(LucideIcon::X)
+                                .tooltip("Close Inspector (Alt+P)")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.toggle_inspector(cx);
+                                })),
+                        ),
                 ),
         )
         .child(match primary {
@@ -78,7 +96,7 @@ pub fn render_inspector(ws: &Workspace, cx: &mut Context<Workspace>) -> impl Int
                     div()
                         .text_xs()
                         .text_color(solid(TEXT_MUTED))
-                        .child("Select a file or folder to inspect details."),
+                        .child("Select a file or folder to inspect or press Space for QuickLook."),
                 )
                 .into_any_element(),
             Some(entry) => {
@@ -95,6 +113,16 @@ pub fn render_inspector(ws: &Workspace, cx: &mut Context<Workspace>) -> impl Int
                 let created_str: SharedString = format_timestamp(entry.created_secs).into();
                 let local_path = entry.location.as_local_path().map(|p| p.to_path_buf());
                 let is_dir = entry.is_dir();
+
+                let matches_preview = local_path.as_ref().is_some_and(|p| {
+                    ws.preview_path.as_ref().is_some_and(|pp| pp == p)
+                });
+                let preview_visual = if matches_preview {
+                    render_inline_preview(&ws.preview_payload, icon, icon_hex, unit)
+                        .into_any_element()
+                } else {
+                    render_icon_box(icon, icon_hex).into_any_element()
+                };
 
                 let mut attr_badges: Vec<&'static str> = Vec::new();
                 if entry.flags.contains(EntryFlags::IS_READONLY) {
@@ -128,28 +156,23 @@ pub fn render_inspector(ws: &Workspace, cx: &mut Context<Workspace>) -> impl Int
                     .overflow_y_scrollbar()
                     .p_3()
                     .gap_3()
-                    // Semantic header preview card
+                    // Live inline preview card (click to launch QuickLook)
                     .child(
                         v_flex()
+                            .id("insp-preview-card")
                             .w_full()
-                            .p_4()
+                            .p_3()
                             .gap_2()
                             .items_center()
                             .rounded(px(RADIUS_ROW))
+                            .cursor_pointer()
                             .bg(solid(BG_BASE))
                             .border_1()
                             .border_color(solid(BORDER_SUBTLE))
-                            .child(
-                                div()
-                                    .w(px(52.))
-                                    .h(px(52.))
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .rounded(px(RADIUS_ROW))
-                                    .bg(soft_tint(icon_hex, 0.14))
-                                    .child(Icon::new(icon).large().text_color(solid(icon_hex))),
-                            )
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.toggle_quicklook(cx);
+                            }))
+                            .child(preview_visual)
                             .child(
                                 div()
                                     .w_full()
@@ -235,7 +258,12 @@ pub fn render_inspector(ws: &Workspace, cx: &mut Context<Workspace>) -> impl Int
                                     .primary()
                                     .label(if is_dir { "Open Folder" } else { "Open File" })
                                     .on_click(cx.listener(move |this, _, window, cx| {
-                                        this.open_location_or_file(open_loc.clone(), is_dir, window, cx);
+                                        this.open_location_or_file(
+                                            open_loc.clone(),
+                                            is_dir,
+                                            window,
+                                            cx,
+                                        );
                                     })),
                             )
                             .child(
@@ -284,6 +312,130 @@ pub fn render_inspector(ws: &Workspace, cx: &mut Context<Workspace>) -> impl Int
                     .into_any_element()
             }
         })
+}
+
+fn render_inline_preview(
+    payload: &PreviewPayload,
+    fallback_icon: LucideIcon,
+    fallback_hex: u32,
+    unit: texplorer_core::SizeUnit,
+) -> impl IntoElement {
+    match payload {
+        PreviewPayload::Image {
+            image,
+            orig_width,
+            orig_height,
+        } => v_flex()
+            .w_full()
+            .items_center()
+            .gap_1()
+            .child(
+                div()
+                    .w_full()
+                    .h(px(164.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .overflow_hidden()
+                    .child(
+                        img(image.clone())
+                            .max_w_full()
+                            .max_h_full()
+                            .object_fit(ObjectFit::Contain),
+                    ),
+            )
+            .child(
+                div()
+                    .text_size(px(10.))
+                    .text_color(solid(TEXT_MUTED))
+                    .child(format!("{orig_width} × {orig_height}")),
+            )
+            .into_any_element(),
+        PreviewPayload::ShellThumbnail { image, .. } => div()
+            .w_full()
+            .h(px(148.))
+            .flex()
+            .items_center()
+            .justify_center()
+            .child(
+                img(image.clone())
+                    .w(px(128.))
+                    .h(px(128.))
+                    .object_fit(ObjectFit::Contain),
+            )
+            .into_any_element(),
+        PreviewPayload::Code { lines, .. } => v_flex()
+            .w_full()
+            .h(px(148.))
+            .p_2()
+            .overflow_hidden()
+            .rounded(px(RADIUS_CONTROL))
+            .bg(solid(BG_SURFACE))
+            .border_1()
+            .border_color(solid(BORDER_SUBTLE))
+            .font_family("Consolas")
+            .children(lines.iter().take(9).map(|line| {
+                div()
+                    .w_full()
+                    .truncate()
+                    .text_size(px(10.))
+                    .text_color(solid(TEXT_PRIMARY))
+                    .child(
+                        StyledText::new(line.text.clone()).with_highlights(line.spans.clone()),
+                    )
+            }))
+            .into_any_element(),
+        PreviewPayload::Markdown { source, .. } => v_flex()
+            .w_full()
+            .h(px(140.))
+            .p_2()
+            .overflow_hidden()
+            .rounded(px(RADIUS_CONTROL))
+            .bg(solid(BG_SURFACE))
+            .border_1()
+            .border_color(solid(BORDER_SUBTLE))
+            .children(source.lines().take(8).map(|l| {
+                div()
+                    .w_full()
+                    .truncate()
+                    .text_size(px(11.))
+                    .text_color(solid(TEXT_SECONDARY))
+                    .child(l.to_string())
+            }))
+            .into_any_element(),
+        PreviewPayload::FolderSummary {
+            total_items,
+            files,
+            folders,
+            immediate_bytes,
+        } => v_flex()
+            .items_center()
+            .gap_1p5()
+            .child(render_icon_box(fallback_icon, fallback_hex))
+            .child(
+                div()
+                    .text_size(px(11.))
+                    .text_color(solid(TEXT_SECONDARY))
+                    .child(format!(
+                        "{total_items} items ({folders} dirs, {files} files • {})",
+                        format_size(*immediate_bytes, unit)
+                    )),
+            )
+            .into_any_element(),
+        _ => render_icon_box(fallback_icon, fallback_hex).into_any_element(),
+    }
+}
+
+fn render_icon_box(icon: LucideIcon, icon_hex: u32) -> impl IntoElement {
+    div()
+        .w(px(52.))
+        .h(px(52.))
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded(px(RADIUS_ROW))
+        .bg(soft_tint(icon_hex, 0.14))
+        .child(Icon::new(icon).large().text_color(solid(icon_hex)))
 }
 
 fn meta_row(label: &'static str, value: SharedString) -> impl IntoElement {
