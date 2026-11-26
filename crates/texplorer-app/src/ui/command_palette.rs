@@ -34,6 +34,7 @@ pub enum PaletteCommand {
     ToggleInspector,
     ToggleHidden,
     ToggleTabs,
+    ToggleRestoreSession,
     ViewMode(ViewMode),
     NewFolder,
     NewFile,
@@ -186,6 +187,14 @@ pub fn all_palette_items() -> Vec<PaletteItem> {
             shortcut: None,
             icon: LucideIcon::LayoutList,
             cmd: PaletteCommand::ToggleTabs,
+        },
+        PaletteItem {
+            id: "cp-restore-session",
+            category: "App",
+            title: "Toggle Restore Tabs & Window on Startup",
+            shortcut: None,
+            icon: LucideIcon::RefreshCw,
+            cmd: PaletteCommand::ToggleRestoreSession,
         },
         PaletteItem {
             id: "cp-vm-details",
@@ -372,6 +381,7 @@ pub fn execute_palette_command(
         PaletteCommand::ToggleInspector => ws.toggle_inspector(cx),
         PaletteCommand::ToggleHidden => ws.toggle_hidden_for_pane(side, cx),
         PaletteCommand::ToggleTabs => ws.toggle_show_tabs(cx),
+        PaletteCommand::ToggleRestoreSession => ws.toggle_restore_tabs_on_startup(window, cx),
         PaletteCommand::ViewMode(m) => ws.set_pane_view_mode(side, m, cx),
         PaletteCommand::NewFolder => {
             if let Some(dir) = ws

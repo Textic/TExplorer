@@ -45,11 +45,7 @@ pub fn render_pane(
     let is_home = model.location == Location::Home;
     let total_visible = model.filtered_indices.len();
     let selected_count = model.selection.len();
-    let selected_bytes: u64 = model
-        .selected_entries()
-        .into_iter()
-        .filter_map(|e| e.size)
-        .sum();
+    let selected_bytes = model.selected_bytes;
     let pane_error = model.error.clone();
     let is_loading = model.loading;
     let filter_non_empty = !model.quick_filter.trim().is_empty();

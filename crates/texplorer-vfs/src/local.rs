@@ -1,6 +1,8 @@
 use std::path::Path;
 
-use texplorer_core::{EntryFlags, FileEntry, Location, classify_extension};
+use texplorer_core::{
+    EntryFlags, FileEntry, Location, classify_extension, location::normalize_local_path,
+};
 
 /// Fast local directory enumerator using `FindFirstFileExW` (`FIND_FIRST_EX_LARGE_FETCH`
 /// + `FindExInfoBasic`) on Windows for high throughput on large folders.
@@ -21,8 +23,10 @@ pub fn list_local_dir(dir: &Path) -> Result<Vec<FileEntry>, String> {
         WIN32_FIND_DATAW,
     };
 
-    let mut pattern_os = dir.as_os_str().to_os_string();
-    let dir_str = dir.to_string_lossy();
+    // Normalize the parent directory once rather than re-normalizing every child path (100k+ files).
+    let norm_dir = normalize_local_path(dir);
+    let mut pattern_os = norm_dir.as_os_str().to_os_string();
+    let dir_str = norm_dir.to_string_lossy();
     if !dir_str.ends_with('\\') && !dir_str.ends_with('/') {
         pattern_os.push("\\");
     }
@@ -67,7 +71,7 @@ pub fn list_local_dir(dir: &Path) -> Result<Vec<FileEntry>, String> {
     }
     let _guard = FindGuard(handle);
 
-    let mut entries = Vec::with_capacity(64);
+    let mut entries = Vec::with_capacity(256);
     loop {
         let name_len = data
             .cFileName
@@ -131,7 +135,7 @@ pub fn list_local_dir(dir: &Path) -> Result<Vec<FileEntry>, String> {
             let created_secs = filetime_to_unix_secs(data.ftCreationTime);
 
             entries.push(FileEntry {
-                location: Location::local(dir.join(&name_os)),
+                location: Location::Local(norm_dir.join(&name_os)),
                 name,
                 extension,
                 size,

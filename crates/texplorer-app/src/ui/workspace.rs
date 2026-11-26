@@ -9,7 +9,7 @@ use futures_util::StreamExt as _;
 use gpui_kit::{
     ClipboardItem, Context, Entity, FocusHandle, Focusable, KeyDownEvent, MouseDownEvent, Pixels,
     Point, RenderImage, ScrollStrategy, SharedString, Subscription, UniformListScrollHandle,
-    Window,
+    Window, WindowBounds,
     component::{
         h_flex,
         input::{InputEvent, InputState},
@@ -19,8 +19,9 @@ use gpui_kit::{
     div, prelude::*, px,
 };
 use texplorer_core::{
-    AccentPreset, AppSettings, FileEntry, KnownFolder, KnownFolderKind, Location, PaneSide,
-    SearchScope, SizeUnit, SortColumn, TabModel, ThemePreset, ViewMode, VolumeInfo,
+    AccentPreset, AppSession, AppSettings, FileEntry, KnownFolder, KnownFolderKind, Location,
+    PaneSide, SavedPaneState, SavedTabState, SearchScope, SizeUnit, SortColumn, SortSpec,
+    TabModel, ThemePreset, ViewMode, VolumeInfo, WindowGeometry, sort_entries,
 };
 use texplorer_mft::{
     IndexServiceInstallState, IndexServiceStatus, install_service_elevated,
@@ -128,6 +129,7 @@ enum BgEvent {
         tab_id: Uuid,
         side: PaneSide,
         generation: u64,
+        sort: SortSpec,
         result: Result<Vec<FileEntry>, String>,
     },
     DirectoryChanged {
@@ -297,6 +299,7 @@ pub struct Workspace {
     toast_seq: u64,
     type_ahead_buf: String,
     type_ahead_at: Instant,
+    last_window_geometry: Option<WindowGeometry>,
     bg_tx: UnboundedSender<BgEvent>,
 }
 
@@ -305,6 +308,7 @@ impl Workspace {
         settings: AppSettings,
         system_is_dark: bool,
         initial_intent: LaunchIntent,
+        initial_session: Option<AppSession>,
         mut ipc_rx: UnboundedReceiver<LaunchIntent>,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -325,8 +329,8 @@ impl Workspace {
         let service_install_state = query_service_install_state();
         let shell_worker = ShellWorker::spawn();
 
-        let (initial_location, pending_select) = match initial_intent {
-            LaunchIntent::OpenLocation(path) => (Location::local(path), None),
+        let explicit_launch = match initial_intent {
+            LaunchIntent::OpenLocation(path) => Some((Location::local(path), None)),
             LaunchIntent::SelectFile(path) => {
                 let name = path
                     .file_name()
@@ -335,10 +339,11 @@ impl Workspace {
                     .parent()
                     .map(Location::local)
                     .unwrap_or(Location::Home);
-                (parent, name)
+                Some((parent, name))
             }
-            _ => (Location::Home, None),
+            _ => None,
         };
+        let initial_window_geom = initial_session.as_ref().and_then(|s| s.window);
 
         let hash_verify_input = cx.new(|cx| {
             InputState::new(window, cx).placeholder("Paste expected SHA-256 or MD5 to verify...")
@@ -404,6 +409,7 @@ impl Workspace {
             toast_seq: 0,
             type_ahead_buf: String::new(),
             type_ahead_at: Instant::now() - Duration::from_secs(5),
+            last_window_geometry: initial_window_geom,
             bg_tx,
         };
 
@@ -419,7 +425,21 @@ impl Workspace {
         })
         .detach();
 
-        ws.open_tab_with_selection(initial_location, pending_select, window, cx);
+        let restored = if ws.settings.restore_tabs_on_startup
+            && let Some(session) = initial_session
+            && !session.tabs.is_empty()
+        {
+            ws.restore_tabs_from_session(session, window, cx);
+            true
+        } else {
+            false
+        };
+
+        if let Some((loc, pending_select)) = explicit_launch {
+            ws.open_tab_with_selection(loc, pending_select, window, cx);
+        } else if !restored {
+            ws.open_tab_with_selection(Location::Home, None, window, cx);
+        }
         ws.refresh_service_status(cx);
         if ws.settings.auto_check_updates {
             ws.check_for_updates(false, cx);
@@ -538,6 +558,7 @@ impl Workspace {
                 tab_id,
                 side,
                 generation,
+                sort,
                 result,
             } => {
                 let mut uncached_folders: Vec<PathBuf> = Vec::new();
@@ -550,6 +571,7 @@ impl Workspace {
                     let is_local_dir = matches!(pane.location, Location::Local(_));
                     match result {
                         Ok(mut entries) => {
+                            let mut patched_cached_sizes = false;
                             if calc_folders && is_local_dir {
                                 for entry in &mut entries {
                                     if entry.is_dir()
@@ -558,19 +580,27 @@ impl Workspace {
                                     {
                                         if let Some(&cached) = self.folder_size_cache.get(local) {
                                             entry.size = Some(cached);
+                                            patched_cached_sizes = true;
                                         } else {
                                             uncached_folders.push(local.to_path_buf());
                                         }
                                     }
                                 }
                             }
-                            pane.set_entries(entries);
+                            if pane.sort == sort
+                                && !(patched_cached_sizes && pane.sort.column == SortColumn::Size)
+                            {
+                                pane.set_presorted_entries(entries);
+                            } else {
+                                pane.set_entries(entries);
+                            }
                         }
                         Err(err) => {
                             pane.loading = false;
                             pane.entries.clear();
                             pane.filtered_indices.clear();
                             pane.selection.clear();
+                            pane.selected_bytes = 0;
                             pane.error = Some(err);
                         }
                     }
@@ -641,6 +671,10 @@ impl Workspace {
                     }
                     LaunchIntent::DelegateToWindowsExplorer(raw) => {
                         let _ = texplorer_platform::delegate_to_windows_explorer(&raw);
+                    }
+                    LaunchIntent::EnableDefaultExplorer { intercept_win_e } => {
+                        self.settings.intercept_win_e = intercept_win_e;
+                        self.enable_default_file_manager(cx);
                     }
                     LaunchIntent::RestoreDefaultExplorer => {
                         self.restore_default_file_manager(cx);
@@ -855,6 +889,8 @@ impl Workspace {
                         if changed {
                             if pane.sort.column == SortColumn::Size {
                                 pane.resort();
+                            } else {
+                                pane.recompute_selection_bytes();
                             }
                             cx.notify();
                         }
@@ -1030,14 +1066,148 @@ impl Workspace {
         self.active_tab_index = self.tabs.len() - 1;
         self.reload_pane_by_id(tab_id, PaneSide::Left, cx);
         self.rebind_watcher(tab_id, PaneSide::Left);
+        self.save_session(Some(window));
         cx.notify();
     }
 
-    pub fn select_tab(&mut self, index: usize, _window: &mut Window, cx: &mut Context<Self>) {
+    fn restore_tabs_from_session(
+        &mut self,
+        session: AppSession,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let mut panes_to_load: Vec<(Uuid, PaneSide)> = Vec::new();
+        for saved in session.tabs {
+            let mut model = TabModel::new(
+                saved.left.location.clone(),
+                saved.left.view_mode,
+                saved.left.show_hidden,
+            );
+            model.left.sort = saved.left.sort;
+            let tab_id = model.id;
+            let left_ui =
+                self.create_pane_ui(tab_id, PaneSide::Left, &saved.left.location, window, cx);
+            panes_to_load.push((tab_id, PaneSide::Left));
+
+            let right_ui = if let Some(saved_right) = saved.right {
+                let mut r_model = texplorer_core::PaneModel::new(
+                    saved_right.location.clone(),
+                    saved_right.view_mode,
+                    saved_right.show_hidden,
+                );
+                r_model.sort = saved_right.sort;
+                model.right = Some(r_model);
+                model.split_enabled = saved.split_enabled;
+                model.active_pane = if saved.split_enabled {
+                    saved.active_pane
+                } else {
+                    PaneSide::Left
+                };
+                let ui = self.create_pane_ui(
+                    tab_id,
+                    PaneSide::Right,
+                    &saved_right.location,
+                    window,
+                    cx,
+                );
+                if saved.split_enabled {
+                    panes_to_load.push((tab_id, PaneSide::Right));
+                }
+                Some(ui)
+            } else {
+                None
+            };
+
+            self.tabs.push(TabUiState {
+                model,
+                left_ui,
+                right_ui,
+            });
+        }
+
+        if !self.tabs.is_empty() {
+            self.active_tab_index = session.active_tab_index.min(self.tabs.len() - 1);
+            for (tab_id, side) in panes_to_load {
+                self.reload_pane_by_id(tab_id, side, cx);
+                self.rebind_watcher(tab_id, side);
+            }
+        }
+    }
+
+    fn capture_window_geometry(&mut self, window: &Window) {
+        let (rect, maximized) = match window.window_bounds() {
+            WindowBounds::Windowed(r) => (r, false),
+            WindowBounds::Maximized(r) | WindowBounds::Fullscreen(r) => (r, true),
+        };
+        let geom = WindowGeometry {
+            x: f32::from(rect.origin.x),
+            y: f32::from(rect.origin.y),
+            width: f32::from(rect.size.width),
+            height: f32::from(rect.size.height),
+            maximized,
+        };
+        if geom.is_valid() {
+            self.last_window_geometry = Some(geom);
+        }
+    }
+
+    fn save_session(&mut self, window: Option<&Window>) {
+        if let Some(w) = window {
+            self.capture_window_geometry(w);
+        }
+        self.persist_session_snapshot();
+    }
+
+    fn persist_session_snapshot(&self) {
+        if !self.settings.restore_tabs_on_startup || self.tabs.is_empty() {
+            return;
+        }
+        let tabs: Vec<SavedTabState> = self
+            .tabs
+            .iter()
+            .map(|t| SavedTabState {
+                split_enabled: t.model.split_enabled,
+                active_pane: t.model.active_pane,
+                left: SavedPaneState {
+                    location: t.model.left.location.clone(),
+                    view_mode: t.model.left.view_mode,
+                    sort: t.model.left.sort,
+                    show_hidden: t.model.left.show_hidden,
+                },
+                right: t.model.right.as_ref().map(|r| SavedPaneState {
+                    location: r.location.clone(),
+                    view_mode: r.view_mode,
+                    sort: r.sort,
+                    show_hidden: r.show_hidden,
+                }),
+            })
+            .collect();
+        let session = AppSession {
+            version: 1,
+            active_tab_index: self.active_tab_index.min(tabs.len().saturating_sub(1)),
+            tabs,
+            window: self.last_window_geometry,
+        };
+        let _ = session.save();
+    }
+
+    pub fn toggle_restore_tabs_on_startup(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.settings.restore_tabs_on_startup = !self.settings.restore_tabs_on_startup;
+        let _ = self.settings.save();
+        if self.settings.restore_tabs_on_startup {
+            self.save_session(Some(window));
+        } else {
+            AppSession::clear();
+        }
+        cx.notify();
+    }
+
+    pub fn select_tab(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
         if index < self.tabs.len() {
             self.active_tab_index = index;
             self.context_menu = None;
             self.sync_preview_for_selection(cx);
+            self.save_session(Some(window));
             cx.notify();
         }
     }
@@ -1054,6 +1224,7 @@ impl Workspace {
             }
             self.context_menu = None;
             self.sync_preview_for_selection(cx);
+            self.save_session(Some(window));
             cx.notify();
         }
     }
@@ -1073,6 +1244,7 @@ impl Workspace {
             self.reload_pane_by_id(tab_id, PaneSide::Right, cx);
             self.rebind_watcher(tab_id, PaneSide::Right);
         }
+        self.save_session(Some(window));
         cx.notify();
     }
 
@@ -1150,6 +1322,7 @@ impl Workspace {
         if changed {
             self.reload_pane_by_id(tab_id, side, cx);
             self.rebind_watcher(tab_id, side);
+            self.save_session(Some(window));
         }
         self.focus_handle.focus(window, cx);
         cx.notify();
@@ -1170,6 +1343,7 @@ impl Workspace {
                 .update(cx, |s, cx| s.set_value("", window, cx));
             self.reload_pane_by_id(tab_id, side, cx);
             self.rebind_watcher(tab_id, side);
+            self.save_session(Some(window));
             cx.notify();
         }
     }
@@ -1189,6 +1363,7 @@ impl Workspace {
                 .update(cx, |s, cx| s.set_value("", window, cx));
             self.reload_pane_by_id(tab_id, side, cx);
             self.rebind_watcher(tab_id, side);
+            self.save_session(Some(window));
             cx.notify();
         }
     }
@@ -1208,6 +1383,7 @@ impl Workspace {
                 .update(cx, |s, cx| s.set_value("", window, cx));
             self.reload_pane_by_id(tab_id, side, cx);
             self.rebind_watcher(tab_id, side);
+            self.save_session(Some(window));
             cx.notify();
         }
     }
@@ -1238,11 +1414,13 @@ impl Workspace {
         pane.load_generation = pane.load_generation.wrapping_add(1);
         let generation = pane.load_generation;
         let location = pane.location.clone();
+        let sort = pane.sort;
 
         if location == Location::Home {
             pane.entries.clear();
             pane.filtered_indices.clear();
             pane.selection.clear();
+            pane.selected_bytes = 0;
             pane.loading = false;
             pane.error = None;
             cx.notify();
@@ -1254,12 +1432,16 @@ impl Workspace {
         let tx = self.bg_tx.clone();
         tokio_runtime().spawn(async move {
             let loc_clone = location.clone();
-            let result = tokio::task::spawn_blocking(move || match &loc_clone {
-                Location::Search { query, scope } => {
-                    let cancel = AtomicBool::new(false);
-                    execute_search(query, scope, use_mft, 1_000, &cancel).map(|r| r.entries)
-                }
-                _ => texplorer_vfs::list_location(&loc_clone),
+            let result = tokio::task::spawn_blocking(move || {
+                let mut entries = match &loc_clone {
+                    Location::Search { query, scope } => {
+                        let cancel = AtomicBool::new(false);
+                        execute_search(query, scope, use_mft, 1_000, &cancel).map(|r| r.entries)?
+                    }
+                    _ => texplorer_vfs::list_location(&loc_clone)?,
+                };
+                sort_entries(&mut entries, sort);
+                Ok(entries)
             })
             .await
             .unwrap_or_else(|e| Err(format!("Directory task panicked: {e}")));
@@ -1267,6 +1449,7 @@ impl Workspace {
                 tab_id,
                 side,
                 generation,
+                sort,
                 result,
             });
         });
@@ -1448,6 +1631,7 @@ impl Workspace {
     pub fn set_pane_view_mode(&mut self, side: PaneSide, mode: ViewMode, cx: &mut Context<Self>) {
         if let Some(tab) = self.active_tab_mut() {
             tab.model.pane_mut(side).view_mode = mode;
+            self.save_session(None);
             cx.notify();
         }
     }
@@ -1457,6 +1641,7 @@ impl Workspace {
             let pane = tab.model.pane_mut(side);
             pane.show_hidden = !pane.show_hidden;
             pane.rebuild_filter();
+            self.save_session(None);
             cx.notify();
         }
     }
@@ -1471,6 +1656,7 @@ impl Workspace {
             let pane = tab.model.pane_mut(side);
             pane.sort.toggle_column(column);
             pane.resort();
+            self.save_session(None);
             cx.notify();
         }
     }
@@ -1492,6 +1678,7 @@ impl Workspace {
             let pane = tab.model.pane_mut(side);
             if ev.click_count >= 2 {
                 pane.selection.select_only(vis_idx);
+                pane.recompute_selection_bytes();
                 pane.visible_entry(vis_idx)
                     .map(|e| (e.location.clone(), e.is_dir()))
             } else {
@@ -1502,6 +1689,7 @@ impl Workspace {
                 } else {
                     pane.selection.select_only(vis_idx);
                 }
+                pane.recompute_selection_bytes();
                 None
             }
         };
@@ -1530,6 +1718,7 @@ impl Workspace {
             let pane = tab.model.pane_mut(side);
             if !pane.selection.contains(vis_idx) {
                 pane.selection.select_only(vis_idx);
+                pane.recompute_selection_bytes();
             }
             pane.visible_entry(vis_idx).cloned()
         };
@@ -3262,6 +3451,7 @@ impl Workspace {
                     let pane = tab.model.pane_mut(side);
                     let total = pane.filtered_indices.len();
                     if let Some(idx) = pane.selection.move_cursor(delta, total, extend) {
+                        pane.recompute_selection_bytes();
                         let scroll_idx = match pane.view_mode {
                             ViewMode::Grid => {
                                 let cols = if tab.model.split_enabled { 4 } else { 6 };
@@ -3324,6 +3514,7 @@ impl Workspace {
                         let pane = tab.model.pane_mut(side);
                         if let Some(vis_idx) = pane.find_type_ahead(&prefix) {
                             pane.selection.select_only(vis_idx);
+                            pane.recompute_selection_bytes();
                             let scroll_idx = match pane.view_mode {
                                 ViewMode::Grid => {
                                     let cols = if tab.model.split_enabled { 4 } else { 6 };
@@ -3387,6 +3578,12 @@ async fn smol_sleep(duration: Duration) {
     let _ = rx.await;
 }
 
+impl Drop for Workspace {
+    fn drop(&mut self) {
+        self.persist_session_snapshot();
+    }
+}
+
 impl Focusable for Workspace {
     fn focus_handle(&self, _cx: &gpui_kit::App) -> FocusHandle {
         self.focus_handle.clone()
@@ -3395,6 +3592,7 @@ impl Focusable for Workspace {
 
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.capture_window_geometry(window);
         let p = self.palette();
         let is_split = self.active_tab().is_some_and(|t| t.model.split_enabled);
 
@@ -3641,6 +3839,7 @@ impl Render for Workspace {
                     let pane = tab.model.active_pane_mut();
                     let total = pane.filtered_indices.len();
                     pane.selection.select_all(total);
+                    pane.recompute_selection_bytes();
                     cx.notify();
                 }
             }))
@@ -3771,7 +3970,8 @@ impl Render for Workspace {
                     }
                 }
             }))
-            .on_action(cx.listener(|_, _: &Quit, _, cx| {
+            .on_action(cx.listener(|this, _: &Quit, window, cx| {
+                this.save_session(Some(window));
                 cx.quit();
             }))
             // Top 38px frameless header

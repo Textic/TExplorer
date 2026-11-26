@@ -2,6 +2,7 @@
 
 pub mod entry;
 pub mod location;
+pub mod session;
 pub mod settings;
 pub mod workspace_model;
 
@@ -10,5 +11,6 @@ pub use entry::{
     ViewMode, VolumeInfo, classify_extension, sort_entries,
 };
 pub use location::{BreadcrumbSegment, Location, SearchScope};
+pub use session::{AppSession, SavedPaneState, SavedTabState, WindowGeometry};
 pub use settings::{AccentPreset, AppSettings, SizeUnit, ThemePreset};
 pub use workspace_model::{PaneModel, PaneSide, SelectionSet, TabModel};
