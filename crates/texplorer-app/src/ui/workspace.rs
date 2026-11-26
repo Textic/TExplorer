@@ -7,9 +7,9 @@ use std::time::{Duration, Instant};
 use futures_channel::mpsc::{UnboundedReceiver, UnboundedSender, unbounded};
 use futures_util::StreamExt as _;
 use gpui_kit::{
-    ClipboardItem, Context, Entity, FocusHandle, Focusable, KeyDownEvent, MouseDownEvent, Pixels,
-    Point, RenderImage, ScrollStrategy, SharedString, Subscription, UniformListScrollHandle,
-    Window, WindowBounds,
+    ClipboardItem, Context, Entity, FocusHandle, Focusable, KeyDownEvent, MouseButton,
+    MouseDownEvent, NavigationDirection, Pixels, Point, RenderImage, ScrollStrategy, SharedString,
+    Subscription, UniformListScrollHandle, Window, WindowBounds,
     component::{
         h_flex,
         input::{InputEvent, InputState},
@@ -36,10 +36,11 @@ use texplorer_ops::{
 };
 use texplorer_platform::{
     DefaultExplorerStatus, DirectoryWatcher, FileLockStatus, LaunchIntent, ShellWorker,
-    cursor_screen_pos, delete_permanently, enable_default_explorer, get_clipboard_files, inspect_file_lock, list_known_folders, list_volumes, list_wsl_distros,
-    move_to_trash, open_in_editor, open_item, open_terminal_here, query_default_explorer_status,
+    cursor_screen_pos, delete_permanently, enable_default_explorer, get_clipboard_files,
+    inspect_file_lock, list_known_folders, list_volumes, list_wsl_distros, move_to_trash,
+    open_in_editor, open_item, open_terminal_here, query_default_explorer_status,
     restore_windows_explorer, reveal_in_windows_explorer, set_clipboard_files,
-    show_properties_dialog, system_prefers_dark_mode,
+    system_prefers_dark_mode,
 };
 use texplorer_vfs::archive::{
     compress_to_zip, extract_archive_all, extract_archive_entries, is_supported_archive,
@@ -65,7 +66,7 @@ use crate::ui::context_menu::{ContextMenuState, ContextMenuTarget, render_contex
 use crate::ui::global_search::{GlobalSearchState, render_global_search_modal};
 use crate::ui::header::render_header;
 use crate::ui::inspector::{HashInspectState, render_inspector};
-use crate::ui::modals::{ActiveModal, TextPromptKind, render_active_modal};
+use crate::ui::modals::{ActiveModal, SettingsCategory, TextPromptKind, render_active_modal};
 use crate::ui::pane::render_pane;
 use crate::ui::quicklook::render_quicklook_modal;
 use crate::ui::sidebar::render_sidebar;
@@ -174,6 +175,10 @@ enum BgEvent {
     },
     Transfer(TransferEvent),
     NativeShellMenuDone(Result<(), String>),
+    ShellOpFinished {
+        result: Result<Option<String>, String>,
+        refresh_side: Option<PaneSide>,
+    },
     FolderSizesReady {
         tab_id: Uuid,
         side: PaneSide,
@@ -265,6 +270,7 @@ pub struct Workspace {
     pub active_tab_index: usize,
     pub context_menu: Option<ContextMenuState>,
     pub active_modal: Option<ActiveModal>,
+    pub settings_category: SettingsCategory,
     modal_subs: Vec<Subscription>,
     pub global_search: Option<GlobalSearchState>,
     global_search_subs: Vec<Subscription>,
@@ -375,6 +381,7 @@ impl Workspace {
             active_tab_index: 0,
             context_menu: None,
             active_modal: None,
+            settings_category: SettingsCategory::Appearance,
             modal_subs: Vec::new(),
             global_search: None,
             global_search_subs: Vec::new(),
@@ -839,7 +846,7 @@ impl Workspace {
                     if auto_dismiss {
                         cx.spawn_in(window, async move |weak, cx| {
                             smol_sleep(Duration::from_secs(3)).await;
-                            let _ = weak.update(cx, |this, cx| {
+                            let _ = weak.update_in(cx, |this, _window, cx| {
                                 let before = this.transfers.len();
                                 this.transfers.retain(|j| j.snapshot.job_id != job_id);
                                 if this.transfers.len() != before {
@@ -857,6 +864,19 @@ impl Workspace {
                     self.show_toast(err, ToastKind::Error, window, cx);
                 } else {
                     self.refresh_visible_panes(cx);
+                }
+            }
+            BgEvent::ShellOpFinished {
+                result,
+                refresh_side,
+            } => {
+                if let Some(side) = refresh_side {
+                    self.refresh_pane(side, window, cx);
+                }
+                match result {
+                    Ok(Some(msg)) => self.show_toast(msg, ToastKind::Success, window, cx),
+                    Ok(None) => {}
+                    Err(err) => self.show_toast(err, ToastKind::Error, window, cx),
                 }
             }
             BgEvent::FolderSizesReady {
@@ -1538,6 +1558,7 @@ impl Workspace {
         input.update(cx, |s, cx| {
             s.set_value(display, window, cx);
             s.focus(window, cx);
+            s.select_all(window, cx);
         });
         cx.notify();
     }
@@ -1790,8 +1811,22 @@ impl Workspace {
         } else if let Some(path) = location.as_local_path() {
             if is_supported_archive(path) {
                 self.navigate_active_pane(Location::archive(path, ""), window, cx);
-            } else if let Err(err) = open_item(path) {
-                self.show_toast(err, ToastKind::Error, window, cx);
+            } else {
+                // Run ShellExecuteW off the GPUI UI thread so Win32 COM never pumps nested
+                // messages while GPUI holds a mutable App borrow.
+                let path_owned = path.to_path_buf();
+                let tx = self.bg_tx.clone();
+                tokio_runtime().spawn(async move {
+                    let result = tokio::task::spawn_blocking(move || {
+                        open_item(&path_owned).map(|()| None)
+                    })
+                    .await
+                    .unwrap_or_else(|e| Err(format!("Failed opening item: {e}")));
+                    let _ = tx.unbounded_send(BgEvent::ShellOpFinished {
+                        result,
+                        refresh_side: None,
+                    });
+                });
             }
         } else if matches!(location, Location::Archive { .. }) {
             self.toggle_quicklook(cx);
@@ -1842,7 +1877,15 @@ impl Workspace {
                 } else {
                     TransferKind::Copy
                 };
-                self.enqueue_transfer(kind, clip.paths, dest_dir, cx);
+                let effective = filter_effective_transfer_sources(kind, clip.paths, &dest_dir, false);
+                if effective.is_empty() {
+                    if clip.is_cut && !self.cut_paths.is_empty() {
+                        self.cut_paths.clear();
+                        cx.notify();
+                    }
+                    return;
+                }
+                self.enqueue_transfer(kind, effective, dest_dir, cx);
             }
             Ok(None) => {
                 self.show_toast("Clipboard does not contain files.", ToastKind::Info, window, cx);
@@ -1867,7 +1910,11 @@ impl Workspace {
         } else {
             TransferKind::Move
         };
-        self.enqueue_transfer(kind, sources, dest_dir, cx);
+        let effective = filter_effective_transfer_sources(kind, sources, &dest_dir, true);
+        if effective.is_empty() {
+            return;
+        }
+        self.enqueue_transfer(kind, effective, dest_dir, cx);
         let _ = window;
     }
 
@@ -1878,6 +1925,10 @@ impl Workspace {
         dest_dir: PathBuf,
         cx: &mut Context<Self>,
     ) {
+        let sources = filter_effective_transfer_sources(kind, sources, &dest_dir, false);
+        if sources.is_empty() {
+            return;
+        }
         let (xfer_tx, mut xfer_rx) = unbounded::<TransferEvent>();
         let (job_id, control) = spawn_transfer_job(kind, sources.clone(), dest_dir.clone(), xfer_tx);
 
@@ -2025,28 +2076,64 @@ impl Workspace {
         self.set_toast_simple(notice, ToastKind::Success, cx);
     }
 
-    pub fn open_terminal_at(&mut self, path: &Path, cx: &mut Context<Self>) {
-        if let Err(err) = open_terminal_here(path, &self.settings.terminal_command) {
-            self.set_toast_simple(err, ToastKind::Error, cx);
-        }
+    pub fn open_terminal_at(&mut self, path: &Path, _cx: &mut Context<Self>) {
+        let path_owned = path.to_path_buf();
+        let cmd = self.settings.terminal_command.clone();
+        let tx = self.bg_tx.clone();
+        tokio_runtime().spawn(async move {
+            let result = tokio::task::spawn_blocking(move || {
+                open_terminal_here(&path_owned, &cmd).map(|()| None)
+            })
+            .await
+            .unwrap_or_else(|e| Err(format!("Failed launching terminal: {e}")));
+            let _ = tx.unbounded_send(BgEvent::ShellOpFinished {
+                result,
+                refresh_side: None,
+            });
+        });
     }
 
-    pub fn open_editor_at(&mut self, path: &Path, cx: &mut Context<Self>) {
-        if let Err(err) = open_in_editor(path, &self.settings.editor_command) {
-            self.set_toast_simple(err, ToastKind::Error, cx);
-        }
+    pub fn open_editor_at(&mut self, path: &Path, _cx: &mut Context<Self>) {
+        let path_owned = path.to_path_buf();
+        let cmd = self.settings.editor_command.clone();
+        let tx = self.bg_tx.clone();
+        tokio_runtime().spawn(async move {
+            let result = tokio::task::spawn_blocking(move || {
+                open_in_editor(&path_owned, &cmd).map(|()| None)
+            })
+            .await
+            .unwrap_or_else(|e| Err(format!("Failed launching editor: {e}")));
+            let _ = tx.unbounded_send(BgEvent::ShellOpFinished {
+                result,
+                refresh_side: None,
+            });
+        });
     }
 
-    pub fn reveal_in_windows_explorer(&mut self, path: &Path, cx: &mut Context<Self>) {
-        if let Err(err) = reveal_in_windows_explorer(path) {
-            self.set_toast_simple(err, ToastKind::Error, cx);
-        }
+    pub fn reveal_in_windows_explorer(&mut self, path: &Path, _cx: &mut Context<Self>) {
+        let path_owned = path.to_path_buf();
+        let tx = self.bg_tx.clone();
+        tokio_runtime().spawn(async move {
+            let result = tokio::task::spawn_blocking(move || {
+                reveal_in_windows_explorer(&path_owned).map(|()| None)
+            })
+            .await
+            .unwrap_or_else(|e| Err(format!("Failed launching Windows Explorer: {e}")));
+            let _ = tx.unbounded_send(BgEvent::ShellOpFinished {
+                result,
+                refresh_side: None,
+            });
+        });
     }
 
-    pub fn show_properties_for(&mut self, path: &Path, cx: &mut Context<Self>) {
-        if let Err(err) = show_properties_dialog(path) {
-            self.set_toast_simple(err, ToastKind::Error, cx);
-        }
+    pub fn show_properties_for(&mut self, path: &Path, _cx: &mut Context<Self>) {
+        let tx = self.bg_tx.clone();
+        self.shell_worker.show_properties(path.to_path_buf(), move |res| {
+            let _ = tx.unbounded_send(BgEvent::ShellOpFinished {
+                result: res.map(|()| None),
+                refresh_side: None,
+            });
+        });
     }
 
     pub fn pin_folder(&mut self, path: PathBuf, cx: &mut Context<Self>) {
@@ -2083,6 +2170,23 @@ impl Workspace {
             self.sync_preview_for_selection(cx);
         }
         cx.notify();
+    }
+
+    pub fn set_settings_category(&mut self, category: SettingsCategory, cx: &mut Context<Self>) {
+        if self.settings_category != category {
+            self.settings_category = category;
+            cx.notify();
+        }
+    }
+
+    pub fn open_settings_category(
+        &mut self,
+        category: SettingsCategory,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.settings_category = category;
+        self.open_settings_modal(window, cx);
     }
 
     pub fn open_settings_modal(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
@@ -2231,7 +2335,7 @@ impl Workspace {
         };
         cx.spawn_in(window, async move |weak, cx| {
             smol_sleep(Duration::from_millis(delay_ms)).await;
-            let _ = weak.update(cx, |this, cx| {
+            let _ = weak.update_in(cx, |this, _window, cx| {
                 let matches_gen = this
                     .global_search
                     .as_ref()
@@ -3139,24 +3243,32 @@ impl Workspace {
         }
     }
 
-    pub fn trash_selected(&mut self, side: PaneSide, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn trash_selected(&mut self, side: PaneSide, _window: &mut Window, _cx: &mut Context<Self>) {
         let paths = self.selected_local_paths(side);
         if paths.is_empty() {
             return;
         }
         let count = paths.len();
-        match move_to_trash(&paths) {
-            Ok(()) => {
-                self.refresh_pane(side, window, cx);
-                let msg = if count == 1 {
-                    "Moved item to Recycle Bin".to_string()
-                } else {
-                    format!("Moved {count} items to Recycle Bin")
-                };
-                self.show_toast(msg, ToastKind::Success, window, cx);
-            }
-            Err(err) => self.show_toast(err, ToastKind::Error, window, cx),
-        }
+        let tx = self.bg_tx.clone();
+        // Run COM IFileOperation (Recycle Bin) off the GPUI UI thread to prevent Win32 message re-entrancy.
+        tokio_runtime().spawn(async move {
+            let result = tokio::task::spawn_blocking(move || {
+                move_to_trash(&paths).map(|()| {
+                    let msg = if count == 1 {
+                        "Moved item to Recycle Bin".to_string()
+                    } else {
+                        format!("Moved {count} items to Recycle Bin")
+                    };
+                    Some(msg)
+                })
+            })
+            .await
+            .unwrap_or_else(|e| Err(format!("Recycle Bin worker failed: {e}")));
+            let _ = tx.unbounded_send(BgEvent::ShellOpFinished {
+                result,
+                refresh_side: Some(side),
+            });
+        });
     }
 
     pub fn prompt_permanent_delete(&mut self, side: PaneSide, cx: &mut Context<Self>) {
@@ -3168,28 +3280,36 @@ impl Workspace {
         cx.notify();
     }
 
-    pub fn confirm_permanent_delete(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn confirm_permanent_delete(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
         let Some(ActiveModal::ConfirmPermanentDelete { side, paths }) = self.active_modal.take()
         else {
             return;
         };
-        let mut failures = Vec::new();
-        for path in &paths {
-            if let Err(err) = delete_permanently(path) {
-                failures.push(err);
-            }
-        }
-        self.refresh_pane(side, window, cx);
-        if failures.is_empty() {
-            self.show_toast(
-                format!("Permanently deleted {} item(s)", paths.len()),
-                ToastKind::Success,
-                window,
-                cx,
-            );
-        } else {
-            self.show_toast(failures[0].clone(), ToastKind::Error, window, cx);
-        }
+        cx.notify();
+        let total = paths.len();
+        let tx = self.bg_tx.clone();
+        tokio_runtime().spawn(async move {
+            let result = tokio::task::spawn_blocking(move || {
+                let mut first_err: Option<String> = None;
+                for path in &paths {
+                    if let Err(err) = delete_permanently(path)
+                        && first_err.is_none()
+                    {
+                        first_err = Some(err);
+                    }
+                }
+                match first_err {
+                    Some(err) => Err(err),
+                    None => Ok(Some(format!("Permanently deleted {total} item(s)"))),
+                }
+            })
+            .await
+            .unwrap_or_else(|e| Err(format!("Delete worker failed: {e}")));
+            let _ = tx.unbounded_send(BgEvent::ShellOpFinished {
+                result,
+                refresh_side: Some(side),
+            });
+        });
     }
 
     pub fn selected_local_paths(&self, side: PaneSide) -> Vec<PathBuf> {
@@ -3404,7 +3524,7 @@ impl Workspace {
         });
         cx.spawn_in(window, async move |weak, cx| {
             smol_sleep(Duration::from_millis(3200)).await;
-            let _ = weak.update(cx, |this, cx| {
+            let _ = weak.update_in(cx, |this, _window, cx| {
                 if this.toast.as_ref().is_some_and(|t| t.id == id) {
                     this.toast = None;
                     cx.notify();
@@ -3415,7 +3535,7 @@ impl Workspace {
         cx.notify();
     }
 
-    fn is_modal_blocking(&self) -> bool {
+    pub fn is_modal_blocking(&self) -> bool {
         self.active_modal.is_some()
             || self.global_search.is_some()
             || self.bulk_rename.is_some()
@@ -3569,6 +3689,87 @@ fn same_volume(a: &Path, b: &Path) -> bool {
     }
 }
 
+fn normalize_path_key(path: &Path) -> String {
+    #[cfg(target_os = "windows")]
+    {
+        let s = path.to_string_lossy().replace('/', "\\");
+        let trimmed = if s.len() > 3 {
+            s.trim_end_matches('\\')
+        } else {
+            s.as_str()
+        };
+        trimmed.to_ascii_lowercase()
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let s = path.to_string_lossy();
+        if s.len() > 1 {
+            s.trim_end_matches('/').to_string()
+        } else {
+            s.into_owned()
+        }
+    }
+}
+
+fn paths_same(a: &Path, b: &Path) -> bool {
+    normalize_path_key(a) == normalize_path_key(b)
+}
+
+fn is_same_or_descendant_path(candidate: &Path, ancestor: &Path) -> bool {
+    let c = normalize_path_key(candidate);
+    let a = normalize_path_key(ancestor);
+    if c == a {
+        return true;
+    }
+    #[cfg(target_os = "windows")]
+    let sep = '\\';
+    #[cfg(not(target_os = "windows"))]
+    let sep = '/';
+
+    if a.ends_with(sep) {
+        c.starts_with(&a)
+    } else {
+        c.starts_with(&format!("{a}{sep}"))
+    }
+}
+
+fn filter_effective_transfer_sources(
+    kind: TransferKind,
+    sources: Vec<PathBuf>,
+    dest_dir: &Path,
+    ignore_self_nesting: bool,
+) -> Vec<PathBuf> {
+    sources
+        .into_iter()
+        .filter(|src| {
+            let Some(name) = src.file_name() else {
+                return false;
+            };
+            if kind == TransferKind::Move && paths_same(src, &dest_dir.join(name)) {
+                return false;
+            }
+            if ignore_self_nesting && is_same_or_descendant_path(dest_dir, src) {
+                return false;
+            }
+            true
+        })
+        .collect()
+}
+
+/// Returns `true` when dropping `sources` into `dest_dir` via internal drag-and-drop
+/// would actually move or copy at least one item.
+pub fn is_valid_internal_drop_target(sources: &[PathBuf], dest_dir: &Path) -> bool {
+    if sources.is_empty() {
+        return false;
+    }
+    let kind = if !same_volume(&sources[0], dest_dir) {
+        TransferKind::Copy
+    } else {
+        TransferKind::Move
+    };
+    !filter_effective_transfer_sources(kind, sources.to_vec(), dest_dir, true).is_empty()
+}
+
 async fn smol_sleep(duration: Duration) {
     let (tx, rx) = futures_channel::oneshot::channel::<()>();
     tokio_runtime().spawn(async move {
@@ -3658,6 +3859,28 @@ impl Render for Workspace {
             .text_color(solid(p.text_primary))
             .overflow_hidden()
             .on_key_down(cx.listener(Self::handle_key_down))
+            .on_mouse_down(
+                MouseButton::Navigate(NavigationDirection::Back),
+                cx.listener(|this, _: &MouseDownEvent, window, cx| {
+                    if !window.default_prevented()
+                        && !this.is_modal_blocking()
+                        && let Some(side) = this.active_tab().map(|t| t.model.active_pane)
+                    {
+                        this.go_back(side, window, cx);
+                    }
+                }),
+            )
+            .on_mouse_down(
+                MouseButton::Navigate(NavigationDirection::Forward),
+                cx.listener(|this, _: &MouseDownEvent, window, cx| {
+                    if !window.default_prevented()
+                        && !this.is_modal_blocking()
+                        && let Some(side) = this.active_tab().map(|t| t.model.active_pane)
+                    {
+                        this.go_forward(side, window, cx);
+                    }
+                }),
+            )
             .on_action(cx.listener(|this, _: &NewTab, window, cx| {
                 if this.is_modal_blocking() {
                     return;
@@ -4044,5 +4267,39 @@ impl Render for Workspace {
             .when_some(self.conflict_queue.front(), |el, prompt| {
                 el.child(render_conflict_modal(self, prompt, cx))
             })
+    }
+}
+
+#[cfg(test)]
+mod transfer_drop_tests {
+    use super::*;
+
+    #[test]
+    fn ignores_dropping_items_back_into_same_directory_or_self() {
+        let desktop = PathBuf::from(r"C:\Users\danie\Desktop");
+        let file = desktop.join("Roblox Studio.lnk");
+        let folder = desktop.join("Projects");
+        let subfolder = folder.join("Sub");
+        let sibling_prefix = desktop.join("Projects2");
+
+        // Same-folder drop is a no-op.
+        assert!(!is_valid_internal_drop_target(std::slice::from_ref(&file), &desktop));
+        // Dropping into a subfolder inside the same directory IS valid.
+        assert!(is_valid_internal_drop_target(std::slice::from_ref(&file), &folder));
+        // Dropping a folder onto itself or inside a descendant is ignored.
+        assert!(!is_valid_internal_drop_target(std::slice::from_ref(&folder), &folder));
+        assert!(!is_valid_internal_drop_target(std::slice::from_ref(&folder), &subfolder));
+        // Dropping a folder onto a sibling with shared prefix is valid.
+        assert!(is_valid_internal_drop_target(std::slice::from_ref(&folder), &sibling_prefix));
+        // Copy (Ctrl+C -> Ctrl+V) inside the same folder still duplicates.
+        assert_eq!(
+            filter_effective_transfer_sources(
+                TransferKind::Copy,
+                vec![file.clone()],
+                &desktop,
+                false,
+            ),
+            vec![file]
+        );
     }
 }

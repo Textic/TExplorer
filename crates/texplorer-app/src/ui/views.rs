@@ -16,7 +16,7 @@ use crate::theme::{
     format_timestamp, known_folder_icon, soft_tint, solid, usage_bar_color,
 };
 use crate::ui::context_menu::ContextMenuTarget;
-use crate::ui::workspace::Workspace;
+use crate::ui::workspace::{Workspace, is_valid_internal_drop_target};
 
 /// Drag payload for internal file/folder drag & drop (into folders or across Dual-Pane).
 #[derive(Clone)]
@@ -371,6 +371,8 @@ pub fn render_details_view(
         PaneSide::Right => "details-list-right",
     };
 
+    let pane_dir_drag = pane_dir.clone();
+    let pane_dir_has_local = pane_dir.is_some();
     let pane_dir_int = pane_dir.clone();
     let pane_dir_ext = pane_dir.clone();
     let pane_dir_arch = pane_dir;
@@ -379,14 +381,29 @@ pub fn render_details_view(
         .size_full()
         .bg(solid(p.bg_base))
         .overflow_hidden()
-        .drag_over::<DraggedEntries>(move |style, _, _, _| {
-            style.border_1().border_color(solid(p.accent_primary))
+        .drag_over::<DraggedEntries>(move |style, drag, _, _| {
+            if pane_dir_drag
+                .as_ref()
+                .is_some_and(|dest| is_valid_internal_drop_target(&drag.paths, dest))
+            {
+                style.border_1().border_color(solid(p.accent_primary))
+            } else {
+                style
+            }
         })
         .drag_over::<DraggedArchiveEntries>(move |style, _, _, _| {
-            style.border_1().border_color(solid(p.accent_primary))
+            if pane_dir_has_local {
+                style.border_1().border_color(solid(p.accent_primary))
+            } else {
+                style
+            }
         })
         .drag_over::<ExternalPaths>(move |style, _, _, _| {
-            style.border_1().border_color(solid(p.accent_primary))
+            if pane_dir_has_local {
+                style.border_1().border_color(solid(p.accent_primary))
+            } else {
+                style
+            }
         })
         .on_drop(cx.listener(move |this, drag: &DraggedEntries, window, cx| {
             if let Some(ref dest) = pane_dir_int {
@@ -582,8 +599,13 @@ fn render_details_rows(
                     })
                 })
                 .when_some(drop_dir_int, |el, dest| {
-                    el.drag_over::<DraggedEntries>(move |style, _, _, _| {
-                        style.bg(soft_tint(p.accent_primary, 0.22))
+                    let dest_hover = dest.clone();
+                    el.drag_over::<DraggedEntries>(move |style, drag, _, _| {
+                        if is_valid_internal_drop_target(&drag.paths, &dest_hover) {
+                            style.bg(soft_tint(p.accent_primary, 0.22))
+                        } else {
+                            style
+                        }
                     })
                     .on_drop(cx.listener(
                         move |this, drag: &DraggedEntries, window, cx| {
@@ -738,6 +760,8 @@ pub fn render_grid_view(
         PaneSide::Left => "grid-list-left",
         PaneSide::Right => "grid-list-right",
     };
+    let pane_dir_drag = pane_dir.clone();
+    let pane_dir_has_local = pane_dir.is_some();
     let pane_dir_int = pane_dir.clone();
     let pane_dir_ext = pane_dir.clone();
     let pane_dir_arch = pane_dir;
@@ -746,14 +770,29 @@ pub fn render_grid_view(
         .size_full()
         .bg(solid(p.bg_base))
         .overflow_hidden()
-        .drag_over::<DraggedEntries>(move |style, _, _, _| {
-            style.border_1().border_color(solid(p.accent_primary))
+        .drag_over::<DraggedEntries>(move |style, drag, _, _| {
+            if pane_dir_drag
+                .as_ref()
+                .is_some_and(|dest| is_valid_internal_drop_target(&drag.paths, dest))
+            {
+                style.border_1().border_color(solid(p.accent_primary))
+            } else {
+                style
+            }
         })
         .drag_over::<DraggedArchiveEntries>(move |style, _, _, _| {
-            style.border_1().border_color(solid(p.accent_primary))
+            if pane_dir_has_local {
+                style.border_1().border_color(solid(p.accent_primary))
+            } else {
+                style
+            }
         })
         .drag_over::<ExternalPaths>(move |style, _, _, _| {
-            style.border_1().border_color(solid(p.accent_primary))
+            if pane_dir_has_local {
+                style.border_1().border_color(solid(p.accent_primary))
+            } else {
+                style
+            }
         })
         .on_drop(cx.listener(move |this, drag: &DraggedEntries, window, cx| {
             if let Some(ref dest) = pane_dir_int {
@@ -984,8 +1023,13 @@ fn render_grid_rows(
                                 })
                             })
                             .when_some(drop_dir_int, |el, dest| {
-                                el.drag_over::<DraggedEntries>(move |style, _, _, _| {
-                                    style.border_color(solid(p.accent_primary))
+                                let dest_hover = dest.clone();
+                                el.drag_over::<DraggedEntries>(move |style, drag, _, _| {
+                                    if is_valid_internal_drop_target(&drag.paths, &dest_hover) {
+                                        style.border_color(solid(p.accent_primary))
+                                    } else {
+                                        style
+                                    }
                                 })
                                 .on_drop(cx.listener(
                                     move |this, drag: &DraggedEntries, window, cx| {
@@ -1096,6 +1140,8 @@ pub fn render_compact_view(
         PaneSide::Left => "compact-list-left",
         PaneSide::Right => "compact-list-right",
     };
+    let pane_dir_drag = pane_dir.clone();
+    let pane_dir_has_local = pane_dir.is_some();
     let pane_dir_int = pane_dir.clone();
     let pane_dir_ext = pane_dir.clone();
     let pane_dir_arch = pane_dir;
@@ -1104,14 +1150,29 @@ pub fn render_compact_view(
         .size_full()
         .bg(solid(p.bg_base))
         .overflow_hidden()
-        .drag_over::<DraggedEntries>(move |style, _, _, _| {
-            style.border_1().border_color(solid(p.accent_primary))
+        .drag_over::<DraggedEntries>(move |style, drag, _, _| {
+            if pane_dir_drag
+                .as_ref()
+                .is_some_and(|dest| is_valid_internal_drop_target(&drag.paths, dest))
+            {
+                style.border_1().border_color(solid(p.accent_primary))
+            } else {
+                style
+            }
         })
         .drag_over::<DraggedArchiveEntries>(move |style, _, _, _| {
-            style.border_1().border_color(solid(p.accent_primary))
+            if pane_dir_has_local {
+                style.border_1().border_color(solid(p.accent_primary))
+            } else {
+                style
+            }
         })
         .drag_over::<ExternalPaths>(move |style, _, _, _| {
-            style.border_1().border_color(solid(p.accent_primary))
+            if pane_dir_has_local {
+                style.border_1().border_color(solid(p.accent_primary))
+            } else {
+                style
+            }
         })
         .on_drop(cx.listener(move |this, drag: &DraggedEntries, window, cx| {
             if let Some(ref dest) = pane_dir_int {

@@ -1,5 +1,5 @@
 use gpui_kit::{
-    Context, MouseButton, MouseDownEvent, SharedString,
+    Context, MouseButton, MouseDownEvent, NavigationDirection, SharedString,
     assets::IconName as LucideIcon,
     component::{
         Disableable as _, Icon, Sizable as _, Size, StyledExt as _,
@@ -102,6 +102,7 @@ pub fn render_pane(
                 MouseButton::Left,
                 cx.listener(move |this, _: &MouseDownEvent, window, cx| {
                     if !window.default_prevented() {
+                        window.prevent_default();
                         this.begin_edit_address(side, window, cx);
                     }
                 }),
@@ -149,7 +150,11 @@ pub fn render_pane(
                                 MouseButton::Left,
                                 cx.listener(move |this, _: &MouseDownEvent, window, cx| {
                                     window.prevent_default();
-                                    this.navigate_pane(side, target.clone(), window, cx);
+                                    if is_last {
+                                        this.begin_edit_address(side, window, cx);
+                                    } else {
+                                        this.navigate_pane(side, target.clone(), window, cx);
+                                    }
                                 }),
                             )
                             .child(label),
@@ -180,6 +185,26 @@ pub fn render_pane(
             MouseButton::Left,
             cx.listener(move |this, _: &MouseDownEvent, _, cx| {
                 this.set_active_pane(side, cx);
+            }),
+        )
+        .on_mouse_down(
+            MouseButton::Navigate(NavigationDirection::Back),
+            cx.listener(move |this, _: &MouseDownEvent, window, cx| {
+                if !this.is_modal_blocking() {
+                    window.prevent_default();
+                    this.set_active_pane(side, cx);
+                    this.go_back(side, window, cx);
+                }
+            }),
+        )
+        .on_mouse_down(
+            MouseButton::Navigate(NavigationDirection::Forward),
+            cx.listener(move |this, _: &MouseDownEvent, window, cx| {
+                if !this.is_modal_blocking() {
+                    window.prevent_default();
+                    this.set_active_pane(side, cx);
+                    this.go_forward(side, window, cx);
+                }
             }),
         )
         // Subtle 2px top accent indicator when Dual-Pane split is active

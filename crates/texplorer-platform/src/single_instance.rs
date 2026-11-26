@@ -5,7 +5,7 @@ use std::thread::{self, JoinHandle};
 
 use serde::{Deserialize, Serialize};
 
-use crate::default_explorer::should_delegate_to_windows_explorer;
+use crate::default_explorer::{is_home_or_this_pc_namespace, should_delegate_to_windows_explorer};
 
 pub const SINGLE_INSTANCE_PIPE: &str = r"\\.\pipe\TExplorerSingleInstanceV1";
 
@@ -86,6 +86,10 @@ pub fn parse_cli_args(args: &[String]) -> (LaunchIntent, bool) {
 
     let cleaned = raw.trim().trim_matches('"');
     if cleaned.is_empty() {
+        return (LaunchIntent::OpenDefault, force_new_window);
+    }
+
+    if is_home_or_this_pc_namespace(cleaned) {
         return (LaunchIntent::OpenDefault, force_new_window);
     }
 
@@ -286,6 +290,10 @@ mod tests {
             )
         );
 
+        assert_eq!(
+            parse_cli_args(&["::{20D04FE0-3AEA-1069-A2D8-08002B30309D}".to_string()]),
+            (LaunchIntent::OpenDefault, false)
+        );
         assert_eq!(
             parse_cli_args(&["::{26EE0668-A00A-44D7-9371-BEB064C98683}".to_string()]),
             (

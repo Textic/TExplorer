@@ -19,9 +19,28 @@ pub enum DefaultExplorerStatus {
     UnsupportedPlatform,
 }
 
+/// Returns `true` when `arg` targets Windows' "This PC" / "Home" / File Explorer root
+/// virtual namespace, which TExplorer can render natively on its `Location::Home` page.
+pub fn is_home_or_this_pc_namespace(arg: &str) -> bool {
+    let trimmed = arg.trim().trim_matches('"');
+    let lower = trimmed.to_ascii_lowercase();
+    let normalized = lower.strip_prefix("shell:").unwrap_or(&lower);
+    matches!(
+        normalized,
+        "::{20d04fe0-3aea-1069-a2d8-08002b30309d}"
+            | "::{f874310e-b6b7-47dc-bc84-b9e6b38f5903}"
+            | "::{52205fd8-5dfb-447d-801a-d0b52f2e83e1}"
+            | "mycomputerfolder"
+            | "homefolder"
+    )
+}
+
 /// Returns `true` when `arg` targets a Windows virtual Shell namespace (Control Panel,
 /// Printers, Settings, CLSID GUID, etc.) that must be handed back to `explorer.exe`.
 pub fn should_delegate_to_windows_explorer(arg: &str) -> bool {
+    if is_home_or_this_pc_namespace(arg) {
+        return false;
+    }
     let trimmed = arg.trim().trim_matches('"');
     let lower = trimmed.to_ascii_lowercase();
     lower.starts_with("::{")
@@ -70,16 +89,19 @@ fn backup_file_path() -> PathBuf {
 }
 
 #[cfg(target_os = "windows")]
-const FOLDER_COMMAND_KEYS: [&str; 3] = [
+const FOLDER_COMMAND_KEYS: [&str; 4] = [
     r"Software\Classes\Folder\shell\open\command",
+    r"Software\Classes\Folder\shell\explore\command",
     r"Software\Classes\Directory\shell\open\command",
     r"Software\Classes\Drive\shell\open\command",
 ];
 
-/// Optional `Win+E` handler CLSID used safely in HKCU (same non-hook mechanism as Files App).
+/// Optional `Win+E` handler CLSID verbs used safely in HKCU (same non-hook mechanism as Files App).
 #[cfg(target_os = "windows")]
-const WIN_E_COMMAND_KEY: &str =
-    r"Software\Classes\CLSID\{52205fd8-5dfb-447d-801a-d0b52f2e83e1}\shell\opennewwindow\command";
+const WIN_E_COMMAND_KEYS: [&str; 2] = [
+    r"Software\Classes\CLSID\{52205fd8-5dfb-447d-801a-d0b52f2e83e1}\shell\opennewwindow\command",
+    r"Software\Classes\CLSID\{52205fd8-5dfb-447d-801a-d0b52f2e83e1}\shell\open\command",
+];
 
 /// Checks whether T Explorer is currently registered as the default Windows file manager.
 #[cfg(target_os = "windows")]
@@ -120,7 +142,7 @@ pub fn enable_default_explorer(intercept_win_e: bool) -> Result<(), String> {
     // Only write a fresh backup if we are not already registered, preserving pre-T-Explorer values.
     if query_default_explorer_status() == DefaultExplorerStatus::Disabled {
         let mut all_keys: Vec<&str> = FOLDER_COMMAND_KEYS.to_vec();
-        all_keys.push(WIN_E_COMMAND_KEY);
+        all_keys.extend_from_slice(&WIN_E_COMMAND_KEYS);
         let mut backup = ShellBackup::default();
         for key in all_keys {
             let existed = hkcu_key_exists(key);
@@ -148,8 +170,10 @@ pub fn enable_default_explorer(intercept_win_e: bool) -> Result<(), String> {
 
     if intercept_win_e {
         let win_e_cmd = format!("\"{exe_str}\"");
-        write_hkcu_string(WIN_E_COMMAND_KEY, "", &win_e_cmd)?;
-        write_hkcu_string(WIN_E_COMMAND_KEY, "DelegateExecute", "")?;
+        for key in WIN_E_COMMAND_KEYS {
+            write_hkcu_string(key, "", &win_e_cmd)?;
+            write_hkcu_string(key, "DelegateExecute", "")?;
+        }
     } else {
         delete_hkcu_tree(r"Software\Classes\CLSID\{52205fd8-5dfb-447d-801a-d0b52f2e83e1}");
     }
@@ -171,7 +195,9 @@ pub fn restore_windows_explorer() -> Result<(), String> {
     if let Ok(raw) = std::fs::read_to_string(&backup_path)
         && let Ok(backup) = serde_json::from_str::<ShellBackup>(&raw)
     {
+        let mut restored_keys = std::collections::HashSet::new();
         for entry in backup.entries {
+            restored_keys.insert(entry.subkey.to_ascii_lowercase());
             if !entry.existed {
                 delete_hkcu_tree(&entry.subkey);
             } else {
@@ -185,6 +211,12 @@ pub fn restore_windows_explorer() -> Result<(), String> {
                 } else {
                     delete_hkcu_value(&entry.subkey, "DelegateExecute");
                 }
+            }
+        }
+        // Clean up any newly added keys (e.g. Folder\shell\explore\command) absent from older backups.
+        for key in FOLDER_COMMAND_KEYS {
+            if !restored_keys.contains(&key.to_ascii_lowercase()) {
+                delete_hkcu_tree(key);
             }
         }
         let _ = std::fs::remove_file(&backup_path);
@@ -393,6 +425,12 @@ mod tests {
         ));
         assert!(should_delegate_to_windows_explorer("shell:ControlPanelFolder"));
         assert!(should_delegate_to_windows_explorer("ms-settings:storage"));
+        assert!(!should_delegate_to_windows_explorer(
+            "::{20D04FE0-3AEA-1069-A2D8-08002B30309D}"
+        ));
+        assert!(is_home_or_this_pc_namespace(
+            "shell:::{f874310e-b6b7-47dc-bc84-b9e6b38f5903}"
+        ));
         assert!(!should_delegate_to_windows_explorer(r"C:\Users\Admin"));
         assert!(!should_delegate_to_windows_explorer(r"X:\TExplorer"));
         assert!(!should_delegate_to_windows_explorer(r"\\wsl.localhost\Ubuntu"));

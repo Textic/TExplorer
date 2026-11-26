@@ -245,7 +245,11 @@ pub fn render_header(
                             .text_color(solid(p.accent_primary))
                             .hover(move |s| s.bg(soft_tint(p.accent_primary, 0.24)))
                             .on_click(cx.listener(|this, _, window, cx| {
-                                this.open_settings_modal(window, cx);
+                                this.open_settings_category(
+                                    crate::ui::modals::SettingsCategory::Updates,
+                                    window,
+                                    cx,
+                                );
                             }))
                             .child(Icon::new(LucideIcon::Download).xsmall())
                             .child(label),

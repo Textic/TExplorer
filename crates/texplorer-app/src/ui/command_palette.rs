@@ -424,7 +424,7 @@ pub fn execute_palette_command(
         PaletteCommand::OpenSettings => ws.open_settings_modal(window, cx),
         PaletteCommand::RebuildMftIndex => ws.rebuild_mft_index(cx),
         PaletteCommand::CheckUpdates => {
-            ws.open_settings_modal(window, cx);
+            ws.open_settings_category(crate::ui::modals::SettingsCategory::Updates, window, cx);
             ws.check_for_updates(true, cx);
         }
         PaletteCommand::SetTheme(theme) => ws.set_theme(theme, cx),
