@@ -338,6 +338,21 @@ fn trim_leading_zeros(digits: &[u8]) -> &[u8] {
     &digits[first_non_zero..]
 }
 
+/// Zero-allocation ASCII case-insensitive string comparator for fast sorting of 100k+ rows.
+#[inline]
+pub fn cmp_ignore_ascii_case(a: &str, b: &str) -> Ordering {
+    let ab = a.as_bytes();
+    let bb = b.as_bytes();
+    for (&ca, &cb) in ab.iter().zip(bb.iter()) {
+        let la = ca.to_ascii_lowercase();
+        let lb = cb.to_ascii_lowercase();
+        if la != lb {
+            return la.cmp(&lb);
+        }
+    }
+    ab.len().cmp(&bb.len())
+}
+
 /// Sorts file entries in place according to `spec`.
 pub fn sort_entries(entries: &mut [FileEntry], spec: SortSpec) {
     entries.sort_by(|a, b| {
@@ -355,10 +370,7 @@ pub fn sort_entries(entries: &mut [FileEntry], spec: SortSpec) {
                 .modified_secs
                 .cmp(&b.modified_secs)
                 .then_with(|| natural_cmp_ignore_ascii_case(&a.name, &b.name)),
-            SortColumn::Type => a
-                .type_label
-                .to_ascii_lowercase()
-                .cmp(&b.type_label.to_ascii_lowercase())
+            SortColumn::Type => cmp_ignore_ascii_case(&a.type_label, &b.type_label)
                 .then_with(|| natural_cmp_ignore_ascii_case(&a.name, &b.name)),
             SortColumn::Size => a
                 .size

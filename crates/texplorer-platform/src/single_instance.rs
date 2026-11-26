@@ -16,6 +16,7 @@ pub enum LaunchIntent {
     OpenLocation(PathBuf),
     SelectFile(PathBuf),
     DelegateToWindowsExplorer(String),
+    EnableDefaultExplorer { intercept_win_e: bool },
     RestoreDefaultExplorer,
 }
 
@@ -32,6 +33,22 @@ pub fn parse_cli_args(args: &[String]) -> (LaunchIntent, bool) {
             || arg.eq_ignore_ascii_case("--restore-default-explorer")
         {
             return (LaunchIntent::RestoreDefaultExplorer, false);
+        }
+        if arg.eq_ignore_ascii_case("--enable-default-explorer-win-e") {
+            return (
+                LaunchIntent::EnableDefaultExplorer {
+                    intercept_win_e: true,
+                },
+                false,
+            );
+        }
+        if arg.eq_ignore_ascii_case("--enable-default-explorer") {
+            return (
+                LaunchIntent::EnableDefaultExplorer {
+                    intercept_win_e: false,
+                },
+                false,
+            );
         }
         if arg.eq_ignore_ascii_case("--new-window") || arg.eq_ignore_ascii_case("-n") {
             force_new_window = true;
@@ -236,6 +253,24 @@ mod tests {
         assert_eq!(
             parse_cli_args(&["--restore-explorer".to_string()]),
             (LaunchIntent::RestoreDefaultExplorer, false)
+        );
+        assert_eq!(
+            parse_cli_args(&["--enable-default-explorer".to_string()]),
+            (
+                LaunchIntent::EnableDefaultExplorer {
+                    intercept_win_e: false
+                },
+                false
+            )
+        );
+        assert_eq!(
+            parse_cli_args(&["--enable-default-explorer-win-e".to_string()]),
+            (
+                LaunchIntent::EnableDefaultExplorer {
+                    intercept_win_e: true
+                },
+                false
+            )
         );
 
         assert_eq!(

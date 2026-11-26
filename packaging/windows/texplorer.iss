@@ -1,5 +1,5 @@
 #ifndef MyAppVersion
-  #define MyAppVersion "0.4.0"
+  #define MyAppVersion "0.5.0"
 #endif
 #ifndef BinaryPath
   #define BinaryPath "..\..\target\release\texplorer.exe"
@@ -11,7 +11,7 @@
   #define OutputDir "..\..\dist"
 #endif
 #ifndef OutputBaseFilename
-  #define OutputBaseFilename "texplorer-v0.4.0-windows-x86_64-setup"
+  #define OutputBaseFilename "texplorer-v0.5.0-windows-x86_64-setup"
 #endif
 
 [Setup]
@@ -43,6 +43,9 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 
 [Tasks]
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
+Name: "defaultexplorer"; Description: "Set TExplorer as Default Windows File Manager (reversible, HKCU)"; GroupDescription: "Windows Integration:"; Flags: unchecked
+Name: "defaultexplorer\wine"; Description: "Also open TExplorer when pressing Win+E"; GroupDescription: "Windows Integration:"; Flags: unchecked
+Name: "mftservice"; Description: "Install NTFS $MFT Instant Search Service (requires Administrator UAC)"; GroupDescription: "Windows Integration:"; Flags: unchecked
 
 [Files]
 Source: "{#BinaryPath}"; DestDir: "{app}"; DestName: "texplorer.exe"; Flags: ignoreversion
@@ -57,6 +60,9 @@ Name: "{autodesktop}\TExplorer"; Filename: "{app}\texplorer.exe"; IconFilename: 
 
 [Run]
 Filename: "{app}\texplorer-service.exe"; Parameters: "--restart-if-installed"; Flags: runhidden waituntilterminated skipifsilent
+Filename: "{app}\texplorer-service.exe"; Parameters: "--install"; Verb: "runas"; Tasks: mftservice; Flags: shellexec runhidden waituntilterminated skipifsilent
+Filename: "{app}\texplorer.exe"; Parameters: "--enable-default-explorer"; Tasks: defaultexplorer and not defaultexplorer\wine; Flags: runhidden waituntilterminated
+Filename: "{app}\texplorer.exe"; Parameters: "--enable-default-explorer-win-e"; Tasks: defaultexplorer\wine; Flags: runhidden waituntilterminated
 Filename: "{app}\texplorer.exe"; Description: "{cm:LaunchProgram,TExplorer}"; Flags: nowait postinstall skipifsilent
 
 [UninstallRun]

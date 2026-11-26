@@ -12,10 +12,11 @@ use gpui_kit::{
     assets::{Assets, icon_assets},
     *,
 };
-use texplorer_core::AppSettings;
+use texplorer_core::{AppSession, AppSettings};
 use texplorer_platform::{
-    LaunchIntent, delegate_to_windows_explorer, parse_cli_args, restore_windows_explorer,
-    start_single_instance_server, system_prefers_dark_mode, try_forward_to_running_instance,
+    LaunchIntent, delegate_to_windows_explorer, enable_default_explorer, parse_cli_args,
+    restore_windows_explorer, start_single_instance_server, system_prefers_dark_mode,
+    try_forward_to_running_instance,
 };
 
 use crate::ui::workspace::{
@@ -123,6 +124,20 @@ fn main() {
                 eprintln!("Failed to restore Windows Explorer: {err}");
                 std::process::exit(1);
             }
+            let mut settings = AppSettings::load();
+            settings.replace_default_explorer = false;
+            let _ = settings.save();
+            return;
+        }
+        LaunchIntent::EnableDefaultExplorer { intercept_win_e } => {
+            if let Err(err) = enable_default_explorer(*intercept_win_e) {
+                eprintln!("Failed to enable TExplorer as default file manager: {err}");
+                std::process::exit(1);
+            }
+            let mut settings = AppSettings::load();
+            settings.replace_default_explorer = true;
+            settings.intercept_win_e = *intercept_win_e;
+            let _ = settings.save();
             return;
         }
         LaunchIntent::DelegateToWindowsExplorer(target) => {
@@ -142,6 +157,11 @@ fn main() {
     });
 
     let initial_settings = AppSettings::load();
+    let initial_session = if initial_settings.restore_tabs_on_startup && !force_new_window {
+        AppSession::load()
+    } else {
+        None
+    };
     let system_is_dark = system_prefers_dark_mode();
 
     gpui_kit::application()
@@ -193,7 +213,22 @@ fn main() {
                 KeyBinding::new("ctrl-q", Quit, Some("TExplorerWorkspace")),
             ]);
 
-            let bounds = WindowBounds::centered(size(px(1440.), px(900.)), cx);
+            let bounds = initial_session
+                .as_ref()
+                .and_then(|s| s.window)
+                .filter(|g| g.is_valid())
+                .map(|g| {
+                    let rect = Bounds::new(
+                        point(px(g.x), px(g.y)),
+                        size(px(g.width), px(g.height)),
+                    );
+                    if g.maximized {
+                        WindowBounds::Maximized(rect)
+                    } else {
+                        WindowBounds::Windowed(rect)
+                    }
+                })
+                .unwrap_or_else(|| WindowBounds::centered(size(px(1440.), px(900.)), cx));
             let options = WindowOptions {
                 window_bounds: Some(bounds),
                 titlebar: Some(TitlebarOptions {
@@ -207,15 +242,18 @@ fn main() {
 
             let settings_for_window = initial_settings.clone();
             let intent_for_window = launch_intent.clone();
+            let mut session_for_window = initial_session.clone();
             let mut ipc_rx_opt = Some(ipc_rx);
             gpui_kit::open_window(options, cx, move |window, cx| {
                 window.set_rem_size(px(theme::UI_REM_SIZE));
                 let rx = ipc_rx_opt.take().expect("single window initialization");
+                let session = session_for_window.take();
                 cx.new(|cx| {
                     Workspace::new(
                         settings_for_window,
                         system_is_dark,
                         intent_for_window,
+                        session,
                         rx,
                         window,
                         cx,

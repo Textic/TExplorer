@@ -790,6 +790,8 @@ fn render_settings_card(
                                         .p_3()
                                         .items_center()
                                         .justify_between()
+                                        .border_b_1()
+                                        .border_color(solid(p.border_subtle))
                                         .child(setting_label(
                                             "Default View Mode",
                                             "Layout used when opening new tabs or split panes.",
@@ -837,6 +839,32 @@ fn render_settings_card(
                                                     }),
                                                 )),
                                         ),
+                                )
+                                // Session persistence
+                                .child(
+                                    h_flex()
+                                        .p_3()
+                                        .items_center()
+                                        .justify_between()
+                                        .gap_3()
+                                        .child(setting_label(
+                                            "Restore Tabs & Window on Startup",
+                                            "Automatically reopen your previous tabs, Dual-Pane splits, and window size.",
+                                            p,
+                                        ))
+                                        .child(choice_pill(
+                                            "set-restore-session",
+                                            if ws.settings.restore_tabs_on_startup {
+                                                "Enabled"
+                                            } else {
+                                                "Disabled"
+                                            },
+                                            ws.settings.restore_tabs_on_startup,
+                                            p,
+                                            cx.listener(|this, _, window, cx| {
+                                                this.toggle_restore_tabs_on_startup(window, cx);
+                                            }),
+                                        )),
                                 ),
                         ),
                 )

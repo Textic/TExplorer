@@ -1,12 +1,13 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashSet};
 
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::entry::{FileEntry, SortSpec, ViewMode};
 use crate::location::Location;
 
 /// Identifies one side of a split tab.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 pub enum PaneSide {
     #[default]
     Left,
@@ -84,10 +85,7 @@ impl SelectionSet {
     }
 
     pub fn select_all(&mut self, total: usize) {
-        self.selected.clear();
-        for i in 0..total {
-            self.selected.insert(i);
-        }
+        self.selected = (0..total).collect();
         if total > 0 {
             self.anchor = Some(0);
             self.cursor = Some(total - 1);
@@ -154,6 +152,8 @@ pub struct PaneModel {
     pub entries: Vec<FileEntry>,
     pub filtered_indices: Vec<usize>,
     pub selection: SelectionSet,
+    /// Cached byte total of selected entries so status-bar rendering stays O(1) on 100k+ items.
+    pub selected_bytes: u64,
     pub loading: bool,
     pub error: Option<String>,
     pub load_generation: u64,
@@ -175,6 +175,7 @@ impl PaneModel {
             entries: Vec::new(),
             filtered_indices: Vec::new(),
             selection: SelectionSet::default(),
+            selected_bytes: 0,
             loading: false,
             error: None,
             load_generation: 0,
@@ -195,6 +196,7 @@ impl PaneModel {
         self.history_forward.clear();
         self.quick_filter.clear();
         self.selection.clear();
+        self.selected_bytes = 0;
         self.error = None;
         true
     }
@@ -217,6 +219,7 @@ impl PaneModel {
         self.history_forward.push(cur);
         self.quick_filter.clear();
         self.selection.clear();
+        self.selected_bytes = 0;
         self.error = None;
         Some(prev)
     }
@@ -227,6 +230,7 @@ impl PaneModel {
         self.history_back.push(cur);
         self.quick_filter.clear();
         self.selection.clear();
+        self.selected_bytes = 0;
         self.error = None;
         Some(next)
     }
@@ -250,6 +254,11 @@ impl PaneModel {
     /// Replaces the raw entries, applies sorting and filtering, and restores pending selection if any.
     pub fn set_entries(&mut self, mut entries: Vec<FileEntry>) {
         crate::entry::sort_entries(&mut entries, self.sort);
+        self.set_presorted_entries(entries);
+    }
+
+    /// Replaces the raw entries assuming they were already sorted off the UI thread by `self.sort`.
+    pub fn set_presorted_entries(&mut self, entries: Vec<FileEntry>) {
         self.entries = entries;
         self.loading = false;
         self.error = None;
@@ -264,11 +273,25 @@ impl PaneModel {
         {
             self.selection.select_only(visible_idx);
         }
+        self.recompute_selection_bytes();
     }
 
-    /// Re-sorts existing entries in place and refreshes the filtered view.
+    /// Recomputes `selected_bytes` after any selection or folder-size change so UI renders in O(1).
+    pub fn recompute_selection_bytes(&mut self) {
+        self.selected_bytes = self
+            .selection
+            .selected
+            .iter()
+            .filter_map(|&vis_idx| {
+                let entry_idx = *self.filtered_indices.get(vis_idx)?;
+                self.entries.get(entry_idx)?.size
+            })
+            .sum();
+    }
+
+    /// Re-sorts existing entries in place and refreshes the filtered view in O(N log N) time.
     pub fn resort(&mut self) {
-        let previously_selected: Vec<Location> = self
+        let previously_selected: HashSet<Location> = self
             .selected_entries()
             .into_iter()
             .map(|e| e.location.clone())
@@ -278,20 +301,24 @@ impl PaneModel {
         self.rebuild_filter();
 
         self.selection.clear();
-        for (vis_idx, &entry_idx) in self.filtered_indices.iter().enumerate() {
-            if previously_selected.contains(&self.entries[entry_idx].location) {
-                self.selection.selected.insert(vis_idx);
-                if self.selection.anchor.is_none() {
-                    self.selection.anchor = Some(vis_idx);
+        if !previously_selected.is_empty() {
+            for (vis_idx, &entry_idx) in self.filtered_indices.iter().enumerate() {
+                if previously_selected.contains(&self.entries[entry_idx].location) {
+                    self.selection.selected.insert(vis_idx);
+                    if self.selection.anchor.is_none() {
+                        self.selection.anchor = Some(vis_idx);
+                    }
+                    self.selection.cursor = Some(vis_idx);
                 }
-                self.selection.cursor = Some(vis_idx);
             }
         }
+        self.recompute_selection_bytes();
     }
 
-    /// Rebuilds `filtered_indices` using `show_hidden` and `quick_filter`.
+    /// Rebuilds `filtered_indices` using `show_hidden` and `quick_filter` with zero per-entry heap allocations.
     pub fn rebuild_filter(&mut self) {
         let needle = self.quick_filter.trim().to_ascii_lowercase();
+        let needle_bytes = needle.as_bytes();
         self.filtered_indices.clear();
         self.filtered_indices.reserve(self.entries.len());
 
@@ -299,13 +326,16 @@ impl PaneModel {
             if !self.show_hidden && entry.is_hidden() {
                 continue;
             }
-            if !needle.is_empty() && !entry.name.to_ascii_lowercase().contains(&needle) {
+            if !needle_bytes.is_empty()
+                && !contains_ascii_case_insensitive(entry.name.as_bytes(), needle_bytes)
+            {
                 continue;
             }
             self.filtered_indices.push(idx);
         }
 
         self.selection.clamp_to(self.filtered_indices.len());
+        self.recompute_selection_bytes();
     }
 
     /// Returns the visible entry at `visible_idx`.
@@ -337,10 +367,11 @@ impl PaneModel {
             .and_then(|&idx| self.visible_entry(idx))
     }
 
-    /// Type-ahead search: finds the next visible item starting with `prefix` (case-insensitive).
+    /// Type-ahead search: finds the next visible item starting with `prefix` (zero heap allocations).
     pub fn find_type_ahead(&self, prefix: &str) -> Option<usize> {
         let needle = prefix.to_ascii_lowercase();
-        if needle.is_empty() || self.filtered_indices.is_empty() {
+        let needle_bytes = needle.as_bytes();
+        if needle_bytes.is_empty() || self.filtered_indices.is_empty() {
             return None;
         }
         let start = self
@@ -352,13 +383,45 @@ impl PaneModel {
         for offset in 0..self.filtered_indices.len() {
             let vis_idx = (start + offset) % self.filtered_indices.len();
             if let Some(entry) = self.visible_entry(vis_idx)
-                && entry.name.to_ascii_lowercase().starts_with(&needle)
+                && starts_with_ascii_case_insensitive(entry.name.as_bytes(), needle_bytes)
             {
                 return Some(vis_idx);
             }
         }
         None
     }
+}
+
+#[inline]
+fn starts_with_ascii_case_insensitive(haystack: &[u8], needle_lower: &[u8]) -> bool {
+    haystack.len() >= needle_lower.len()
+        && haystack[..needle_lower.len()]
+            .iter()
+            .zip(needle_lower)
+            .all(|(&h, &n)| h.to_ascii_lowercase() == n)
+}
+
+#[inline]
+fn contains_ascii_case_insensitive(haystack: &[u8], needle_lower: &[u8]) -> bool {
+    if needle_lower.is_empty() {
+        return true;
+    }
+    if haystack.len() < needle_lower.len() {
+        return false;
+    }
+    let first = needle_lower[0];
+    let last_start = haystack.len() - needle_lower.len();
+    for start in 0..=last_start {
+        if haystack[start].to_ascii_lowercase() == first
+            && haystack[start + 1..start + needle_lower.len()]
+                .iter()
+                .zip(&needle_lower[1..])
+                .all(|(&h, &n)| h.to_ascii_lowercase() == n)
+        {
+            return true;
+        }
+    }
+    false
 }
 
 /// A top-level browser tab containing either a single pane or a Dual-Pane split.
@@ -465,5 +528,52 @@ mod tests {
         assert!(tab.toggle_split());
         assert!(tab.split_enabled);
         assert_eq!(tab.pane(PaneSide::Right).location, Location::local(r"X:\Projects"));
+    }
+
+    #[test]
+    fn handles_100k_entries_sort_filter_and_select_all_fast() {
+        use crate::entry::{EntryFlags, FileKind, SortColumn};
+
+        let mut pane = PaneModel::new(Location::local(r"X:\BigDir"), ViewMode::Details, true);
+        let entries: Vec<FileEntry> = (0..100_000usize)
+            .map(|i| FileEntry {
+                name: format!("asset_{:06}.png", 99_999 - i),
+                extension: "png".to_string(),
+                location: Location::Local(std::path::PathBuf::from(format!(
+                    r"X:\BigDir\asset_{:06}.png",
+                    99_999 - i
+                ))),
+                size: Some((i as u64 + 1) * 64),
+                modified_secs: 1_700_000_000 + i as i64,
+                created_secs: 1_700_000_000 + i as i64,
+                flags: EntryFlags::empty(),
+                kind: FileKind::Image,
+                type_label: "PNG Image".to_string(),
+            })
+            .collect();
+
+        pane.set_entries(entries);
+        assert_eq!(pane.filtered_indices.len(), 100_000);
+        assert_eq!(pane.visible_entry(0).unwrap().name, "asset_000000.png");
+
+        pane.selection.select_all(pane.filtered_indices.len());
+        pane.recompute_selection_bytes();
+        assert_eq!(pane.selection.len(), 100_000);
+        assert!(pane.selected_bytes > 0);
+
+        // Resort by Type and Size while all 100k items are selected (must stay O(N log N), not O(N^2)).
+        pane.sort.toggle_column(SortColumn::Type);
+        pane.resort();
+        assert_eq!(pane.selection.len(), 100_000);
+
+        pane.sort.toggle_column(SortColumn::Size);
+        pane.resort();
+        assert_eq!(pane.visible_entry(0).unwrap().name, "asset_000000.png");
+
+        // Zero-allocation quick filter and type-ahead.
+        pane.quick_filter = "054321".to_string();
+        pane.rebuild_filter();
+        assert_eq!(pane.filtered_indices.len(), 1);
+        assert_eq!(pane.find_type_ahead("asset_054321"), Some(0));
     }
 }
