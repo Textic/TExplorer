@@ -110,10 +110,10 @@ pub fn reveal_in_windows_explorer(path: &Path) -> Result<(), String> {
 /// `pwsh.exe`, `powershell.exe`): strips extended `\\?\` prefixes and trims redundant trailing
 /// separators from non-root paths while preserving drive roots (`C:\`).
 pub fn normalize_terminal_dir(path: &Path) -> PathBuf {
-    let base = if path.is_dir() {
-        path
-    } else {
+    let base = if path.is_file() {
         path.parent().unwrap_or(path)
+    } else {
+        path
     };
     let raw = base.to_string_lossy();
     let stripped = if let Some(unc) = raw.strip_prefix(r"\\?\UNC\") {
@@ -504,13 +504,23 @@ mod tests {
     #[test]
     fn normalizes_terminal_dir_and_wt_quotes() {
         assert_eq!(
-            normalize_terminal_dir(Path::new(r"\\?\X:\TExplorer\")),
-            PathBuf::from(r"X:\TExplorer")
+            normalize_terminal_dir(Path::new(r"\\?\Z:\NonExistent\Project\")),
+            PathBuf::from(r"Z:\NonExistent\Project")
         );
         assert_eq!(
             normalize_terminal_dir(Path::new(r"\\?\C:\")),
             PathBuf::from(r"C:\")
         );
+        let temp_file = std::env::temp_dir().join(format!(
+            "texplorer_term_test_{}.txt",
+            std::process::id()
+        ));
+        let _ = std::fs::write(&temp_file, b"ok");
+        assert_eq!(
+            normalize_terminal_dir(&temp_file),
+            normalize_terminal_dir(&std::env::temp_dir())
+        );
+        let _ = std::fs::remove_file(&temp_file);
         assert_eq!(
             format_wt_dir_args(Path::new(r"X:\")),
             r#"-d "X:\\""#
