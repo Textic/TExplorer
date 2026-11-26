@@ -74,12 +74,20 @@ pub fn render_home_view(
 ) -> impl IntoElement {
     let p = ws.palette();
     let unit = ws.settings.size_unit;
+    let split_enabled = ws.active_tab().is_some_and(|t| t.model.split_enabled);
+    let inner_w = (ws.estimated_pane_width(split_enabled) - 48.0).max(220.0);
     let visible_quick_access: Vec<_> = ws
-        .known_folders
-        .iter()
+        .settings
+        .ordered_quick_access(&ws.known_folders)
+        .into_iter()
         .filter(|f| ws.settings.is_quick_access_visible(f.kind))
-        .cloned()
         .collect();
+    let qa_cols = (((inner_w + 10.0) / 230.0).floor().clamp(1.0, 5.0) as u16)
+        .min(visible_quick_access.len().max(1) as u16)
+        .max(1);
+    let drv_cols = (((inner_w + 14.0) / 280.0).floor().clamp(1.0, 4.0) as u16)
+        .min(ws.volumes.len().max(1) as u16)
+        .max(1);
 
     v_flex()
         .id(match side {
@@ -97,8 +105,10 @@ pub fn render_home_view(
                     .gap_2p5()
                     .child(home_section_header("Quick Access", p))
                     .child(
-                        h_flex()
-                            .flex_wrap()
+                        div()
+                            .w_full()
+                            .grid()
+                            .grid_cols(qa_cols)
                             .gap_2()
                             .children(visible_quick_access.into_iter().enumerate().map(
                                 |(i, folder)| {
@@ -118,7 +128,8 @@ pub fn render_home_view(
                                             },
                                             i,
                                         ))
-                                        .w(px(236.))
+                                        .w_full()
+                                        .min_w_0()
                                         .p_2p5()
                                         .gap_2p5()
                                         .items_center()
@@ -148,11 +159,20 @@ pub fn render_home_view(
                                             MouseButton::Middle,
                                             cx.listener(
                                                 move |this, _: &MouseDownEvent, window, cx| {
-                                                    this.open_new_tab(
-                                                        mid_target.clone(),
-                                                        window,
-                                                        cx,
-                                                    );
+                                                    if this.settings.show_tabs {
+                                                        this.open_new_tab(
+                                                            mid_target.clone(),
+                                                            window,
+                                                            cx,
+                                                        );
+                                                    } else {
+                                                        this.navigate_pane(
+                                                            side,
+                                                            mid_target.clone(),
+                                                            window,
+                                                            cx,
+                                                        );
+                                                    }
                                                 },
                                             ),
                                         )
@@ -215,8 +235,10 @@ pub fn render_home_view(
                 .gap_2p5()
                 .child(home_section_header("Devices and Drives", p))
                 .child(
-                    h_flex()
-                        .flex_wrap()
+                    div()
+                        .w_full()
+                        .grid()
+                        .grid_cols(drv_cols)
                         .gap_3()
                         .children(ws.volumes.iter().enumerate().map(|(i, vol)| {
                             let target = Location::local(&vol.root_path);
@@ -242,7 +264,8 @@ pub fn render_home_view(
                                     },
                                     i,
                                 ))
-                                .w(px(292.))
+                                .w_full()
+                                .min_w_0()
                                 .p_3()
                                 .gap_2()
                                 .rounded(px(RADIUS_ROW))
@@ -262,7 +285,16 @@ pub fn render_home_view(
                                 .on_mouse_down(
                                     MouseButton::Middle,
                                     cx.listener(move |this, _: &MouseDownEvent, window, cx| {
-                                        this.open_new_tab(mid_target.clone(), window, cx);
+                                        if this.settings.show_tabs {
+                                            this.open_new_tab(mid_target.clone(), window, cx);
+                                        } else {
+                                            this.navigate_pane(
+                                                side,
+                                                mid_target.clone(),
+                                                window,
+                                                cx,
+                                            );
+                                        }
                                     }),
                                 )
                                 .on_mouse_down(
@@ -494,17 +526,32 @@ pub fn render_details_view(
             )
             .into_any_element()
         } else {
-            uniform_list(
-                list_id,
-                row_count,
-                cx.processor(move |this, range: Range<usize>, _window, cx| {
-                    render_details_rows(this, side, range, cx)
-                }),
-            )
-            .track_scroll(&pane_ui.scroll_handle)
-            .flex_1()
-            .w_full()
-            .into_any_element()
+            div()
+                .relative()
+                .flex_1()
+                .min_h_0()
+                .w_full()
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, ev: &MouseDownEvent, window, cx| {
+                        this.begin_marquee_selection(side, ev, window, cx);
+                    }),
+                )
+                .child(
+                    uniform_list(
+                        list_id,
+                        row_count,
+                        cx.processor(move |this, range: Range<usize>, _window, cx| {
+                            render_details_rows(this, side, range, cx)
+                        }),
+                    )
+                    .track_scroll(&pane_ui.scroll_handle)
+                    .size_full(),
+                )
+                .when_some(ws.active_marquee_rect(side), |el, (l, t, w, h)| {
+                    el.child(render_marquee_overlay(l, t, w, h, p))
+                })
+                .into_any_element()
         })
         .into_any_element()
 }
@@ -754,7 +801,7 @@ pub fn render_grid_view(
     let is_loading = model.loading;
     let error = model.error.clone();
     let pane_dir = model.location.as_local_path().map(|path| path.to_path_buf());
-    let cols = if tab.model.split_enabled { 4usize } else { 6usize };
+    let cols = ws.grid_view_columns(tab.model.split_enabled);
     let row_count = total.div_ceil(cols);
     let list_id = match side {
         PaneSide::Left => "grid-list-left",
@@ -832,17 +879,32 @@ pub fn render_grid_view(
             )
             .into_any_element()
         } else {
-            uniform_list(
-                list_id,
-                row_count,
-                cx.processor(move |this, range: Range<usize>, _window, cx| {
-                    render_grid_rows(this, side, cols, range, cx)
-                }),
-            )
-            .track_scroll(&pane_ui.scroll_handle)
-            .flex_1()
-            .w_full()
-            .into_any_element()
+            div()
+                .relative()
+                .flex_1()
+                .min_h_0()
+                .w_full()
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, ev: &MouseDownEvent, window, cx| {
+                        this.begin_marquee_selection(side, ev, window, cx);
+                    }),
+                )
+                .child(
+                    uniform_list(
+                        list_id,
+                        row_count,
+                        cx.processor(move |this, range: Range<usize>, _window, cx| {
+                            render_grid_rows(this, side, cols, range, cx)
+                        }),
+                    )
+                    .track_scroll(&pane_ui.scroll_handle)
+                    .size_full(),
+                )
+                .when_some(ws.active_marquee_rect(side), |el, (l, t, w, h)| {
+                    el.child(render_marquee_overlay(l, t, w, h, p))
+                })
+                .into_any_element()
         })
         .into_any_element()
 }
@@ -1212,19 +1274,53 @@ pub fn render_compact_view(
             )
             .into_any_element()
         } else {
-            uniform_list(
-                list_id,
-                row_count,
-                cx.processor(move |this, range: Range<usize>, _window, cx| {
-                    render_compact_rows(this, side, range, cx)
-                }),
-            )
-            .track_scroll(&pane_ui.scroll_handle)
-            .flex_1()
-            .w_full()
-            .into_any_element()
+            div()
+                .relative()
+                .flex_1()
+                .min_h_0()
+                .w_full()
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, ev: &MouseDownEvent, window, cx| {
+                        this.begin_marquee_selection(side, ev, window, cx);
+                    }),
+                )
+                .child(
+                    uniform_list(
+                        list_id,
+                        row_count,
+                        cx.processor(move |this, range: Range<usize>, _window, cx| {
+                            render_compact_rows(this, side, range, cx)
+                        }),
+                    )
+                    .track_scroll(&pane_ui.scroll_handle)
+                    .size_full(),
+                )
+                .when_some(ws.active_marquee_rect(side), |el, (l, t, w, h)| {
+                    el.child(render_marquee_overlay(l, t, w, h, p))
+                })
+                .into_any_element()
         })
         .into_any_element()
+}
+
+fn render_marquee_overlay(
+    left: f32,
+    top: f32,
+    width: f32,
+    height: f32,
+    p: Palette,
+) -> impl IntoElement {
+    div()
+        .absolute()
+        .left(px(left))
+        .top(px(top))
+        .w(px(width))
+        .h(px(height))
+        .bg(soft_tint(p.accent_primary, 0.16))
+        .border_1()
+        .border_color(solid(p.accent_primary))
+        .rounded(px(2.))
 }
 
 fn render_compact_rows(

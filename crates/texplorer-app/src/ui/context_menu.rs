@@ -288,14 +288,16 @@ fn build_rows(ws: &Workspace, target: &ContextMenuTarget) -> Vec<MenuRow> {
                 } else {
                     entry.location.clone()
                 };
-                rows.push(MenuRow::Item {
-                    id: "ctx-open-tab",
-                    label: "Open in New Tab".into(),
-                    shortcut: None,
-                    icon: MenuIcon::Lucide(LucideIcon::Plus),
-                    danger: false,
-                    action: MenuAction::OpenNewTab(nav_target.clone()),
-                });
+                if ws.settings.show_tabs {
+                    rows.push(MenuRow::Item {
+                        id: "ctx-open-tab",
+                        label: "Open in New Tab".into(),
+                        shortcut: None,
+                        icon: MenuIcon::Lucide(LucideIcon::Plus),
+                        danger: false,
+                        action: MenuAction::OpenNewTab(nav_target.clone()),
+                    });
+                }
                 rows.push(MenuRow::Item {
                     id: "ctx-open-split",
                     label: "Open in Split Pane".into(),
@@ -583,23 +585,25 @@ fn build_rows(ws: &Workspace, target: &ContextMenuTarget) -> Vec<MenuRow> {
         ],
         ContextMenuTarget::KnownFolder(folder) => {
             let loc = Location::local(&folder.path);
-            vec![
-                MenuRow::Item {
-                    id: "ctx-qa-open",
-                    label: "Open".into(),
-                    shortcut: None,
-                    icon: MenuIcon::Lucide(LucideIcon::FolderOpen),
-                    danger: false,
-                    action: MenuAction::OpenEntry(loc.clone(), true),
-                },
-                MenuRow::Item {
+            let mut rows = vec![MenuRow::Item {
+                id: "ctx-qa-open",
+                label: "Open".into(),
+                shortcut: None,
+                icon: MenuIcon::Lucide(LucideIcon::FolderOpen),
+                danger: false,
+                action: MenuAction::OpenEntry(loc.clone(), true),
+            }];
+            if ws.settings.show_tabs {
+                rows.push(MenuRow::Item {
                     id: "ctx-qa-tab",
                     label: "Open in New Tab".into(),
                     shortcut: None,
                     icon: MenuIcon::Lucide(LucideIcon::Plus),
                     danger: false,
                     action: MenuAction::OpenNewTab(loc.clone()),
-                },
+                });
+            }
+            rows.extend([
                 MenuRow::Item {
                     id: "ctx-qa-split",
                     label: "Open in Split Pane".into(),
@@ -634,27 +638,30 @@ fn build_rows(ws: &Workspace, target: &ContextMenuTarget) -> Vec<MenuRow> {
                     danger: true,
                     action: MenuAction::HideQuickAccess(folder.kind),
                 },
-            ]
+            ]);
+            rows
         }
         ContextMenuTarget::Volume(vol) => {
             let loc = Location::local(&vol.root_path);
-            vec![
-                MenuRow::Item {
-                    id: "ctx-vol-open",
-                    label: "Open Drive".into(),
-                    shortcut: None,
-                    icon: MenuIcon::Lucide(LucideIcon::HardDrive),
-                    danger: false,
-                    action: MenuAction::OpenEntry(loc.clone(), true),
-                },
-                MenuRow::Item {
+            let mut rows = vec![MenuRow::Item {
+                id: "ctx-vol-open",
+                label: "Open Drive".into(),
+                shortcut: None,
+                icon: MenuIcon::Lucide(LucideIcon::HardDrive),
+                danger: false,
+                action: MenuAction::OpenEntry(loc.clone(), true),
+            }];
+            if ws.settings.show_tabs {
+                rows.push(MenuRow::Item {
                     id: "ctx-vol-tab",
                     label: "Open in New Tab".into(),
                     shortcut: None,
                     icon: MenuIcon::Lucide(LucideIcon::Plus),
                     danger: false,
                     action: MenuAction::OpenNewTab(loc.clone()),
-                },
+                });
+            }
+            rows.extend([
                 MenuRow::Item {
                     id: "ctx-vol-split",
                     label: "Open in Split Pane".into(),
@@ -680,7 +687,8 @@ fn build_rows(ws: &Workspace, target: &ContextMenuTarget) -> Vec<MenuRow> {
                     danger: false,
                     action: MenuAction::ShowProperties(vol.root_path.clone()),
                 },
-            ]
+            ]);
+            rows
         }
     }
 }

@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-use crate::entry::{KnownFolderKind, ViewMode};
+use crate::entry::{KnownFolder, KnownFolderKind, ViewMode};
 
 /// Base surface theme preset. Files palettes appear first, followed by Obsidian Dark.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -180,6 +180,44 @@ impl SizeUnit {
     }
 }
 
+/// Configurable top-level navigation categories rendered in the left sidebar.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SidebarSection {
+    QuickAccess,
+    Pinned,
+    Drives,
+    LinuxWsl,
+}
+
+impl SidebarSection {
+    /// Default vertical order for left sidebar categories.
+    pub const DEFAULT_ORDER: [Self; 4] = [
+        Self::QuickAccess,
+        Self::Pinned,
+        Self::Drives,
+        Self::LinuxWsl,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::QuickAccess => "Quick Access",
+            Self::Pinned => "Pinned",
+            Self::Drives => "Drives",
+            Self::LinuxWsl => "Linux / WSL",
+        }
+    }
+
+    pub fn header_label(self) -> &'static str {
+        match self {
+            Self::QuickAccess => "QUICK ACCESS",
+            Self::Pinned => "PINNED",
+            Self::Drives => "DRIVES",
+            Self::LinuxWsl => "LINUX / WSL",
+        }
+    }
+}
+
 /// Persistent user configuration for TExplorer.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -200,6 +238,10 @@ pub struct AppSettings {
     pub replace_default_explorer: bool,
     pub intercept_win_e: bool,
     pub restore_tabs_on_startup: bool,
+    pub sidebar_section_order: Vec<SidebarSection>,
+    pub hidden_sidebar_sections: Vec<SidebarSection>,
+    pub collapsed_sidebar_sections: Vec<SidebarSection>,
+    pub quick_access_order: Vec<KnownFolderKind>,
     pub hidden_quick_access: Vec<KnownFolderKind>,
     pub pinned_folders: Vec<PathBuf>,
     pub terminal_command: String,
@@ -225,6 +267,10 @@ impl Default for AppSettings {
             replace_default_explorer: false,
             intercept_win_e: false,
             restore_tabs_on_startup: true,
+            sidebar_section_order: SidebarSection::DEFAULT_ORDER.to_vec(),
+            hidden_sidebar_sections: Vec::new(),
+            collapsed_sidebar_sections: Vec::new(),
+            quick_access_order: Vec::new(),
             hidden_quick_access: Vec::new(),
             pinned_folders: Vec::new(),
             terminal_command: "wt.exe".to_string(),
@@ -325,11 +371,237 @@ impl AppSettings {
             self.hidden_quick_access.push(kind);
         }
     }
+
+    /// Returns `available` Quick Access folders ordered according to `quick_access_order`,
+    /// appending any remaining folders in their natural discovery order.
+    pub fn ordered_quick_access(&self, available: &[KnownFolder]) -> Vec<KnownFolder> {
+        let mut out = Vec::with_capacity(available.len());
+        for &kind in &self.quick_access_order {
+            if let Some(folder) = available.iter().find(|f| f.kind == kind)
+                && !out.iter().any(|existing: &KnownFolder| existing.kind == kind)
+            {
+                out.push(folder.clone());
+            }
+        }
+        for folder in available {
+            if !out.iter().any(|existing| existing.kind == folder.kind) {
+                out.push(folder.clone());
+            }
+        }
+        out
+    }
+
+    /// Moves a Quick Access folder up (`delta = -1`) or down (`delta = 1`) relative to `available`.
+    pub fn move_quick_access(
+        &mut self,
+        kind: KnownFolderKind,
+        delta: isize,
+        available: &[KnownFolder],
+    ) -> bool {
+        let mut order: Vec<KnownFolderKind> = self
+            .ordered_quick_access(available)
+            .into_iter()
+            .map(|f| f.kind)
+            .collect();
+        let Some(idx) = order.iter().position(|k| *k == kind) else {
+            return false;
+        };
+        let target = idx as isize + delta;
+        if target < 0 || target as usize >= order.len() {
+            return false;
+        }
+        order.swap(idx, target as usize);
+        self.quick_access_order = order;
+        true
+    }
+
+    /// Returns `true` when Quick Access folder order or visibility differs from defaults.
+    pub fn has_custom_quick_access(&self, available: &[KnownFolder]) -> bool {
+        if !self.hidden_quick_access.is_empty() {
+            return true;
+        }
+        let default_kinds: Vec<KnownFolderKind> = available.iter().map(|f| f.kind).collect();
+        let current_kinds: Vec<KnownFolderKind> = self
+            .ordered_quick_access(available)
+            .into_iter()
+            .map(|f| f.kind)
+            .collect();
+        current_kinds != default_kinds
+    }
+
+    /// Restores default Quick Access folder ordering and visibility.
+    pub fn reset_quick_access(&mut self) {
+        self.quick_access_order.clear();
+        self.hidden_quick_access.clear();
+    }
+
+    /// Returns all sidebar sections deduplicated in the user's configured order,
+    /// appending any newly introduced sections in their default relative order.
+    pub fn normalized_sidebar_order(&self) -> Vec<SidebarSection> {
+        let mut out = Vec::with_capacity(SidebarSection::DEFAULT_ORDER.len());
+        for &sec in &self.sidebar_section_order {
+            if !out.contains(&sec) {
+                out.push(sec);
+            }
+        }
+        for sec in SidebarSection::DEFAULT_ORDER {
+            if !out.contains(&sec) {
+                out.push(sec);
+            }
+        }
+        out
+    }
+
+    /// Returns `true` when `section` is enabled to appear in the left sidebar.
+    pub fn is_sidebar_section_visible(&self, section: SidebarSection) -> bool {
+        !self.hidden_sidebar_sections.contains(&section)
+    }
+
+    /// Toggles whether `section` is shown in the left sidebar.
+    pub fn toggle_sidebar_section_visible(&mut self, section: SidebarSection) {
+        if let Some(pos) = self
+            .hidden_sidebar_sections
+            .iter()
+            .position(|s| *s == section)
+        {
+            self.hidden_sidebar_sections.remove(pos);
+        } else {
+            self.hidden_sidebar_sections.push(section);
+        }
+    }
+
+    /// Returns `true` when `section` is currently collapsed in the left sidebar.
+    pub fn is_sidebar_section_collapsed(&self, section: SidebarSection) -> bool {
+        self.collapsed_sidebar_sections.contains(&section)
+    }
+
+    /// Toggles collapsed/expanded state of `section` in the left sidebar.
+    pub fn toggle_sidebar_section_collapsed(&mut self, section: SidebarSection) {
+        if let Some(pos) = self
+            .collapsed_sidebar_sections
+            .iter()
+            .position(|s| *s == section)
+        {
+            self.collapsed_sidebar_sections.remove(pos);
+        } else {
+            self.collapsed_sidebar_sections.push(section);
+        }
+    }
+
+    /// Moves `section` up (`delta = -1`) or down (`delta = 1`) in `sidebar_section_order`.
+    pub fn move_sidebar_section(&mut self, section: SidebarSection, delta: isize) -> bool {
+        let mut order = self.normalized_sidebar_order();
+        let Some(idx) = order.iter().position(|s| *s == section) else {
+            return false;
+        };
+        let target = idx as isize + delta;
+        if target < 0 || target as usize >= order.len() {
+            return false;
+        }
+        order.swap(idx, target as usize);
+        self.sidebar_section_order = order;
+        true
+    }
+
+    /// Returns `true` when sidebar section order or visibility differs from defaults.
+    pub fn has_custom_sidebar_sections(&self) -> bool {
+        self.normalized_sidebar_order().as_slice() != SidebarSection::DEFAULT_ORDER
+            || !self.hidden_sidebar_sections.is_empty()
+    }
+
+    /// Restores default sidebar section ordering and visibility.
+    pub fn reset_sidebar_sections(&mut self) {
+        self.sidebar_section_order = SidebarSection::DEFAULT_ORDER.to_vec();
+        self.hidden_sidebar_sections.clear();
+        self.collapsed_sidebar_sections.clear();
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sidebar_sections_reorder_hide_collapse_and_normalize() {
+        let mut s = AppSettings {
+            sidebar_section_order: vec![SidebarSection::Drives, SidebarSection::Drives],
+            ..Default::default()
+        };
+        // Normalizing deduplicates and appends missing sections in default order.
+        assert_eq!(
+            s.normalized_sidebar_order(),
+            vec![
+                SidebarSection::Drives,
+                SidebarSection::QuickAccess,
+                SidebarSection::Pinned,
+                SidebarSection::LinuxWsl,
+            ]
+        );
+        // Boundary checks & swapping.
+        assert!(!s.move_sidebar_section(SidebarSection::Drives, -1));
+        assert!(s.move_sidebar_section(SidebarSection::Drives, 1));
+        assert_eq!(s.normalized_sidebar_order()[0], SidebarSection::QuickAccess);
+        assert_eq!(s.normalized_sidebar_order()[1], SidebarSection::Drives);
+
+        // Visibility & collapse toggles.
+        assert!(s.is_sidebar_section_visible(SidebarSection::LinuxWsl));
+        s.toggle_sidebar_section_visible(SidebarSection::LinuxWsl);
+        assert!(!s.is_sidebar_section_visible(SidebarSection::LinuxWsl));
+
+        assert!(!s.is_sidebar_section_collapsed(SidebarSection::Drives));
+        s.toggle_sidebar_section_collapsed(SidebarSection::Drives);
+        assert!(s.is_sidebar_section_collapsed(SidebarSection::Drives));
+
+        assert!(s.has_custom_sidebar_sections());
+        s.reset_sidebar_sections();
+        assert!(!s.has_custom_sidebar_sections());
+        assert!(s.is_sidebar_section_visible(SidebarSection::LinuxWsl));
+        assert!(!s.is_sidebar_section_collapsed(SidebarSection::Drives));
+    }
+
+    #[test]
+    fn quick_access_items_reorder_and_reset() {
+        let available = vec![
+            KnownFolder {
+                kind: KnownFolderKind::Desktop,
+                name: "Desktop".to_string(),
+                path: PathBuf::from(r"C:\Users\Demo\Desktop"),
+            },
+            KnownFolder {
+                kind: KnownFolderKind::Downloads,
+                name: "Downloads".to_string(),
+                path: PathBuf::from(r"C:\Users\Demo\Downloads"),
+            },
+            KnownFolder {
+                kind: KnownFolderKind::Documents,
+                name: "Documents".to_string(),
+                path: PathBuf::from(r"C:\Users\Demo\Documents"),
+            },
+        ];
+
+        let mut s = AppSettings::default();
+        assert!(!s.has_custom_quick_access(&available));
+        assert!(!s.move_quick_access(KnownFolderKind::Desktop, -1, &available));
+        assert!(s.move_quick_access(KnownFolderKind::Documents, -1, &available));
+        assert!(s.has_custom_quick_access(&available));
+
+        let ordered: Vec<KnownFolderKind> = s
+            .ordered_quick_access(&available)
+            .into_iter()
+            .map(|f| f.kind)
+            .collect();
+        assert_eq!(
+            ordered,
+            vec![
+                KnownFolderKind::Desktop,
+                KnownFolderKind::Documents,
+                KnownFolderKind::Downloads,
+            ]
+        );
+
+        s.reset_quick_access();
+        assert!(!s.has_custom_quick_access(&available));
+    }
 
     #[test]
     fn round_trips_settings_json() {
