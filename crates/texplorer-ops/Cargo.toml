@@ -4,9 +4,11 @@ version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
-description = "Asynchronous file operations engine, conflict resolution, and Undo/Redo history for TExplorer"
+description = "Asynchronous file operations engine, conflict resolution, Bulk Rename, and Undo/Redo history for TExplorer"
 
 [dependencies]
+chrono.workspace = true
 futures-channel.workspace = true
+regex.workspace = true
 texplorer-platform = { path = "../texplorer-platform" }
 uuid.workspace = true

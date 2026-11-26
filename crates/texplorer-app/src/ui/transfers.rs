@@ -30,7 +30,7 @@ pub fn render_transfer_drawer(ws: &Workspace, cx: &mut Context<Workspace>) -> im
         .absolute()
         .right(px(16.))
         .bottom(px(34.))
-        .w(px(356.))
+        .w(px(380.))
         .bg(solid(p.bg_surface))
         .border_1()
         .border_color(solid(p.border))
@@ -40,7 +40,7 @@ pub fn render_transfer_drawer(ws: &Workspace, cx: &mut Context<Workspace>) -> im
         .child(
             h_flex()
                 .w_full()
-                .h(px(32.))
+                .h(px(36.))
                 .px_3()
                 .items_center()
                 .justify_between()
@@ -49,7 +49,7 @@ pub fn render_transfer_drawer(ws: &Workspace, cx: &mut Context<Workspace>) -> im
                 .border_color(solid(p.border_subtle))
                 .child(
                     div()
-                        .text_size(px(11.))
+                        .text_size(px(13.))
                         .font_semibold()
                         .text_color(solid(p.text_secondary))
                         .child("TRANSFERS"),
@@ -62,7 +62,7 @@ pub fn render_transfer_drawer(ws: &Workspace, cx: &mut Context<Workspace>) -> im
                             .py_0p5()
                             .rounded(px(RADIUS_CONTROL))
                             .cursor_pointer()
-                            .text_size(px(10.))
+                            .text_size(px(12.))
                             .text_color(solid(p.text_muted))
                             .hover(move |s| {
                                 s.bg(solid(p.bg_hover)).text_color(solid(p.text_primary))
@@ -200,7 +200,7 @@ pub fn render_transfer_drawer(ws: &Workspace, cx: &mut Context<Workspace>) -> im
                                 .flex_1()
                                 .min_w_0()
                                 .truncate()
-                                .text_size(px(11.))
+                                .text_size(px(13.))
                                 .text_color(solid(p.text_muted))
                                 .child(status_text),
                         )
@@ -209,7 +209,7 @@ pub fn render_transfer_drawer(ws: &Workspace, cx: &mut Context<Workspace>) -> im
                                 div()
                                     .max_w(px(130.))
                                     .truncate()
-                                    .text_size(px(10.))
+                                    .text_size(px(12.))
                                     .text_color(solid(p.text_secondary))
                                     .child(current),
                             )
@@ -460,7 +460,7 @@ fn compare_card(
                 .child(div().w(px(6.)).h(px(6.)).rounded(px(999.)).bg(solid(dot_hex)))
                 .child(
                     div()
-                        .text_size(px(11.))
+                        .text_size(px(13.))
                         .font_semibold()
                         .text_color(solid(p.text_primary))
                         .child(heading),
@@ -474,7 +474,7 @@ fn compare_card(
         )
         .child(
             div()
-                .text_size(px(11.))
+                .text_size(px(13.))
                 .text_color(solid(p.text_muted))
                 .child(time_text),
         )

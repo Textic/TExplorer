@@ -17,7 +17,7 @@ use texplorer_core::{AccentPreset, DriveKind, FileKind, KnownFolderKind, SizeUni
 
 pub const RADIUS_ROW: f32 = 6.;
 pub const RADIUS_CONTROL: f32 = 4.;
-pub const UI_REM_SIZE: f32 = 17.0;
+pub const UI_REM_SIZE: f32 = 19.5;
 
 /// Resolved flat surface, text, semantic, accent, and syntax color palette.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -228,8 +228,8 @@ pub fn apply_theme(p: Palette, cx: &mut App) {
         theme.focus_ring = false;
         theme.radius = px(RADIUS_CONTROL);
         theme.radius_lg = px(RADIUS_ROW);
-        theme.font_size = px(14.);
-        theme.mono_font_size = px(12.);
+        theme.font_size = px(15.5);
+        theme.mono_font_size = px(13.5);
 
         let bg_base = solid(p.bg_base);
         let bg_surface = solid(p.bg_surface);

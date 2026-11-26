@@ -1,11 +1,13 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use texplorer_platform::move_to_trash;
+use uuid::Uuid;
 
 /// Reversible filesystem transaction recorded for `Ctrl+Z` / `Ctrl+Y`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UndoAction {
     Rename { from: PathBuf, to: PathBuf },
+    BulkRename { pairs: Vec<(PathBuf, PathBuf)> },
     Move { pairs: Vec<(PathBuf, PathBuf)> },
     Copy { created: Vec<PathBuf> },
     CreateDir { path: PathBuf },
@@ -22,6 +24,7 @@ impl UndoAction {
                     .unwrap_or_else(|| to.display().to_string());
                 format!("Rename \"{name}\"")
             }
+            Self::BulkRename { pairs } => format!("Bulk Rename {} item(s)", pairs.len()),
             Self::Move { pairs } => format!("Move {} item(s)", pairs.len()),
             Self::Copy { created } => format!("Copy {} item(s)", created.len()),
             Self::CreateDir { path } => {
@@ -55,6 +58,14 @@ impl UndoAction {
                 Ok(Some(Self::Rename {
                     from: from.clone(),
                     to: to.clone(),
+                }))
+            }
+            Self::BulkRename { pairs } => {
+                let reversed: Vec<(PathBuf, PathBuf)> =
+                    pairs.iter().map(|(from, to)| (to.clone(), from.clone())).collect();
+                two_phase_rename_pairs(&reversed)?;
+                Ok(Some(Self::BulkRename {
+                    pairs: pairs.clone(),
                 }))
             }
             Self::Move { pairs } => {
@@ -124,6 +135,10 @@ impl UndoAction {
                     .map_err(|e| format!("Failed to redo rename: {e}"))?;
                 Ok(self.clone())
             }
+            Self::BulkRename { pairs } => {
+                two_phase_rename_pairs(pairs)?;
+                Ok(self.clone())
+            }
             Self::Move { pairs } => {
                 for (orig, dest) in pairs {
                     if !orig.exists() {
@@ -161,6 +176,36 @@ impl UndoAction {
             Self::Copy { .. } => Err("Redoing an undone copy is not supported.".to_string()),
         }
     }
+}
+
+fn two_phase_rename_pairs(pairs: &[(PathBuf, PathBuf)]) -> Result<(), String> {
+    let mut staged: Vec<(PathBuf, PathBuf, PathBuf)> = Vec::with_capacity(pairs.len());
+    for (src, dst) in pairs {
+        if !src.exists() {
+            continue;
+        }
+        let parent = src.parent().unwrap_or_else(|| Path::new(""));
+        let tmp = parent.join(format!(".texplorer_undo_{}", Uuid::new_v4().simple()));
+        if let Err(err) = std::fs::rename(src, &tmp) {
+            for (o, t, _) in staged.iter().rev() {
+                let _ = std::fs::rename(t, o);
+            }
+            return Err(format!("Failed staging batch rename: {err}"));
+        }
+        staged.push((src.clone(), tmp, dst.clone()));
+    }
+    for (i, (_, tmp, dst)) in staged.iter().enumerate() {
+        if let Err(err) = std::fs::rename(tmp, dst) {
+            for (o, _, d) in staged[..i].iter().rev() {
+                let _ = std::fs::rename(d, o);
+            }
+            for (o, t, _) in &staged[i..] {
+                let _ = std::fs::rename(t, o);
+            }
+            return Err(format!("Failed completing batch rename: {err}"));
+        }
+    }
+    Ok(())
 }
 
 fn copy_recursively_simple(src: &std::path::Path, dst: &std::path::Path) -> Result<(), String> {

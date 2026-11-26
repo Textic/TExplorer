@@ -40,7 +40,7 @@ pub fn render_header(
     h_flex()
         .id("app-header-bar")
         .w_full()
-        .h(px(38.))
+        .h(px(40.))
         .flex_shrink_0()
         .items_center()
         .bg(solid(p.bg_elevated))
@@ -98,14 +98,16 @@ pub fn render_header(
                         let is_split = tab.model.split_enabled;
                         let tab_icon = match tab.model.active_pane_ref().location {
                             Location::Home => LucideIcon::House,
+                            Location::Archive { .. } => LucideIcon::FileArchive,
+                            Location::Search { .. } => LucideIcon::Search,
                             _ => LucideIcon::Folder,
                         };
 
                         h_flex()
                             .id(("tab-item", idx))
-                            .h(px(28.))
-                            .max_w(px(200.))
-                            .min_w(px(96.))
+                            .h(px(30.))
+                            .max_w(px(210.))
+                            .min_w(px(104.))
                             .px_2()
                             .gap_1p5()
                             .items_center()
@@ -228,7 +230,7 @@ pub fn render_header(
                     el.child(
                         div()
                             .id("hdr-update-pill")
-                            .h(px(24.))
+                            .h(px(26.))
                             .px_2()
                             .flex()
                             .items_center()
@@ -238,7 +240,7 @@ pub fn render_header(
                             .bg(soft_tint(p.accent_primary, 0.16))
                             .border_1()
                             .border_color(soft_tint(p.accent_primary, 0.35))
-                            .text_size(px(11.))
+                            .text_size(px(12.5))
                             .font_medium()
                             .text_color(solid(p.accent_primary))
                             .hover(move |s| s.bg(soft_tint(p.accent_primary, 0.24)))
@@ -252,7 +254,7 @@ pub fn render_header(
                 .child(
                     div()
                         .id("hdr-global-search")
-                        .h(px(26.))
+                        .h(px(28.))
                         .px_2()
                         .flex()
                         .items_center()
@@ -275,7 +277,7 @@ pub fn render_header(
                         .child(div().text_xs().font_medium().child("Search"))
                         .child(
                             div()
-                                .text_size(px(10.))
+                                .text_size(px(12.))
                                 .text_color(solid(p.text_muted))
                                 .child("Ctrl+K"),
                         ),
@@ -283,7 +285,7 @@ pub fn render_header(
                 .child(
                     div()
                         .id("hdr-toggle-split")
-                        .h(px(26.))
+                        .h(px(28.))
                         .px_2()
                         .flex()
                         .items_center()

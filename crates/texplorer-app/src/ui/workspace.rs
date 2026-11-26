@@ -28,31 +28,42 @@ use texplorer_mft::{
     start_service_elevated, uninstall_service_elevated,
 };
 use texplorer_ops::{
-    ConflictDecision, ConflictPrompt, ConflictResolution, TransferControl, TransferEvent,
-    TransferKind, TransferSnapshot, TransferStatus, UndoAction, UndoHistory, spawn_transfer_job,
+    BulkRenameSpec, ConflictDecision, ConflictPrompt, ConflictResolution, RenameCasing,
+    TransferControl, TransferEvent, TransferKind, TransferSnapshot, TransferStatus, UndoAction,
+    UndoHistory, execute_bulk_rename, preview_bulk_rename, spawn_transfer_job,
+    unique_keep_both_path,
 };
 use texplorer_platform::{
-    DefaultExplorerStatus, DirectoryWatcher, LaunchIntent, ShellWorker, cursor_screen_pos,
-    delete_permanently, enable_default_explorer, find_textree_exe, get_clipboard_files,
-    list_known_folders, list_volumes, list_wsl_distros, move_to_trash, open_in_editor, open_item,
-    open_terminal_here, query_default_explorer_status, restore_windows_explorer,
-    reveal_in_windows_explorer, set_clipboard_files, show_properties_dialog,
-    system_prefers_dark_mode,
+    DefaultExplorerStatus, DirectoryWatcher, FileLockStatus, LaunchIntent, ShellWorker,
+    cursor_screen_pos, delete_permanently, enable_default_explorer, get_clipboard_files, inspect_file_lock, list_known_folders, list_volumes, list_wsl_distros,
+    move_to_trash, open_in_editor, open_item, open_terminal_here, query_default_explorer_status,
+    restore_windows_explorer, reveal_in_windows_explorer, set_clipboard_files,
+    show_properties_dialog, system_prefers_dark_mode,
+};
+use texplorer_vfs::archive::{
+    compress_to_zip, extract_archive_all, extract_archive_entries, is_supported_archive,
 };
 use texplorer_vfs::folder_size::resolve_folder_sizes;
+use texplorer_vfs::hash::{FileHashes, compute_file_hashes};
 use texplorer_vfs::search::{SearchOutcome, execute_search};
 use uuid::Uuid;
 
 use crate::preview::{
-    PreviewPayload, ThumbnailCache, ThumbnailKey, load_preview_blocking, raw_bgra_to_render_image,
+    PreviewPayload, ThumbnailCache, ThumbnailKey, load_archive_entry_preview_blocking,
+    load_preview_blocking, raw_bgra_to_render_image,
 };
 use crate::theme::{
     Palette, RADIUS_ROW, apply_theme, crisp_resize_handle_appearance, resolve_palette, solid,
 };
+use crate::ui::bulk_rename::{BulkRenameState, render_bulk_rename_modal};
+use crate::ui::command_palette::{
+    CommandPaletteState, execute_palette_command, filtered_palette_items,
+    render_command_palette_modal,
+};
 use crate::ui::context_menu::{ContextMenuState, ContextMenuTarget, render_context_menu};
 use crate::ui::global_search::{GlobalSearchState, render_global_search_modal};
 use crate::ui::header::render_header;
-use crate::ui::inspector::render_inspector;
+use crate::ui::inspector::{HashInspectState, render_inspector};
 use crate::ui::modals::{ActiveModal, TextPromptKind, render_active_modal};
 use crate::ui::pane::render_pane;
 use crate::ui::quicklook::render_quicklook_modal;
@@ -79,6 +90,8 @@ gpui_kit::actions!(
         RefreshPane,
         FocusFilter,
         OpenGlobalSearch,
+        OpenCommandPalette,
+        OpenBulkRename,
         ToggleSidebar,
         ToggleInspector,
         ToggleHiddenFiles,
@@ -141,8 +154,21 @@ enum BgEvent {
     },
     PreviewReady {
         generation: u64,
-        path: PathBuf,
+        location: Location,
         payload: PreviewPayload,
+    },
+    HashesReady {
+        generation: u64,
+        path: PathBuf,
+        result: Result<FileHashes, String>,
+    },
+    LockChecked {
+        generation: u64,
+        path: PathBuf,
+        status: FileLockStatus,
+    },
+    ArchiveOpFinished {
+        result: Result<(String, PathBuf), String>,
     },
     Transfer(TransferEvent),
     NativeShellMenuDone(Result<(), String>),
@@ -240,12 +266,26 @@ pub struct Workspace {
     modal_subs: Vec<Subscription>,
     pub global_search: Option<GlobalSearchState>,
     global_search_subs: Vec<Subscription>,
+    pub bulk_rename: Option<BulkRenameState>,
+    bulk_rename_subs: Vec<Subscription>,
+    pub command_palette: Option<CommandPaletteState>,
+    command_palette_subs: Vec<Subscription>,
     folder_size_cache: HashMap<PathBuf, u64>,
     folder_size_cancels: HashMap<(Uuid, PaneSide), Arc<AtomicBool>>,
     pub quicklook_open: bool,
-    pub preview_path: Option<PathBuf>,
+    pub preview_location: Option<Location>,
     pub preview_payload: PreviewPayload,
     preview_generation: u64,
+    pub hash_target: Option<PathBuf>,
+    pub hash_state: HashInspectState,
+    hash_generation: u64,
+    hash_cancel: Arc<AtomicBool>,
+    pub hash_verify_input: Entity<InputState>,
+    pub hash_verify_text: String,
+    _hash_verify_sub: Subscription,
+    pub lock_target: Option<PathBuf>,
+    pub lock_status: FileLockStatus,
+    lock_generation: u64,
     pub transfers: Vec<TransferJobState>,
     pub conflict_queue: VecDeque<ConflictPrompt>,
     pub conflict_apply_to_all: bool,
@@ -300,6 +340,20 @@ impl Workspace {
             _ => (Location::Home, None),
         };
 
+        let hash_verify_input = cx.new(|cx| {
+            InputState::new(window, cx).placeholder("Paste expected SHA-256 or MD5 to verify...")
+        });
+        let hash_verify_sub = cx.subscribe_in(
+            &hash_verify_input,
+            window,
+            |this, state, ev: &InputEvent, _window, cx| {
+                if matches!(ev, InputEvent::Change) {
+                    this.hash_verify_text = state.read(cx).value().to_string();
+                    cx.notify();
+                }
+            },
+        );
+
         let mut ws = Self {
             focus_handle: cx.focus_handle(),
             settings,
@@ -319,12 +373,26 @@ impl Workspace {
             modal_subs: Vec::new(),
             global_search: None,
             global_search_subs: Vec::new(),
+            bulk_rename: None,
+            bulk_rename_subs: Vec::new(),
+            command_palette: None,
+            command_palette_subs: Vec::new(),
             folder_size_cache: HashMap::new(),
             folder_size_cancels: HashMap::new(),
             quicklook_open: false,
-            preview_path: None,
+            preview_location: None,
             preview_payload: PreviewPayload::Loading,
             preview_generation: 0,
+            hash_target: None,
+            hash_state: HashInspectState::Idle,
+            hash_generation: 0,
+            hash_cancel: Arc::new(AtomicBool::new(false)),
+            hash_verify_input,
+            hash_verify_text: String::new(),
+            _hash_verify_sub: hash_verify_sub,
+            lock_target: None,
+            lock_status: FileLockStatus::NotChecked,
+            lock_generation: 0,
             transfers: Vec::new(),
             conflict_queue: VecDeque::new(),
             conflict_apply_to_all: false,
@@ -642,15 +710,52 @@ impl Workspace {
             }
             BgEvent::PreviewReady {
                 generation,
-                path,
+                location,
                 payload,
             } => {
                 if generation == self.preview_generation {
-                    self.preview_path = Some(path);
+                    self.preview_location = Some(location);
                     self.preview_payload = payload;
                     cx.notify();
                 }
             }
+            BgEvent::HashesReady {
+                generation,
+                path,
+                result,
+            } => {
+                if generation == self.hash_generation && self.hash_target.as_ref() == Some(&path) {
+                    self.hash_state = match result {
+                        Ok(hashes) => HashInspectState::Ready(hashes),
+                        Err(err) => HashInspectState::Error(err),
+                    };
+                    cx.notify();
+                }
+            }
+            BgEvent::LockChecked {
+                generation,
+                path,
+                status,
+            } => {
+                if generation == self.lock_generation && self.lock_target.as_ref() == Some(&path) {
+                    self.lock_status = status;
+                    cx.notify();
+                }
+            }
+            BgEvent::ArchiveOpFinished { result } => match result {
+                Ok((msg, target_dir)) => {
+                    self.invalidate_folder_sizes_under(&target_dir);
+                    self.refresh_panes_showing(&target_dir, cx);
+                    if let Some(parent) = target_dir.parent() {
+                        self.invalidate_folder_sizes_under(parent);
+                        self.refresh_panes_showing(parent, cx);
+                    }
+                    self.show_toast(msg, ToastKind::Success, window, cx);
+                }
+                Err(err) => {
+                    self.show_toast(err, ToastKind::Error, window, cx);
+                }
+            },
             BgEvent::Transfer(xfer_ev) => match xfer_ev {
                 TransferEvent::Progress(snap) => {
                     if let Some(job) = self
@@ -836,7 +941,8 @@ impl Workspace {
         }
     }
 
-    /// Triggers an asynchronous preview load whenever Inspector or QuickLook is visible.
+    /// Triggers an asynchronous preview load whenever Inspector or QuickLook is visible
+    /// (supporting both local filesystem items and virtual archive entries).
     fn sync_preview_for_selection(&mut self, cx: &mut Context<Self>) {
         if !self.settings.show_inspector && !self.quicklook_open {
             return;
@@ -844,15 +950,16 @@ impl Workspace {
         let target = self
             .active_tab()
             .and_then(|t| t.model.active_pane_ref().primary_selected_entry())
-            .and_then(|e| Some((e.location.as_local_path()?.to_path_buf(), e.kind)));
+            .filter(|e| matches!(e.location, Location::Local(_) | Location::Archive { .. }))
+            .map(|e| (e.location.clone(), e.kind));
 
-        let Some((path, kind)) = target else {
-            self.preview_path = None;
+        let Some((location, kind)) = target else {
+            self.preview_location = None;
             self.preview_payload = PreviewPayload::Loading;
             return;
         };
 
-        if self.preview_path.as_ref() == Some(&path)
+        if self.preview_location.as_ref() == Some(&location)
             && !matches!(self.preview_payload, PreviewPayload::Loading)
         {
             return;
@@ -860,16 +967,23 @@ impl Workspace {
 
         self.preview_generation = self.preview_generation.wrapping_add(1);
         let generation = self.preview_generation;
-        self.preview_path = Some(path.clone());
+        self.preview_location = Some(location.clone());
         self.preview_payload = PreviewPayload::Loading;
 
         let worker = self.shell_worker.clone();
         let palette = self.palette();
         let tx = self.bg_tx.clone();
         tokio_runtime().spawn(async move {
-            let p_clone = path.clone();
-            let payload = tokio::task::spawn_blocking(move || {
-                load_preview_blocking(p_clone, kind, worker, palette)
+            let loc_clone = location.clone();
+            let payload = tokio::task::spawn_blocking(move || match loc_clone {
+                Location::Local(path) => load_preview_blocking(path, kind, worker, palette),
+                Location::Archive {
+                    archive_path,
+                    inner_path,
+                } => load_archive_entry_preview_blocking(archive_path, inner_path, kind, palette),
+                _ => PreviewPayload::Unsupported {
+                    reason: "Preview is not available for this location.".to_string(),
+                },
             })
             .await
             .unwrap_or_else(|_| PreviewPayload::Unsupported {
@@ -877,7 +991,7 @@ impl Workspace {
             });
             let _ = tx.unbounded_send(BgEvent::PreviewReady {
                 generation,
-                path,
+                location,
                 payload,
             });
         });
@@ -1256,18 +1370,21 @@ impl Workspace {
         if let Some(tab) = self.tabs.iter_mut().find(|t| t.model.id == tab_id) {
             tab.pane_ui_mut(side).editing_address = false;
         }
-        if let Some(target) = Location::parse_user_input(raw) {
-            if let Some(local) = target.as_local_path()
-                && !local.exists()
-            {
-                self.show_toast(
-                    format!("Path not found: {}", local.display()),
-                    ToastKind::Error,
-                    window,
-                    cx,
-                );
-                cx.notify();
-                return;
+        if let Some(mut target) = Location::parse_user_input(raw) {
+            if let Some(local) = target.as_local_path() {
+                if !local.exists() {
+                    self.show_toast(
+                        format!("Path not found: {}", local.display()),
+                        ToastKind::Error,
+                        window,
+                        cx,
+                    );
+                    cx.notify();
+                    return;
+                }
+                if local.is_file() && is_supported_archive(local) {
+                    target = Location::archive(local, "");
+                }
             }
             self.navigate_pane(side, target, window, cx);
         } else {
@@ -1481,10 +1598,14 @@ impl Workspace {
     ) {
         if is_dir || matches!(location, Location::Home) {
             self.navigate_active_pane(location, window, cx);
-        } else if let Some(path) = location.as_local_path()
-            && let Err(err) = open_item(path)
-        {
-            self.show_toast(err, ToastKind::Error, window, cx);
+        } else if let Some(path) = location.as_local_path() {
+            if is_supported_archive(path) {
+                self.navigate_active_pane(Location::archive(path, ""), window, cx);
+            } else if let Err(err) = open_item(path) {
+                self.show_toast(err, ToastKind::Error, window, cx);
+            }
+        } else if matches!(location, Location::Archive { .. }) {
+            self.toggle_quicklook(cx);
         }
     }
 
@@ -1727,16 +1848,6 @@ impl Workspace {
         }
     }
 
-    pub fn open_in_textree(&mut self, path: &Path, cx: &mut Context<Self>) {
-        let Some(exe) = find_textree_exe(self.settings.textree_path.as_deref()) else {
-            self.set_toast_simple("TexTree executable was not found.", ToastKind::Error, cx);
-            return;
-        };
-        if let Err(err) = std::process::Command::new(exe).arg(path).spawn() {
-            self.set_toast_simple(format!("Failed to launch TexTree: {err}"), ToastKind::Error, cx);
-        }
-    }
-
     pub fn reveal_in_windows_explorer(&mut self, path: &Path, cx: &mut Context<Self>) {
         if let Err(err) = reveal_in_windows_explorer(path) {
             self.set_toast_simple(err, ToastKind::Error, cx);
@@ -1796,6 +1907,10 @@ impl Workspace {
         self.quicklook_open = false;
         self.global_search = None;
         self.global_search_subs.clear();
+        self.bulk_rename = None;
+        self.bulk_rename_subs.clear();
+        self.command_palette = None;
+        self.command_palette_subs.clear();
         self.active_modal = Some(ActiveModal::Settings);
         cx.notify();
     }
@@ -1807,6 +1922,10 @@ impl Workspace {
         self.quicklook_open = false;
         self.active_modal = None;
         self.modal_subs.clear();
+        self.bulk_rename = None;
+        self.bulk_rename_subs.clear();
+        self.command_palette = None;
+        self.command_palette_subs.clear();
         self.refresh_service_status(cx);
 
         let active_folder = self
@@ -2158,6 +2277,549 @@ impl Workspace {
         cx.notify();
     }
 
+    // --- Phase 4: Bulk Rename, Command Palette, Checksums, File Locks & Transparent Archives ---
+
+    pub fn open_bulk_rename_for_pane(
+        &mut self,
+        side: PaneSide,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let mut sources = self.selected_local_paths(side);
+        if sources.is_empty()
+            && let Some(tab) = self.active_tab()
+        {
+            let pane = tab.model.pane(side);
+            sources = pane
+                .filtered_indices
+                .iter()
+                .filter_map(|&idx| {
+                    pane.entries
+                        .get(idx)?
+                        .location
+                        .as_local_path()
+                        .map(|p| p.to_path_buf())
+                })
+                .collect();
+        }
+        if sources.is_empty() {
+            self.show_toast(
+                "Select local files or folders to bulk rename.",
+                ToastKind::Info,
+                window,
+                cx,
+            );
+            return;
+        }
+
+        self.context_menu = None;
+        self.quicklook_open = false;
+        self.active_modal = None;
+        self.modal_subs.clear();
+        self.global_search = None;
+        self.global_search_subs.clear();
+        self.command_palette = None;
+        self.command_palette_subs.clear();
+
+        let find_input =
+            cx.new(|cx| InputState::new(window, cx).placeholder("Text or regex pattern..."));
+        let replace_input = cx.new(|cx| {
+            InputState::new(window, cx).placeholder("Replacement ($1, $2 for regex)...")
+        });
+        let template_input = cx.new(|cx| {
+            InputState::new(window, cx).placeholder("Optional: e.g. photo_{n:03}_{name}")
+        });
+        let ext_input = cx.new(|cx| InputState::new(window, cx).placeholder("Keep original"));
+        find_input.update(cx, |s, cx| s.focus(window, cx));
+
+        let mut subs = Vec::with_capacity(4);
+        for input in [&find_input, &replace_input, &template_input, &ext_input] {
+            let sub = cx.subscribe_in(input, window, |this, _, ev: &InputEvent, window, cx| {
+                match ev {
+                    InputEvent::Change => this.sync_bulk_rename_inputs(cx),
+                    InputEvent::PressEnter { .. } => this.apply_bulk_rename(window, cx),
+                    _ => {}
+                }
+            });
+            subs.push(sub);
+        }
+
+        let spec = BulkRenameSpec::default();
+        let preview_rows = preview_bulk_rename(&sources, &spec).unwrap_or_default();
+
+        self.bulk_rename_subs = subs;
+        self.bulk_rename = Some(BulkRenameState {
+            side,
+            sources,
+            find_input,
+            replace_input,
+            template_input,
+            ext_input,
+            spec,
+            preview_rows,
+            regex_error: None,
+            scroll_handle: UniformListScrollHandle::new(),
+        });
+        cx.notify();
+    }
+
+    pub fn close_bulk_rename(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.bulk_rename.take().is_some() {
+            self.bulk_rename_subs.clear();
+            self.focus_handle.focus(window, cx);
+            cx.notify();
+        }
+    }
+
+    fn sync_bulk_rename_inputs(&mut self, cx: &mut Context<Self>) {
+        let Some((find_e, repl_e, tmpl_e, ext_e)) = self.bulk_rename.as_ref().map(|br| {
+            (
+                br.find_input.clone(),
+                br.replace_input.clone(),
+                br.template_input.clone(),
+                br.ext_input.clone(),
+            )
+        }) else {
+            return;
+        };
+        let find = find_e.read(cx).value().to_string();
+        let replace = repl_e.read(cx).value().to_string();
+        let template = tmpl_e.read(cx).value().to_string();
+        let ext = ext_e.read(cx).value().to_string();
+
+        if let Some(br) = self.bulk_rename.as_mut() {
+            br.spec.find = find;
+            br.spec.replace = replace;
+            br.spec.template = template;
+            br.spec.extension_override = ext;
+        }
+        self.recompute_bulk_rename_preview(cx);
+    }
+
+    fn recompute_bulk_rename_preview(&mut self, cx: &mut Context<Self>) {
+        if let Some(br) = self.bulk_rename.as_mut() {
+            match preview_bulk_rename(&br.sources, &br.spec) {
+                Ok(rows) => {
+                    br.preview_rows = rows;
+                    br.regex_error = None;
+                }
+                Err(err) => {
+                    br.regex_error = Some(err);
+                }
+            }
+            cx.notify();
+        }
+    }
+
+    pub fn toggle_bulk_rename_regex(&mut self, cx: &mut Context<Self>) {
+        if let Some(br) = self.bulk_rename.as_mut() {
+            br.spec.use_regex = !br.spec.use_regex;
+        }
+        self.recompute_bulk_rename_preview(cx);
+    }
+
+    pub fn toggle_bulk_rename_case(&mut self, cx: &mut Context<Self>) {
+        if let Some(br) = self.bulk_rename.as_mut() {
+            br.spec.case_sensitive = !br.spec.case_sensitive;
+        }
+        self.recompute_bulk_rename_preview(cx);
+    }
+
+    pub fn set_bulk_rename_casing(&mut self, casing: RenameCasing, cx: &mut Context<Self>) {
+        if let Some(br) = self.bulk_rename.as_mut() {
+            br.spec.casing = casing;
+        }
+        self.recompute_bulk_rename_preview(cx);
+    }
+
+    pub fn apply_bulk_rename(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((side, rows, has_regex_err)) = self
+            .bulk_rename
+            .as_ref()
+            .map(|br| (br.side, br.preview_rows.clone(), br.regex_error.is_some()))
+        else {
+            return;
+        };
+        if has_regex_err {
+            return;
+        }
+        match execute_bulk_rename(&rows) {
+            Ok(undo_action) => {
+                let renamed_count = match &undo_action {
+                    UndoAction::BulkRename { pairs } => pairs.len(),
+                    _ => 0,
+                };
+                self.undo_history.push(undo_action);
+                self.close_bulk_rename(window, cx);
+                self.refresh_pane(side, window, cx);
+                self.show_toast(
+                    format!("Renamed {renamed_count} item(s) (Ctrl+Z to undo)"),
+                    ToastKind::Success,
+                    window,
+                    cx,
+                );
+            }
+            Err(err) => {
+                self.show_toast(err, ToastKind::Error, window, cx);
+            }
+        }
+    }
+
+    pub fn open_command_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.context_menu = None;
+        self.quicklook_open = false;
+        self.active_modal = None;
+        self.modal_subs.clear();
+        self.global_search = None;
+        self.global_search_subs.clear();
+        self.bulk_rename = None;
+        self.bulk_rename_subs.clear();
+
+        let input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("Type a command... (search, rename, hash, lock, zip, theme, split)")
+        });
+        input.update(cx, |s, cx| s.focus(window, cx));
+
+        let sub = cx.subscribe_in(&input, window, |this, state, ev: &InputEvent, window, cx| {
+            match ev {
+                InputEvent::Change => {
+                    let q = state.read(cx).value().to_string();
+                    if let Some(cp) = this.command_palette.as_mut() {
+                        cp.query = q;
+                        cp.selected_idx = 0;
+                        cx.notify();
+                    }
+                }
+                InputEvent::PressEnter { .. } => {
+                    this.execute_selected_palette_command(window, cx);
+                }
+                _ => {}
+            }
+        });
+
+        self.command_palette_subs = vec![sub];
+        self.command_palette = Some(CommandPaletteState {
+            input,
+            query: String::new(),
+            selected_idx: 0,
+        });
+        cx.notify();
+    }
+
+    pub fn close_command_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.command_palette.take().is_some() {
+            self.command_palette_subs.clear();
+            self.focus_handle.focus(window, cx);
+            cx.notify();
+        }
+    }
+
+    pub fn move_command_palette_selection(&mut self, delta: isize, cx: &mut Context<Self>) {
+        let Some(cp) = self.command_palette.as_mut() else {
+            return;
+        };
+        let total = filtered_palette_items(&cp.query).len();
+        if total == 0 {
+            return;
+        }
+        let next = cp
+            .selected_idx
+            .saturating_add_signed(delta)
+            .min(total.saturating_sub(1));
+        if next != cp.selected_idx {
+            cp.selected_idx = next;
+            cx.notify();
+        }
+    }
+
+    fn execute_selected_palette_command(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let cmd_opt = self.command_palette.as_ref().and_then(|cp| {
+            let items = filtered_palette_items(&cp.query);
+            let idx = cp.selected_idx.min(items.len().saturating_sub(1));
+            items.get(idx).map(|i| i.cmd)
+        });
+        self.close_command_palette(window, cx);
+        if let Some(cmd) = cmd_opt {
+            execute_palette_command(self, cmd, window, cx);
+        }
+    }
+
+    pub fn compute_checksums_for_selection(&mut self, cx: &mut Context<Self>) {
+        let file_path = self.active_tab().and_then(|t| {
+            let entry = t.model.active_pane_ref().primary_selected_entry()?;
+            if entry.is_dir() {
+                return None;
+            }
+            entry.location.as_local_path().map(|p| p.to_path_buf())
+        });
+        let Some(path) = file_path else {
+            self.set_toast_simple(
+                "Select a local file to compute SHA-256 & MD5 checksums.",
+                ToastKind::Info,
+                cx,
+            );
+            return;
+        };
+
+        if !self.settings.show_inspector {
+            self.settings.show_inspector = true;
+            let _ = self.settings.save();
+            self.sync_preview_for_selection(cx);
+        }
+
+        self.hash_cancel.store(true, Ordering::Relaxed);
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.hash_cancel = Arc::clone(&cancel);
+        self.hash_generation = self.hash_generation.wrapping_add(1);
+        let generation = self.hash_generation;
+        self.hash_target = Some(path.clone());
+        self.hash_state = HashInspectState::Computing;
+
+        let tx = self.bg_tx.clone();
+        tokio_runtime().spawn(async move {
+            let p_clone = path.clone();
+            let result =
+                tokio::task::spawn_blocking(move || compute_file_hashes(&p_clone, &cancel))
+                    .await
+                    .unwrap_or_else(|e| Err(format!("Checksum worker panicked: {e}")));
+            let _ = tx.unbounded_send(BgEvent::HashesReady {
+                generation,
+                path,
+                result,
+            });
+        });
+        cx.notify();
+    }
+
+    pub fn check_locks_for_selection(&mut self, cx: &mut Context<Self>) {
+        let file_path = self.active_tab().and_then(|t| {
+            let entry = t.model.active_pane_ref().primary_selected_entry()?;
+            if entry.is_dir() {
+                return None;
+            }
+            entry.location.as_local_path().map(|p| p.to_path_buf())
+        });
+        let Some(path) = file_path else {
+            self.set_toast_simple(
+                "Select a local file to inspect Windows file locks.",
+                ToastKind::Info,
+                cx,
+            );
+            return;
+        };
+
+        if !self.settings.show_inspector {
+            self.settings.show_inspector = true;
+            let _ = self.settings.save();
+            self.sync_preview_for_selection(cx);
+        }
+
+        self.lock_generation = self.lock_generation.wrapping_add(1);
+        let generation = self.lock_generation;
+        self.lock_target = Some(path.clone());
+        self.lock_status = FileLockStatus::Checking;
+
+        let tx = self.bg_tx.clone();
+        tokio_runtime().spawn(async move {
+            let p_clone = path.clone();
+            let status = tokio::task::spawn_blocking(move || inspect_file_lock(&p_clone))
+                .await
+                .unwrap_or_else(|e| FileLockStatus::Error(format!("Lock probe failed: {e}")));
+            let _ = tx.unbounded_send(BgEvent::LockChecked {
+                generation,
+                path,
+                status,
+            });
+        });
+        cx.notify();
+    }
+
+    pub fn selected_archive_inner_paths(&self, side: PaneSide, archive_path: &Path) -> Vec<String> {
+        let Some(tab) = self.active_tab() else {
+            return Vec::new();
+        };
+        tab.model
+            .pane(side)
+            .selected_entries()
+            .into_iter()
+            .filter_map(|e| match &e.location {
+                Location::Archive {
+                    archive_path: ap,
+                    inner_path,
+                } if ap == archive_path => Some(inner_path.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    pub fn compress_selected_to_zip(
+        &mut self,
+        side: PaneSide,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let sources = self.selected_local_paths(side);
+        if sources.is_empty() {
+            self.show_toast(
+                "Select local files or folders to compress.",
+                ToastKind::Info,
+                window,
+                cx,
+            );
+            return;
+        }
+        let Some(dest_dir) = sources[0].parent().map(|p| p.to_path_buf()) else {
+            return;
+        };
+        let base_name = if sources.len() == 1 {
+            let stem = sources[0]
+                .file_stem()
+                .or_else(|| sources[0].file_name())
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "Archive".to_string());
+            format!("{stem}.zip")
+        } else {
+            "Archive.zip".to_string()
+        };
+        let output_zip = unique_keep_both_path(&dest_dir.join(base_name));
+        let zip_label = output_zip
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "Archive.zip".to_string());
+
+        self.show_toast(
+            format!("Compressing to \"{zip_label}\"..."),
+            ToastKind::Info,
+            window,
+            cx,
+        );
+
+        let tx = self.bg_tx.clone();
+        tokio_runtime().spawn(async move {
+            let result = tokio::task::spawn_blocking(move || {
+                let count = compress_to_zip(&sources, &output_zip)?;
+                Ok((format!("Created \"{zip_label}\" ({count} file(s))"), dest_dir))
+            })
+            .await
+            .unwrap_or_else(|e| Err(format!("Compression task failed: {e}")));
+            let _ = tx.unbounded_send(BgEvent::ArchiveOpFinished { result });
+        });
+    }
+
+    pub fn extract_selected_archive_here(
+        &mut self,
+        side: PaneSide,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let archive_opt = self.active_tab().and_then(|t| {
+            let pane = t.model.pane(side);
+            if let Some(entry) = pane.primary_selected_entry()
+                && !entry.is_dir()
+                && let Some(local) = entry.location.as_local_path()
+                && is_supported_archive(local)
+            {
+                return Some(local.to_path_buf());
+            }
+            if let Location::Archive { archive_path, .. } = &pane.location {
+                return Some(archive_path.clone());
+            }
+            None
+        });
+        if let Some(archive_path) = archive_opt {
+            self.extract_archive_here(archive_path, window, cx);
+        } else {
+            self.show_toast(
+                "Select a .zip, .7z, .tar, or .tar.gz archive to extract.",
+                ToastKind::Info,
+                window,
+                cx,
+            );
+        }
+    }
+
+    pub fn extract_archive_here(
+        &mut self,
+        archive_path: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(parent) = archive_path.parent() else {
+            return;
+        };
+        let dest_dir = parent.join(archive_stem_name(&archive_path));
+        self.extract_archive_entries_into(archive_path, Vec::new(), dest_dir, window, cx);
+    }
+
+    pub fn extract_archive_item_to_target(
+        &mut self,
+        archive_path: PathBuf,
+        inner_paths: Vec<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // When Dual-Pane is open and the opposite pane points to a local folder, extract straight into it;
+        // otherwise extract into a clean sibling folder next to the archive.
+        let dest_dir = self
+            .active_tab()
+            .filter(|t| t.model.split_enabled)
+            .and_then(|t| {
+                let opp = t.model.active_pane.opposite();
+                t.model
+                    .pane(opp)
+                    .location
+                    .as_local_path()
+                    .map(|p| p.to_path_buf())
+            })
+            .unwrap_or_else(|| {
+                archive_path
+                    .parent()
+                    .unwrap_or_else(|| Path::new("."))
+                    .join(archive_stem_name(&archive_path))
+            });
+
+        self.extract_archive_entries_into(archive_path, inner_paths, dest_dir, window, cx);
+    }
+
+    pub fn extract_archive_entries_into(
+        &mut self,
+        archive_path: PathBuf,
+        inner_paths: Vec<String>,
+        dest_dir: PathBuf,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let dest_label = dest_dir
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| dest_dir.display().to_string());
+        self.show_toast(
+            format!("Extracting to \"{dest_label}\"..."),
+            ToastKind::Info,
+            window,
+            cx,
+        );
+
+        let tx = self.bg_tx.clone();
+        tokio_runtime().spawn(async move {
+            let result = tokio::task::spawn_blocking(move || {
+                let count = if inner_paths.is_empty() {
+                    extract_archive_all(&archive_path, &dest_dir)?
+                } else {
+                    extract_archive_entries(&archive_path, &inner_paths, &dest_dir)?
+                };
+                Ok((
+                    format!("Extracted {count} file(s) into \"{dest_label}\""),
+                    dest_dir,
+                ))
+            })
+            .await
+            .unwrap_or_else(|e| Err(format!("Extraction task failed: {e}")));
+            let _ = tx.unbounded_send(BgEvent::ArchiveOpFinished { result });
+        });
+    }
+
     pub fn open_new_folder_prompt(
         &mut self,
         side: PaneSide,
@@ -2365,7 +3027,7 @@ impl Workspace {
         let _ = self.settings.save();
         apply_theme(self.palette(), cx);
         if self.settings.show_inspector || self.quicklook_open {
-            self.preview_path = None;
+            self.preview_location = None;
             self.sync_preview_for_selection(cx);
         }
         cx.notify();
@@ -2567,6 +3229,8 @@ impl Workspace {
     fn is_modal_blocking(&self) -> bool {
         self.active_modal.is_some()
             || self.global_search.is_some()
+            || self.bulk_rename.is_some()
+            || self.command_palette.is_some()
             || !self.conflict_queue.is_empty()
     }
 
@@ -2688,6 +3352,21 @@ impl Workspace {
     }
 }
 
+fn archive_stem_name(path: &Path) -> String {
+    let raw = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "Extracted".to_string());
+    let lower = raw.to_ascii_lowercase();
+    if lower.ends_with(".tar.gz") && raw.len() > 7 {
+        return raw[..raw.len() - 7].to_string();
+    }
+    path.file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "Extracted".to_string())
+}
+
 fn same_volume(a: &Path, b: &Path) -> bool {
     use std::path::Component;
     match (a.components().next(), b.components().next()) {
@@ -2735,8 +3414,8 @@ impl Render for Workspace {
                 .child(resizable_panel().child(main_panes))
                 .child(
                     resizable_panel()
-                        .size(px(304.))
-                        .size_range(px(240.)..px(480.))
+                        .size(px(328.))
+                        .size_range(px(260.)..px(500.))
                         .fixed()
                         .child(render_inspector(self, cx)),
                 )
@@ -2750,8 +3429,8 @@ impl Render for Workspace {
                 .with_handle_appearance(crisp_resize_handle_appearance(p))
                 .child(
                     resizable_panel()
-                        .size(px(238.))
-                        .size_range(px(185.)..px(360.))
+                        .size(px(256.))
+                        .size_range(px(200.)..px(380.))
                         .fixed()
                         .child(render_sidebar(self, cx)),
                 )
@@ -2908,6 +3587,30 @@ impl Render for Workspace {
                     this.open_global_search(window, cx);
                 }
             }))
+            .on_action(cx.listener(|this, _: &OpenCommandPalette, window, cx| {
+                if this.active_modal.is_some() || !this.conflict_queue.is_empty() {
+                    return;
+                }
+                if this.command_palette.is_some() {
+                    this.close_command_palette(window, cx);
+                } else {
+                    this.open_command_palette(window, cx);
+                }
+            }))
+            .on_action(cx.listener(|this, _: &OpenBulkRename, window, cx| {
+                if this.active_modal.is_some() || !this.conflict_queue.is_empty() {
+                    return;
+                }
+                if this.bulk_rename.is_some() {
+                    this.close_bulk_rename(window, cx);
+                } else {
+                    let side = this
+                        .active_tab()
+                        .map(|t| t.model.active_pane)
+                        .unwrap_or(PaneSide::Left);
+                    this.open_bulk_rename_for_pane(side, window, cx);
+                }
+            }))
             .on_action(cx.listener(|this, _: &ToggleSidebar, _, cx| {
                 if this.is_modal_blocking() {
                     return;
@@ -3044,6 +3747,10 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &CancelOrDismiss, window, cx| {
                 if this.context_menu.is_some() {
                     this.dismiss_context_menu(cx);
+                } else if this.command_palette.is_some() {
+                    this.close_command_palette(window, cx);
+                } else if this.bulk_rename.is_some() {
+                    this.close_bulk_rename(window, cx);
                 } else if this.global_search.is_some() {
                     this.close_global_search(window, cx);
                 } else if this.quicklook_open {
@@ -3120,6 +3827,14 @@ impl Render for Workspace {
             // Global Search overlay (Ctrl+K)
             .when_some(self.global_search.as_ref(), |el, gs| {
                 el.child(render_global_search_modal(self, gs, cx))
+            })
+            // Bulk Rename overlay (Ctrl+Shift+R)
+            .when_some(self.bulk_rename.as_ref(), |el, br| {
+                el.child(render_bulk_rename_modal(self, br, cx))
+            })
+            // Command Palette overlay (Ctrl+Shift+P)
+            .when_some(self.command_palette.as_ref(), |el, cp| {
+                el.child(render_command_palette_modal(self, cp, cx))
             })
             // Active modal overlay (Settings / Prompts / Confirmations)
             .when_some(self.active_modal.clone(), |el, modal| {

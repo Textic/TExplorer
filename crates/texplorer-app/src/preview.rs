@@ -238,6 +238,93 @@ pub fn load_preview_blocking(
     }
 }
 
+/// Loads an inline preview directly from an entry inside a `.zip`/`.7z`/`.tar`/`.tar.gz` archive
+/// without extracting anything to disk.
+pub fn load_archive_entry_preview_blocking(
+    archive_path: PathBuf,
+    inner_path: String,
+    kind: FileKind,
+    palette: Palette,
+) -> PreviewPayload {
+    if kind == FileKind::Folder {
+        return match texplorer_vfs::archive::list_archive_dir(&archive_path, &inner_path) {
+            Ok(entries) => {
+                let folders = entries.iter().filter(|e| e.is_dir()).count();
+                let files = entries.len().saturating_sub(folders);
+                let immediate_bytes = entries.iter().filter_map(|e| e.size).sum();
+                PreviewPayload::FolderSummary {
+                    total_items: entries.len(),
+                    files,
+                    folders,
+                    immediate_bytes,
+                }
+            }
+            Err(err) => PreviewPayload::Unsupported { reason: err },
+        };
+    }
+
+    let ext = inner_path
+        .rsplit_once('.')
+        .map(|(_, e)| e.to_ascii_lowercase())
+        .unwrap_or_default();
+
+    // Images inside archive (up to 16 MiB)
+    if matches!(
+        ext.as_str(),
+        "png" | "jpg" | "jpeg" | "webp" | "gif" | "bmp" | "ico"
+    ) && let Ok((bytes, false)) =
+        texplorer_vfs::archive::read_archive_entry_bytes(&archive_path, &inner_path, 16 * 1024 * 1024)
+        && let Ok(dyn_img) = image::load_from_memory(&bytes)
+    {
+        let orig_w = dyn_img.width();
+        let orig_h = dyn_img.height();
+        let resized = if orig_w > 1280 || orig_h > 1280 {
+            dyn_img.resize(1280, 1280, FilterType::Triangle)
+        } else {
+            dyn_img
+        };
+        let mut rgba = resized.to_rgba8();
+        for px in rgba.pixels_mut() {
+            px.0.swap(0, 2);
+        }
+        let frame = Frame::new(rgba);
+        return PreviewPayload::Image {
+            image: Arc::new(RenderImage::new(smallvec![frame])),
+            orig_width: orig_w,
+            orig_height: orig_h,
+        };
+    }
+
+    // Markdown or source code inside archive (up to 192 KiB)
+    if let Ok((bytes, truncated)) =
+        texplorer_vfs::archive::read_archive_entry_bytes(&archive_path, &inner_path, 192 * 1024)
+        && !bytes.contains(&0)
+        && let Ok(text) = String::from_utf8(bytes)
+    {
+        if matches!(ext.as_str(), "md" | "markdown") {
+            return PreviewPayload::Markdown {
+                source: text,
+                truncated,
+            };
+        }
+        let language = if is_text_or_code_extension(&ext) {
+            language_label(&ext)
+        } else {
+            "Plain Text"
+        };
+        let lines = highlight_code_lines(&text, &ext, 450, palette);
+        return PreviewPayload::Code {
+            language,
+            lines,
+            truncated,
+        };
+    }
+
+    PreviewPayload::Unsupported {
+        reason: "Binary archive entry — extract to open natively.".to_string(),
+    }
+}
+
 fn load_folder_summary(path: &Path) -> PreviewPayload {
     let Ok(rd) = std::fs::read_dir(path) else {
         return PreviewPayload::Unsupported {

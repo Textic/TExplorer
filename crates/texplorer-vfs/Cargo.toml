@@ -4,12 +4,18 @@ version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
-description = "Virtual File System layer for T Explorer (local directories, Home, hybrid search, background folder sizes, and fast Win32 enumeration)"
+description = "Virtual File System layer for T Explorer (local directories, Home, archives, checksums, hybrid search, background folder sizes)"
 
 [dependencies]
+flate2.workspace = true
+md-5.workspace = true
 rayon.workspace = true
+sevenz-rust.workspace = true
+sha2.workspace = true
+tar.workspace = true
 texplorer-core = { path = "../texplorer-core" }
 texplorer-mft = { path = "../texplorer-mft" }
+zip.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true, features = [

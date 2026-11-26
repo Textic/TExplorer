@@ -158,10 +158,10 @@ pub fn render_quicklook_modal(
                     .items_start()
                     .child(
                         div()
-                            .w(px(34.))
+                            .w(px(42.))
                             .flex_shrink_0()
                             .text_right()
-                            .text_size(px(11.))
+                            .text_size(px(12.5))
                             .text_color(solid(p.text_muted))
                             .child(ln),
                     )
@@ -169,7 +169,7 @@ pub fn render_quicklook_modal(
                         div()
                             .flex_1()
                             .min_w_0()
-                            .text_size(px(12.))
+                            .text_size(px(14.))
                             .text_color(solid(p.text_primary))
                             .child(styled),
                     )
@@ -330,7 +330,7 @@ pub fn render_quicklook_modal(
                                         .bg(solid(p.bg_base))
                                         .border_1()
                                         .border_color(solid(p.border_subtle))
-                                        .text_size(px(11.))
+                                        .text_size(px(13.))
                                         .text_color(solid(p.text_secondary))
                                         .child(badge_text),
                                 ),
@@ -372,7 +372,7 @@ pub fn render_quicklook_modal(
                 .child(
                     h_flex()
                         .w_full()
-                        .h(px(28.))
+                        .h(px(32.))
                         .px_3p5()
                         .flex_shrink_0()
                         .items_center()
@@ -382,7 +382,7 @@ pub fn render_quicklook_modal(
                         .border_color(solid(p.border_subtle))
                         .child(
                             div()
-                                .text_size(px(11.))
+                                .text_size(px(13.))
                                 .text_color(solid(p.text_muted))
                                 .child("↑ / ↓ Navigate files   •   Enter Open   •   Space / Esc Close"),
                         ),

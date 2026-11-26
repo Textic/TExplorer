@@ -21,9 +21,9 @@ use texplorer_platform::{
 use crate::ui::workspace::{
     CancelOrDismiss, CloseTab, CopySelected, CreateNewFolder, CutSelected, DeletePermanent,
     DeleteToTrash, FocusAddressBar, FocusFilter, GoBack, GoForward, GoUp, NewTab, NextTab,
-    OpenGlobalSearch, OpenSettings, PasteItems, PrevTab, Quit, RedoActionCmd, RefreshPane,
-    RenameSelected, SelectAllItems, SwitchActivePane, ToggleHiddenFiles, ToggleInspector,
-    ToggleSidebar, ToggleSplitPane, UndoActionCmd, Workspace,
+    OpenBulkRename, OpenCommandPalette, OpenGlobalSearch, OpenSettings, PasteItems, PrevTab, Quit,
+    RedoActionCmd, RefreshPane, RenameSelected, SelectAllItems, SwitchActivePane,
+    ToggleHiddenFiles, ToggleInspector, ToggleSidebar, ToggleSplitPane, UndoActionCmd, Workspace,
 };
 
 icon_assets!(
@@ -172,6 +172,8 @@ fn main() {
                 KeyBinding::new("ctrl-r", RefreshPane, Some("TExplorerWorkspace")),
                 KeyBinding::new("ctrl-f", FocusFilter, Some("TExplorerWorkspace")),
                 KeyBinding::new("ctrl-k", OpenGlobalSearch, Some("TExplorerWorkspace")),
+                KeyBinding::new("ctrl-shift-p", OpenCommandPalette, Some("TExplorerWorkspace")),
+                KeyBinding::new("ctrl-shift-r", OpenBulkRename, Some("TExplorerWorkspace")),
                 KeyBinding::new("ctrl-b", ToggleSidebar, Some("TExplorerWorkspace")),
                 KeyBinding::new("alt-p", ToggleInspector, Some("TExplorerWorkspace")),
                 KeyBinding::new("ctrl-h", ToggleHiddenFiles, Some("TExplorerWorkspace")),

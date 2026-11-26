@@ -25,6 +25,15 @@ pub struct DraggedEntries {
     pub label: SharedString,
 }
 
+/// Drag payload for extracting entries directly out of a browsed archive (`Location::Archive`)
+/// into a local folder or opposite Dual-Pane via Drag & Drop.
+#[derive(Clone)]
+pub struct DraggedArchiveEntries {
+    pub archive_path: PathBuf,
+    pub inner_paths: Vec<String>,
+    pub label: SharedString,
+}
+
 struct DragBadgeView {
     label: SharedString,
     palette: Palette,
@@ -109,7 +118,7 @@ pub fn render_home_view(
                                             },
                                             i,
                                         ))
-                                        .w(px(210.))
+                                        .w(px(236.))
                                         .p_2p5()
                                         .gap_2p5()
                                         .items_center()
@@ -191,7 +200,7 @@ pub fn render_home_view(
                                                 .child(
                                                     div()
                                                         .truncate()
-                                                        .text_size(px(11.))
+                                                        .text_size(px(13.))
                                                         .text_color(solid(p.text_muted))
                                                         .child(sub),
                                                 ),
@@ -233,7 +242,7 @@ pub fn render_home_view(
                                     },
                                     i,
                                 ))
-                                .w(px(268.))
+                                .w(px(292.))
                                 .p_3()
                                 .gap_2()
                                 .rounded(px(RADIUS_ROW))
@@ -302,7 +311,7 @@ pub fn render_home_view(
                                                     .bg(solid(p.bg_base))
                                                     .border_1()
                                                     .border_color(solid(p.border_subtle))
-                                                    .text_size(px(10.))
+                                                    .text_size(px(12.))
                                                     .text_color(solid(p.text_secondary))
                                                     .child(fs_label),
                                             )
@@ -323,13 +332,13 @@ pub fn render_home_view(
                                         .justify_between()
                                         .child(
                                             div()
-                                                .text_size(px(11.))
+                                                .text_size(px(13.))
                                                 .text_color(solid(p.text_muted))
                                                 .child(space_label),
                                         )
                                         .child(
                                             div()
-                                                .text_size(px(11.))
+                                                .text_size(px(13.))
                                                 .font_medium()
                                                 .text_color(solid(p.text_secondary))
                                                 .child(pct_label),
@@ -363,7 +372,8 @@ pub fn render_details_view(
     };
 
     let pane_dir_int = pane_dir.clone();
-    let pane_dir_ext = pane_dir;
+    let pane_dir_ext = pane_dir.clone();
+    let pane_dir_arch = pane_dir;
 
     v_flex()
         .size_full()
@@ -372,12 +382,26 @@ pub fn render_details_view(
         .drag_over::<DraggedEntries>(move |style, _, _, _| {
             style.border_1().border_color(solid(p.accent_primary))
         })
+        .drag_over::<DraggedArchiveEntries>(move |style, _, _, _| {
+            style.border_1().border_color(solid(p.accent_primary))
+        })
         .drag_over::<ExternalPaths>(move |style, _, _, _| {
             style.border_1().border_color(solid(p.accent_primary))
         })
         .on_drop(cx.listener(move |this, drag: &DraggedEntries, window, cx| {
             if let Some(ref dest) = pane_dir_int {
                 this.handle_dropped_paths(drag.paths.clone(), dest.clone(), false, window, cx);
+            }
+        }))
+        .on_drop(cx.listener(move |this, drag: &DraggedArchiveEntries, window, cx| {
+            if let Some(ref dest) = pane_dir_arch {
+                this.extract_archive_entries_into(
+                    drag.archive_path.clone(),
+                    drag.inner_paths.clone(),
+                    dest.clone(),
+                    window,
+                    cx,
+                );
             }
         }))
         .on_drop(cx.listener(move |this, ext: &ExternalPaths, window, cx| {
@@ -396,7 +420,7 @@ pub fn render_details_view(
         .child(
             h_flex()
                 .w_full()
-                .h(px(30.))
+                .h(px(34.))
                 .px_2p5()
                 .flex_shrink_0()
                 .items_center()
@@ -418,7 +442,7 @@ pub fn render_details_view(
                     "Date Modified",
                     SortColumn::Modified,
                     sort,
-                    Some(142.),
+                    Some(164.),
                     false,
                     p,
                     cx,
@@ -428,7 +452,7 @@ pub fn render_details_view(
                     "Type",
                     SortColumn::Type,
                     sort,
-                    Some(126.),
+                    Some(144.),
                     false,
                     p,
                     cx,
@@ -438,7 +462,7 @@ pub fn render_details_view(
                     "Size",
                     SortColumn::Size,
                     sort,
-                    Some(92.),
+                    Some(106.),
                     true,
                     p,
                     cx,
@@ -509,8 +533,10 @@ fn render_details_rows(
             };
 
             let drag_payload = build_drag_payload(ws, side, local_path.as_ref(), &entry.name);
+            let archive_drag_payload = build_archive_drag_payload(ws, side, entry);
             let drop_dir_int = if is_dir { local_path.clone() } else { None };
             let drop_dir_ext = drop_dir_int.clone();
+            let drop_dir_arch = drop_dir_int.clone();
 
             let row = h_flex()
                 .id((
@@ -521,7 +547,7 @@ fn render_details_rows(
                     vis_idx,
                 ))
                 .w_full()
-                .h(px(28.))
+                .h(px(32.))
                 .px_2p5()
                 .items_center()
                 .cursor_pointer()
@@ -547,6 +573,14 @@ fn render_details_rows(
                         })
                     })
                 })
+                .when_some(archive_drag_payload, |el, payload| {
+                    el.on_drag(payload, move |drag, _, _, cx| {
+                        cx.new(|_| DragBadgeView {
+                            label: drag.label.clone(),
+                            palette: p,
+                        })
+                    })
+                })
                 .when_some(drop_dir_int, |el, dest| {
                     el.drag_over::<DraggedEntries>(move |style, _, _, _| {
                         style.bg(soft_tint(p.accent_primary, 0.22))
@@ -558,6 +592,23 @@ fn render_details_rows(
                                 drag.paths.clone(),
                                 dest.clone(),
                                 false,
+                                window,
+                                cx,
+                            );
+                        },
+                    ))
+                })
+                .when_some(drop_dir_arch, |el, dest| {
+                    el.drag_over::<DraggedArchiveEntries>(move |style, _, _, _| {
+                        style.bg(soft_tint(p.accent_primary, 0.22))
+                    })
+                    .on_drop(cx.listener(
+                        move |this, drag: &DraggedArchiveEntries, window, cx| {
+                            cx.stop_propagation();
+                            this.extract_archive_entries_into(
+                                drag.archive_path.clone(),
+                                drag.inner_paths.clone(),
+                                dest.clone(),
                                 window,
                                 cx,
                             );
@@ -633,7 +684,7 @@ fn render_details_rows(
                 )
                 .child(
                     div()
-                        .w(px(142.))
+                        .w(px(164.))
                         .flex_shrink_0()
                         .truncate()
                         .text_xs()
@@ -642,7 +693,7 @@ fn render_details_rows(
                 )
                 .child(
                     div()
-                        .w(px(126.))
+                        .w(px(144.))
                         .flex_shrink_0()
                         .truncate()
                         .text_xs()
@@ -651,7 +702,7 @@ fn render_details_rows(
                 )
                 .child(
                     div()
-                        .w(px(92.))
+                        .w(px(106.))
                         .flex_shrink_0()
                         .text_right()
                         .truncate()
@@ -688,7 +739,8 @@ pub fn render_grid_view(
         PaneSide::Right => "grid-list-right",
     };
     let pane_dir_int = pane_dir.clone();
-    let pane_dir_ext = pane_dir;
+    let pane_dir_ext = pane_dir.clone();
+    let pane_dir_arch = pane_dir;
 
     v_flex()
         .size_full()
@@ -697,12 +749,26 @@ pub fn render_grid_view(
         .drag_over::<DraggedEntries>(move |style, _, _, _| {
             style.border_1().border_color(solid(p.accent_primary))
         })
+        .drag_over::<DraggedArchiveEntries>(move |style, _, _, _| {
+            style.border_1().border_color(solid(p.accent_primary))
+        })
         .drag_over::<ExternalPaths>(move |style, _, _, _| {
             style.border_1().border_color(solid(p.accent_primary))
         })
         .on_drop(cx.listener(move |this, drag: &DraggedEntries, window, cx| {
             if let Some(ref dest) = pane_dir_int {
                 this.handle_dropped_paths(drag.paths.clone(), dest.clone(), false, window, cx);
+            }
+        }))
+        .on_drop(cx.listener(move |this, drag: &DraggedArchiveEntries, window, cx| {
+            if let Some(ref dest) = pane_dir_arch {
+                this.extract_archive_entries_into(
+                    drag.archive_path.clone(),
+                    drag.inner_paths.clone(),
+                    dest.clone(),
+                    window,
+                    cx,
+                );
             }
         }))
         .on_drop(cx.listener(move |this, ext: &ExternalPaths, window, cx| {
@@ -798,7 +864,7 @@ fn render_grid_rows(
 
             h_flex()
                 .w_full()
-                .h(px(122.))
+                .h(px(136.))
                 .px_3()
                 .py_1p5()
                 .gap_2()
@@ -822,8 +888,10 @@ fn render_grid_rows(
 
                     let drag_payload =
                         build_drag_payload(ws, side, local_path.as_ref(), &entry.name);
+                    let archive_drag_payload = build_archive_drag_payload(ws, side, entry);
                     let drop_dir_int = if is_dir { local_path.clone() } else { None };
                     let drop_dir_ext = drop_dir_int.clone();
+                    let drop_dir_arch = drop_dir_int.clone();
 
                     let visual = if let Some(render_img) = thumb {
                         div()
@@ -907,6 +975,14 @@ fn render_grid_rows(
                                     })
                                 })
                             })
+                            .when_some(archive_drag_payload, |el, payload| {
+                                el.on_drag(payload, move |drag, _, _, cx| {
+                                    cx.new(|_| DragBadgeView {
+                                        label: drag.label.clone(),
+                                        palette: p,
+                                    })
+                                })
+                            })
                             .when_some(drop_dir_int, |el, dest| {
                                 el.drag_over::<DraggedEntries>(move |style, _, _, _| {
                                     style.border_color(solid(p.accent_primary))
@@ -918,6 +994,23 @@ fn render_grid_rows(
                                             drag.paths.clone(),
                                             dest.clone(),
                                             false,
+                                            window,
+                                            cx,
+                                        );
+                                    },
+                                ))
+                            })
+                            .when_some(drop_dir_arch, |el, dest| {
+                                el.drag_over::<DraggedArchiveEntries>(move |style, _, _, _| {
+                                    style.border_color(solid(p.accent_primary))
+                                })
+                                .on_drop(cx.listener(
+                                    move |this, drag: &DraggedArchiveEntries, window, cx| {
+                                        cx.stop_propagation();
+                                        this.extract_archive_entries_into(
+                                            drag.archive_path.clone(),
+                                            drag.inner_paths.clone(),
+                                            dest.clone(),
                                             window,
                                             cx,
                                         );
@@ -971,7 +1064,7 @@ fn render_grid_rows(
                             )
                             .child(
                                 div()
-                                    .text_size(px(10.))
+                                    .text_size(px(12.))
                                     .text_color(solid(p.text_muted))
                                     .child(sub),
                             ),
@@ -1004,7 +1097,8 @@ pub fn render_compact_view(
         PaneSide::Right => "compact-list-right",
     };
     let pane_dir_int = pane_dir.clone();
-    let pane_dir_ext = pane_dir;
+    let pane_dir_ext = pane_dir.clone();
+    let pane_dir_arch = pane_dir;
 
     v_flex()
         .size_full()
@@ -1013,12 +1107,26 @@ pub fn render_compact_view(
         .drag_over::<DraggedEntries>(move |style, _, _, _| {
             style.border_1().border_color(solid(p.accent_primary))
         })
+        .drag_over::<DraggedArchiveEntries>(move |style, _, _, _| {
+            style.border_1().border_color(solid(p.accent_primary))
+        })
         .drag_over::<ExternalPaths>(move |style, _, _, _| {
             style.border_1().border_color(solid(p.accent_primary))
         })
         .on_drop(cx.listener(move |this, drag: &DraggedEntries, window, cx| {
             if let Some(ref dest) = pane_dir_int {
                 this.handle_dropped_paths(drag.paths.clone(), dest.clone(), false, window, cx);
+            }
+        }))
+        .on_drop(cx.listener(move |this, drag: &DraggedArchiveEntries, window, cx| {
+            if let Some(ref dest) = pane_dir_arch {
+                this.extract_archive_entries_into(
+                    drag.archive_path.clone(),
+                    drag.inner_paths.clone(),
+                    dest.clone(),
+                    window,
+                    cx,
+                );
             }
         }))
         .on_drop(cx.listener(move |this, ext: &ExternalPaths, window, cx| {
@@ -1086,6 +1194,7 @@ fn render_compact_rows(
                 .unwrap_or_default()
                 .into();
             let drag_payload = build_drag_payload(ws, side, local_path.as_ref(), &entry.name);
+            let archive_drag_payload = build_archive_drag_payload(ws, side, entry);
 
             Some(
                 h_flex()
@@ -1097,7 +1206,7 @@ fn render_compact_rows(
                         vis_idx,
                     ))
                     .w_full()
-                    .h(px(24.))
+                    .h(px(28.))
                     .px_2p5()
                     .gap_2()
                     .items_center()
@@ -1115,6 +1224,14 @@ fn render_compact_rows(
                         }
                     })
                     .when_some(drag_payload, |el, payload| {
+                        el.on_drag(payload, move |drag, _, _, cx| {
+                            cx.new(|_| DragBadgeView {
+                                label: drag.label.clone(),
+                                palette: p,
+                            })
+                        })
+                    })
+                    .when_some(archive_drag_payload, |el, payload| {
                         el.on_drag(payload, move |drag, _, _, cx| {
                             cx.new(|_| DragBadgeView {
                                 label: drag.label.clone(),
@@ -1155,7 +1272,7 @@ fn render_compact_rows(
                     )
                     .child(
                         div()
-                            .text_size(px(11.))
+                            .text_size(px(13.))
                             .text_color(solid(p.text_muted))
                             .child(size),
                     )
@@ -1184,6 +1301,36 @@ fn build_drag_payload(
         format!("{} items", paths.len()).into()
     };
     Some(DraggedEntries { paths, label })
+}
+
+fn build_archive_drag_payload(
+    ws: &Workspace,
+    side: PaneSide,
+    entry: &texplorer_core::FileEntry,
+) -> Option<DraggedArchiveEntries> {
+    let Location::Archive {
+        archive_path,
+        inner_path,
+    } = &entry.location
+    else {
+        return None;
+    };
+    let selected = ws.selected_archive_inner_paths(side, archive_path);
+    let inner_paths = if selected.iter().any(|p| p == inner_path) {
+        selected
+    } else {
+        vec![inner_path.clone()]
+    };
+    let label: SharedString = if inner_paths.len() == 1 {
+        format!("Extract {}", entry.name).into()
+    } else {
+        format!("Extract {} items", inner_paths.len()).into()
+    };
+    Some(DraggedArchiveEntries {
+        archive_path: archive_path.clone(),
+        inner_paths,
+        label,
+    })
 }
 
 #[allow(clippy::too_many_arguments)]

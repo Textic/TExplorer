@@ -1,6 +1,8 @@
 //! Virtual File System providers for T Explorer.
 
+pub mod archive;
 pub mod folder_size;
+pub mod hash;
 pub mod local;
 pub mod search;
 
@@ -17,10 +19,10 @@ pub fn list_location(location: &Location) -> Result<Vec<FileEntry>, String> {
     match location {
         Location::Home => Ok(Vec::new()),
         Location::Local(path) => local::list_local_dir(path),
-        Location::Archive { archive_path, .. } => Err(format!(
-            "Archive virtual browsing for \"{}\" will be enabled in Phase 4.",
-            archive_path.display()
-        )),
+        Location::Archive {
+            archive_path,
+            inner_path,
+        } => archive::list_archive_dir(archive_path, inner_path),
         Location::Search { query, scope } => {
             let cancel = AtomicBool::new(false);
             search::execute_search(query, scope, true, 1_000, &cancel).map(|res| res.entries)
