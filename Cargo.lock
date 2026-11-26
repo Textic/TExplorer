@@ -6477,7 +6477,7 @@ dependencies = [
 
 [[package]]
 name = "texplorer-app"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "chrono",
  "dirs 6.0.0",
@@ -6491,6 +6491,7 @@ dependencies = [
  "smallvec",
  "tauri-winres",
  "texplorer-core",
+ "texplorer-mft",
  "texplorer-ops",
  "texplorer-platform",
  "texplorer-vfs",
@@ -6500,7 +6501,7 @@ dependencies = [
 
 [[package]]
 name = "texplorer-core"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "bitflags 2.13.2",
  "dirs 6.0.0",
@@ -6510,8 +6511,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "texplorer-mft"
+version = "0.3.0"
+dependencies = [
+ "regex",
+ "serde",
+ "serde_json",
+ "windows-sys 0.59.0",
+]
+
+[[package]]
 name = "texplorer-ops"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "futures-channel",
  "texplorer-platform",
@@ -6520,7 +6531,7 @@ dependencies = [
 
 [[package]]
 name = "texplorer-platform"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "dirs 6.0.0",
  "serde",
@@ -6532,10 +6543,22 @@ dependencies = [
 ]
 
 [[package]]
-name = "texplorer-vfs"
-version = "0.2.0"
+name = "texplorer-service"
+version = "0.3.0"
 dependencies = [
+ "rayon",
+ "serde_json",
+ "texplorer-mft",
+ "windows-sys 0.59.0",
+]
+
+[[package]]
+name = "texplorer-vfs"
+version = "0.3.0"
+dependencies = [
+ "rayon",
  "texplorer-core",
+ "texplorer-mft",
  "windows-sys 0.59.0",
 ]
 

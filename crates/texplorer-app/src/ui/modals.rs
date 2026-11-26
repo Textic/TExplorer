@@ -13,14 +13,11 @@ use gpui_kit::{
     },
     div, prelude::*, px,
 };
-use texplorer_core::{AccentPreset, PaneSide, SizeUnit, ViewMode};
+use texplorer_core::{AccentPreset, PaneSide, SizeUnit, ThemePreset, ViewMode};
+use texplorer_mft::IndexServiceInstallState;
 use texplorer_platform::DefaultExplorerStatus;
 
-use crate::theme::{
-    BG_BASE, BG_ELEVATED, BG_HOVER, BG_SURFACE, BORDER, BORDER_SUBTLE, RADIUS_CONTROL, RADIUS_ROW,
-    STATUS_ERROR, STATUS_INFO, STATUS_SUCCESS, STATUS_WARNING, TEXT_MUTED, TEXT_PRIMARY,
-    TEXT_SECONDARY, full_hit_input, soft_tint, solid,
-};
+use crate::theme::{Palette, RADIUS_CONTROL, RADIUS_ROW, full_hit_input, soft_tint, solid};
 use crate::ui::workspace::Workspace;
 use crate::updater::{CURRENT_VERSION, UpdateState, format_download_bytes};
 
@@ -52,16 +49,17 @@ pub fn render_active_modal(
     modal: &ActiveModal,
     cx: &mut Context<Workspace>,
 ) -> impl IntoElement {
+    let p = ws.palette();
     let card = match modal {
-        ActiveModal::Settings => render_settings_card(ws, cx).into_any_element(),
+        ActiveModal::Settings => render_settings_card(ws, p, cx).into_any_element(),
         ActiveModal::TextPrompt {
             title,
             confirm_label,
             input,
             ..
-        } => render_text_prompt_card(title, confirm_label, input, cx).into_any_element(),
+        } => render_text_prompt_card(title, confirm_label, input, p, cx).into_any_element(),
         ActiveModal::ConfirmPermanentDelete { paths, .. } => {
-            render_delete_confirm_card(paths, cx).into_any_element()
+            render_delete_confirm_card(paths, p, cx).into_any_element()
         }
     };
 
@@ -78,7 +76,7 @@ pub fn render_active_modal(
                 .id("modal-backdrop")
                 .absolute()
                 .inset_0()
-                .bg(gpui_kit::hsla(0.0, 0.0, 0.0, 0.65))
+                .bg(gpui_kit::hsla(0.0, 0.0, 0.0, p.backdrop_alpha()))
                 .occlude()
                 .on_scroll(|_, _, cx| {
                     cx.stop_propagation();
@@ -109,14 +107,15 @@ fn render_text_prompt_card(
     title: &'static str,
     confirm_label: &'static str,
     input: &Entity<InputState>,
+    p: Palette,
     cx: &mut Context<Workspace>,
 ) -> impl IntoElement {
     v_flex()
         .id("prompt-modal-card")
         .w(px(420.))
-        .bg(solid(BG_SURFACE))
+        .bg(solid(p.bg_surface))
         .border_1()
-        .border_color(solid(BORDER))
+        .border_color(solid(p.border))
         .rounded(px(RADIUS_ROW))
         .overflow_hidden()
         .occlude()
@@ -127,14 +126,14 @@ fn render_text_prompt_card(
                 .px_3p5()
                 .items_center()
                 .justify_between()
-                .bg(solid(BG_ELEVATED))
+                .bg(solid(p.bg_elevated))
                 .border_b_1()
-                .border_color(solid(BORDER_SUBTLE))
+                .border_color(solid(p.border_subtle))
                 .child(
                     div()
                         .text_sm()
                         .font_semibold()
-                        .text_color(solid(TEXT_PRIMARY))
+                        .text_color(solid(p.text_primary))
                         .child(title),
                 )
                 .child(
@@ -157,9 +156,9 @@ fn render_text_prompt_card(
                         .h(px(34.))
                         .px_2p5()
                         .rounded(px(RADIUS_ROW))
-                        .bg(solid(BG_BASE))
+                        .bg(solid(p.bg_base))
                         .border_1()
-                        .border_color(solid(BORDER))
+                        .border_color(solid(p.border))
                         .child(full_hit_input(
                             "prompt-text-input",
                             input,
@@ -191,7 +190,11 @@ fn render_text_prompt_card(
         )
 }
 
-fn render_delete_confirm_card(paths: &[PathBuf], cx: &mut Context<Workspace>) -> impl IntoElement {
+fn render_delete_confirm_card(
+    paths: &[PathBuf],
+    p: Palette,
+    cx: &mut Context<Workspace>,
+) -> impl IntoElement {
     let summary: SharedString = if paths.len() == 1 {
         format!(
             "Permanently delete \"{}\"? This cannot be undone.",
@@ -212,9 +215,9 @@ fn render_delete_confirm_card(paths: &[PathBuf], cx: &mut Context<Workspace>) ->
     v_flex()
         .id("confirm-del-card")
         .w(px(440.))
-        .bg(solid(BG_SURFACE))
+        .bg(solid(p.bg_surface))
         .border_1()
-        .border_color(solid(BORDER))
+        .border_color(solid(p.border))
         .rounded(px(RADIUS_ROW))
         .overflow_hidden()
         .occlude()
@@ -225,14 +228,14 @@ fn render_delete_confirm_card(paths: &[PathBuf], cx: &mut Context<Workspace>) ->
                 .px_3p5()
                 .items_center()
                 .justify_between()
-                .bg(solid(BG_ELEVATED))
+                .bg(solid(p.bg_elevated))
                 .border_b_1()
-                .border_color(solid(BORDER_SUBTLE))
+                .border_color(solid(p.border_subtle))
                 .child(
                     div()
                         .text_sm()
                         .font_semibold()
-                        .text_color(solid(STATUS_ERROR))
+                        .text_color(solid(p.status_error))
                         .child("Delete Permanently"),
                 ),
         )
@@ -243,7 +246,7 @@ fn render_delete_confirm_card(paths: &[PathBuf], cx: &mut Context<Workspace>) ->
                 .child(
                     div()
                         .text_xs()
-                        .text_color(solid(TEXT_SECONDARY))
+                        .text_color(solid(p.text_secondary))
                         .child(summary),
                 )
                 .child(
@@ -271,25 +274,69 @@ fn render_delete_confirm_card(paths: &[PathBuf], cx: &mut Context<Workspace>) ->
         )
 }
 
-fn render_settings_card(ws: &Workspace, cx: &mut Context<Workspace>) -> impl IntoElement {
-    let accent = ws.settings.accent;
+fn render_settings_card(
+    ws: &Workspace,
+    p: Palette,
+    cx: &mut Context<Workspace>,
+) -> impl IntoElement {
     let status = &ws.default_explorer_status;
     let (status_label, status_hex): (&'static str, u32) = match status {
-        DefaultExplorerStatus::Enabled => ("Active", STATUS_SUCCESS),
-        DefaultExplorerStatus::OutdatedPath(_) => ("Needs Update", STATUS_WARNING),
-        DefaultExplorerStatus::Disabled => ("Windows Default", TEXT_SECONDARY),
-        DefaultExplorerStatus::UnsupportedPlatform => ("Windows Only", TEXT_MUTED),
+        DefaultExplorerStatus::Enabled => ("Active", p.status_success),
+        DefaultExplorerStatus::OutdatedPath(_) => ("Needs Update", p.status_warning),
+        DefaultExplorerStatus::Disabled => ("Windows Default", p.text_secondary),
+        DefaultExplorerStatus::UnsupportedPlatform => ("Windows Only", p.text_muted),
     };
     let is_windows = !matches!(status, DefaultExplorerStatus::UnsupportedPlatform);
     let is_enabled = matches!(status, DefaultExplorerStatus::Enabled);
 
+    let svc_state = ws.service_install_state;
+    let svc_busy = ws.service_busy;
+    let (svc_badge_label, svc_badge_hex): (SharedString, u32) = match svc_state {
+        IndexServiceInstallState::Running => {
+            if let Some(live) = &ws.service_live_status {
+                if live.indexing {
+                    ("Indexing MFT...".into(), p.status_info)
+                } else if live.total_entries > 0 {
+                    (
+                        format!("Active ({} items)", live.total_entries).into(),
+                        p.status_success,
+                    )
+                } else {
+                    ("Active".into(), p.status_success)
+                }
+            } else {
+                ("Active".into(), p.status_success)
+            }
+        }
+        IndexServiceInstallState::Stopped => ("Stopped".into(), p.status_warning),
+        IndexServiceInstallState::NotInstalled => ("Not Installed".into(), p.text_secondary),
+        IndexServiceInstallState::Unavailable => ("Windows Only".into(), p.text_muted),
+    };
+    let svc_supported = svc_state != IndexServiceInstallState::Unavailable;
+    let svc_running = svc_state == IndexServiceInstallState::Running;
+    let svc_stopped = svc_state == IndexServiceInstallState::Stopped;
+    let svc_not_installed = svc_state == IndexServiceInstallState::NotInstalled;
+
+    let theme_subtitle: SharedString = if ws.settings.theme == ThemePreset::FilesSystem {
+        let mode_label = if ws.system_is_dark { "Dark" } else { "Light" };
+        format!(
+            "Follows Windows system mode using the Files palette (currently {mode_label})."
+        )
+        .into()
+    } else {
+        "Files palettes appear first, followed by Obsidian Dark.".into()
+    };
+
     let update_busy = ws.update_state.is_busy();
     let (update_summary, update_hex): (SharedString, u32) = match &ws.update_state {
-        UpdateState::Idle => (format!("Installed v{CURRENT_VERSION}").into(), TEXT_SECONDARY),
-        UpdateState::Checking => ("Checking GitHub Releases...".into(), STATUS_INFO),
+        UpdateState::Idle => (
+            format!("Installed v{CURRENT_VERSION}").into(),
+            p.text_secondary,
+        ),
+        UpdateState::Checking => ("Checking GitHub Releases...".into(), p.status_info),
         UpdateState::UpToDate => (
             format!("v{CURRENT_VERSION} is up to date").into(),
-            STATUS_SUCCESS,
+            p.status_success,
         ),
         UpdateState::Available(info) => {
             let date_part = if info.published_at.is_empty() {
@@ -299,7 +346,7 @@ fn render_settings_card(ws: &Workspace, cx: &mut Context<Workspace>) -> impl Int
             };
             (
                 format!("Update {} available{date_part}", info.tag_name).into(),
-                STATUS_SUCCESS,
+                p.status_success,
             )
         }
         UpdateState::Downloading {
@@ -320,13 +367,13 @@ fn render_settings_card(ws: &Workspace, cx: &mut Context<Workspace>) -> impl Int
                     format_download_bytes(*downloaded_bytes)
                 ),
             };
-            (progress.into(), STATUS_INFO)
+            (progress.into(), p.status_info)
         }
         UpdateState::Installing(info) => (
             format!("Installing {} and restarting...", info.tag_name).into(),
-            STATUS_INFO,
+            p.status_info,
         ),
-        UpdateState::Failed(err) => (err.clone().into(), STATUS_ERROR),
+        UpdateState::Failed(err) => (err.clone().into(), p.status_error),
     };
 
     let install_action_label: Option<&'static str> = match &ws.update_state {
@@ -344,9 +391,9 @@ fn render_settings_card(ws: &Workspace, cx: &mut Context<Workspace>) -> impl Int
         .id("settings-modal-card")
         .w(px(640.))
         .max_h(px(680.))
-        .bg(solid(BG_SURFACE))
+        .bg(solid(p.bg_surface))
         .border_1()
-        .border_color(solid(BORDER))
+        .border_color(solid(p.border))
         .rounded(px(RADIUS_ROW))
         .overflow_hidden()
         .occlude()
@@ -359,9 +406,9 @@ fn render_settings_card(ws: &Workspace, cx: &mut Context<Workspace>) -> impl Int
                 .flex_shrink_0()
                 .items_center()
                 .justify_between()
-                .bg(solid(BG_ELEVATED))
+                .bg(solid(p.bg_elevated))
                 .border_b_1()
-                .border_color(solid(BORDER_SUBTLE))
+                .border_color(solid(p.border_subtle))
                 .child(
                     h_flex()
                         .gap_2()
@@ -369,13 +416,13 @@ fn render_settings_card(ws: &Workspace, cx: &mut Context<Workspace>) -> impl Int
                         .child(
                             Icon::new(LucideIcon::Settings)
                                 .small()
-                                .text_color(solid(accent.primary_hex())),
+                                .text_color(solid(p.accent_primary)),
                         )
                         .child(
                             div()
                                 .text_sm()
                                 .font_semibold()
-                                .text_color(solid(TEXT_PRIMARY))
+                                .text_color(solid(p.text_primary))
                                 .child("Settings"),
                         ),
                 )
@@ -401,13 +448,13 @@ fn render_settings_card(ws: &Workspace, cx: &mut Context<Workspace>) -> impl Int
                 .child(
                     v_flex()
                         .gap_2()
-                        .child(section_heading("INTERFACE & SIDEBAR"))
+                        .child(section_heading("INTERFACE & SIDEBAR", p))
                         .child(
                             v_flex()
                                 .rounded(px(RADIUS_ROW))
-                                .bg(solid(BG_BASE))
+                                .bg(solid(p.bg_base))
                                 .border_1()
-                                .border_color(solid(BORDER_SUBTLE))
+                                .border_color(solid(p.border_subtle))
                                 .overflow_hidden()
                                 .child(
                                     h_flex()
@@ -415,10 +462,11 @@ fn render_settings_card(ws: &Workspace, cx: &mut Context<Workspace>) -> impl Int
                                         .items_center()
                                         .justify_between()
                                         .border_b_1()
-                                        .border_color(solid(BORDER_SUBTLE))
+                                        .border_color(solid(p.border_subtle))
                                         .child(setting_label(
                                             "Top Tab Bar",
                                             "Show or hide browser tabs in the window header.",
+                                            p,
                                         ))
                                         .child(choice_pill(
                                             "ui-show-tabs",
@@ -428,7 +476,7 @@ fn render_settings_card(ws: &Workspace, cx: &mut Context<Workspace>) -> impl Int
                                                 "Hidden"
                                             },
                                             ws.settings.show_tabs,
-                                            accent.primary_hex(),
+                                            p,
                                             cx.listener(|this, _, _, cx| {
                                                 this.toggle_show_tabs(cx);
                                             }),
@@ -440,10 +488,11 @@ fn render_settings_card(ws: &Workspace, cx: &mut Context<Workspace>) -> impl Int
                                         .items_center()
                                         .justify_between()
                                         .border_b_1()
-                                        .border_color(solid(BORDER_SUBTLE))
+                                        .border_color(solid(p.border_subtle))
                                         .child(setting_label(
                                             "Header Title (TExplorer)",
                                             "Show or hide the TExplorer title text at the top-left.",
+                                            p,
                                         ))
                                         .child(choice_pill(
                                             "ui-show-brand",
@@ -453,7 +502,7 @@ fn render_settings_card(ws: &Workspace, cx: &mut Context<Workspace>) -> impl Int
                                                 "Hidden"
                                             },
                                             ws.settings.show_brand_title,
-                                            accent.primary_hex(),
+                                            p,
                                             cx.listener(|this, _, _, cx| {
                                                 this.toggle_show_brand_title(cx);
                                             }),
@@ -466,6 +515,7 @@ fn render_settings_card(ws: &Workspace, cx: &mut Context<Workspace>) -> impl Int
                                         .child(setting_label(
                                             "Quick Access Folders",
                                             "Choose which default folders appear in Quick Access. You can also right-click any item to remove it.",
+                                            p,
                                         ))
                                         .child(
                                             h_flex().flex_wrap().gap_1p5().children(
@@ -477,7 +527,6 @@ fn render_settings_card(ws: &Workspace, cx: &mut Context<Workspace>) -> impl Int
                                                             .is_quick_access_visible(kind);
                                                         let label: SharedString =
                                                             folder.name.clone().into();
-                                                        let accent_hex = accent.primary_hex();
 
                                                         div()
                                                             .id(("qa-toggle", idx))
@@ -486,30 +535,30 @@ fn render_settings_card(ws: &Workspace, cx: &mut Context<Workspace>) -> impl Int
                                                             .rounded(px(RADIUS_CONTROL))
                                                             .cursor_pointer()
                                                             .bg(if visible {
-                                                                soft_tint(accent_hex, 0.16)
+                                                                soft_tint(p.accent_primary, 0.16)
                                                             } else {
-                                                                solid(BG_SURFACE)
+                                                                solid(p.bg_surface)
                                                             })
                                                             .border_1()
                                                             .border_color(if visible {
-                                                                solid(accent_hex)
+                                                                solid(p.accent_primary)
                                                             } else {
-                                                                solid(BORDER_SUBTLE)
+                                                                solid(p.border_subtle)
                                                             })
                                                             .text_xs()
                                                             .font_medium()
                                                             .text_color(if visible {
-                                                                solid(accent_hex)
+                                                                solid(p.accent_primary)
                                                             } else {
-                                                                solid(TEXT_MUTED)
+                                                                solid(p.text_muted)
                                                             })
                                                             .hover(move |s| {
                                                                 if visible {
                                                                     s
                                                                 } else {
-                                                                    s.bg(solid(BG_HOVER))
+                                                                    s.bg(solid(p.bg_hover))
                                                                         .text_color(solid(
-                                                                            TEXT_PRIMARY,
+                                                                            p.text_primary,
                                                                         ))
                                                                 }
                                                             })
@@ -528,34 +577,128 @@ fn render_settings_card(ws: &Workspace, cx: &mut Context<Workspace>) -> impl Int
                                 ),
                         ),
                 )
-                // Appearance section
+                // Appearance section (Files palettes & accents first, then Obsidian)
                 .child(
                     v_flex()
                         .gap_2()
-                        .child(section_heading("APPEARANCE"))
+                        .child(section_heading("APPEARANCE", p))
                         .child(
                             v_flex()
                                 .rounded(px(RADIUS_ROW))
-                                .bg(solid(BG_BASE))
+                                .bg(solid(p.bg_base))
                                 .border_1()
-                                .border_color(solid(BORDER_SUBTLE))
+                                .border_color(solid(p.border_subtle))
                                 .overflow_hidden()
-                                // Accent selector
+                                // Theme Palette selector (Files System / Files Dark / Files Light / Obsidian)
                                 .child(
-                                    h_flex()
+                                    v_flex()
                                         .p_3()
-                                        .items_center()
-                                        .justify_between()
+                                        .gap_2()
                                         .border_b_1()
-                                        .border_color(solid(BORDER_SUBTLE))
-                                        .child(setting_label(
-                                            "Accent Color",
-                                            "Obsidian Dark flat accent used for focus and active controls.",
+                                        .border_color(solid(p.border_subtle))
+                                        .child(setting_label_shared(
+                                            "Theme Palette",
+                                            theme_subtitle,
+                                            p,
                                         ))
                                         .child(
-                                            h_flex().gap_1p5().children(
+                                            h_flex().flex_wrap().gap_1p5().children(
+                                                ThemePreset::ALL.into_iter().map(|preset| {
+                                                    let active = ws.settings.theme == preset;
+                                                    let (swatch_bg, swatch_border) = match preset {
+                                                        ThemePreset::FilesSystem => (
+                                                            if ws.system_is_dark {
+                                                                0x282828
+                                                            } else {
+                                                                0xfafafa
+                                                            },
+                                                            p.accent_primary,
+                                                        ),
+                                                        ThemePreset::FilesDark => {
+                                                            (0x282828, 0x50c0ff)
+                                                        }
+                                                        ThemePreset::FilesLight => {
+                                                            (0xfafafa, 0x0070cb)
+                                                        }
+                                                        ThemePreset::ObsidianDark => {
+                                                            (0x09090b, 0x34d399)
+                                                        }
+                                                    };
+
+                                                    div()
+                                                        .id(preset.label())
+                                                        .px_2p5()
+                                                        .py_1()
+                                                        .flex()
+                                                        .items_center()
+                                                        .gap_1p5()
+                                                        .rounded(px(RADIUS_CONTROL))
+                                                        .cursor_pointer()
+                                                        .bg(if active {
+                                                            soft_tint(p.accent_primary, 0.14)
+                                                        } else {
+                                                            solid(p.bg_surface)
+                                                        })
+                                                        .border_1()
+                                                        .border_color(if active {
+                                                            solid(p.accent_primary)
+                                                        } else {
+                                                            solid(p.border_subtle)
+                                                        })
+                                                        .hover(move |s| {
+                                                            if active {
+                                                                s
+                                                            } else {
+                                                                s.bg(solid(p.bg_hover))
+                                                            }
+                                                        })
+                                                        .on_click(cx.listener(
+                                                            move |this, _, _, cx| {
+                                                                this.set_theme(preset, cx);
+                                                            },
+                                                        ))
+                                                        .child(
+                                                            div()
+                                                                .w(px(10.))
+                                                                .h(px(10.))
+                                                                .rounded(px(999.))
+                                                                .bg(solid(swatch_bg))
+                                                                .border_1()
+                                                                .border_color(solid(swatch_border)),
+                                                        )
+                                                        .child(
+                                                            div()
+                                                                .text_xs()
+                                                                .font_medium()
+                                                                .text_color(if active {
+                                                                    solid(p.accent_primary)
+                                                                } else {
+                                                                    solid(p.text_primary)
+                                                                })
+                                                                .child(preset.short_label()),
+                                                        )
+                                                }),
+                                            ),
+                                        ),
+                                )
+                                // Accent selector (Files colors first, then Obsidian colors)
+                                .child(
+                                    v_flex()
+                                        .p_3()
+                                        .gap_2()
+                                        .border_b_1()
+                                        .border_color(solid(p.border_subtle))
+                                        .child(setting_label(
+                                            "Accent Color",
+                                            "Files accents appear first, followed by Obsidian accents.",
+                                            p,
+                                        ))
+                                        .child(
+                                            h_flex().flex_wrap().gap_1p5().children(
                                                 AccentPreset::ALL.into_iter().map(|preset| {
                                                     let active = ws.settings.accent == preset;
+                                                    let dot_hex = preset.primary_hex_for(p.is_dark);
+
                                                     div()
                                                         .id(preset.label())
                                                         .px_2()
@@ -566,17 +709,23 @@ fn render_settings_card(ws: &Workspace, cx: &mut Context<Workspace>) -> impl Int
                                                         .rounded(px(RADIUS_CONTROL))
                                                         .cursor_pointer()
                                                         .bg(if active {
-                                                            solid(BG_ELEVATED)
+                                                            soft_tint(dot_hex, 0.14)
                                                         } else {
-                                                            solid(BG_SURFACE)
+                                                            solid(p.bg_surface)
                                                         })
                                                         .border_1()
                                                         .border_color(if active {
-                                                            solid(preset.primary_hex())
+                                                            solid(dot_hex)
                                                         } else {
-                                                            solid(BORDER_SUBTLE)
+                                                            solid(p.border_subtle)
                                                         })
-                                                        .hover(|s| s.bg(solid(BG_HOVER)))
+                                                        .hover(move |s| {
+                                                            if active {
+                                                                s
+                                                            } else {
+                                                                s.bg(solid(p.bg_hover))
+                                                            }
+                                                        })
                                                         .on_click(cx.listener(
                                                             move |this, _, _, cx| {
                                                                 this.set_accent(preset, cx);
@@ -587,17 +736,13 @@ fn render_settings_card(ws: &Workspace, cx: &mut Context<Workspace>) -> impl Int
                                                                 .w(px(10.))
                                                                 .h(px(10.))
                                                                 .rounded(px(999.))
-                                                                .bg(solid(preset.primary_hex())),
+                                                                .bg(solid(dot_hex)),
                                                         )
                                                         .child(
                                                             div()
                                                                 .text_xs()
-                                                                .text_color(solid(TEXT_PRIMARY))
-                                                                .child(match preset {
-                                                                    AccentPreset::Emerald => "Emerald",
-                                                                    AccentPreset::Violet => "Violet",
-                                                                    AccentPreset::Monochrome => "Mono",
-                                                                }),
+                                                                .text_color(solid(p.text_primary))
+                                                                .child(preset.short_label()),
                                                         )
                                                 }),
                                             ),
@@ -610,10 +755,11 @@ fn render_settings_card(ws: &Workspace, cx: &mut Context<Workspace>) -> impl Int
                                         .items_center()
                                         .justify_between()
                                         .border_b_1()
-                                        .border_color(solid(BORDER_SUBTLE))
+                                        .border_color(solid(p.border_subtle))
                                         .child(setting_label(
                                             "Size Units",
                                             "Choose binary (KiB/MiB) or decimal (KB/MB) formatting.",
+                                            p,
                                         ))
                                         .child(
                                             h_flex()
@@ -622,7 +768,7 @@ fn render_settings_card(ws: &Workspace, cx: &mut Context<Workspace>) -> impl Int
                                                     "unit-bin",
                                                     "Binary",
                                                     ws.settings.size_unit == SizeUnit::Binary,
-                                                    accent.primary_hex(),
+                                                    p,
                                                     cx.listener(|this, _, _, cx| {
                                                         this.set_size_unit(SizeUnit::Binary, cx);
                                                     }),
@@ -631,7 +777,7 @@ fn render_settings_card(ws: &Workspace, cx: &mut Context<Workspace>) -> impl Int
                                                     "unit-dec",
                                                     "Decimal",
                                                     ws.settings.size_unit == SizeUnit::Decimal,
-                                                    accent.primary_hex(),
+                                                    p,
                                                     cx.listener(|this, _, _, cx| {
                                                         this.set_size_unit(SizeUnit::Decimal, cx);
                                                     }),
@@ -647,6 +793,7 @@ fn render_settings_card(ws: &Workspace, cx: &mut Context<Workspace>) -> impl Int
                                         .child(setting_label(
                                             "Default View Mode",
                                             "Layout used when opening new tabs or split panes.",
+                                            p,
                                         ))
                                         .child(
                                             h_flex()
@@ -654,8 +801,9 @@ fn render_settings_card(ws: &Workspace, cx: &mut Context<Workspace>) -> impl Int
                                                 .child(choice_pill(
                                                     "dvm-details",
                                                     "Details",
-                                                    ws.settings.default_view_mode == ViewMode::Details,
-                                                    accent.primary_hex(),
+                                                    ws.settings.default_view_mode
+                                                        == ViewMode::Details,
+                                                    p,
                                                     cx.listener(|this, _, _, cx| {
                                                         this.set_default_view_mode(
                                                             ViewMode::Details,
@@ -667,7 +815,7 @@ fn render_settings_card(ws: &Workspace, cx: &mut Context<Workspace>) -> impl Int
                                                     "dvm-grid",
                                                     "Grid",
                                                     ws.settings.default_view_mode == ViewMode::Grid,
-                                                    accent.primary_hex(),
+                                                    p,
                                                     cx.listener(|this, _, _, cx| {
                                                         this.set_default_view_mode(
                                                             ViewMode::Grid,
@@ -678,8 +826,9 @@ fn render_settings_card(ws: &Workspace, cx: &mut Context<Workspace>) -> impl Int
                                                 .child(choice_pill(
                                                     "dvm-compact",
                                                     "Compact",
-                                                    ws.settings.default_view_mode == ViewMode::Compact,
-                                                    accent.primary_hex(),
+                                                    ws.settings.default_view_mode
+                                                        == ViewMode::Compact,
+                                                    p,
                                                     cx.listener(|this, _, _, cx| {
                                                         this.set_default_view_mode(
                                                             ViewMode::Compact,
@@ -691,17 +840,17 @@ fn render_settings_card(ws: &Workspace, cx: &mut Context<Workspace>) -> impl Int
                                 ),
                         ),
                 )
-                // Windows Default File Manager Integration section
+                // Search, MFT Service & Folder Sizes section
                 .child(
                     v_flex()
                         .gap_2()
-                        .child(section_heading("WINDOWS INTEGRATION"))
+                        .child(section_heading("SEARCH & INDEXING", p))
                         .child(
                             v_flex()
                                 .rounded(px(RADIUS_ROW))
-                                .bg(solid(BG_BASE))
+                                .bg(solid(p.bg_base))
                                 .border_1()
-                                .border_color(solid(BORDER_SUBTLE))
+                                .border_color(solid(p.border_subtle))
                                 .overflow_hidden()
                                 .child(
                                     h_flex()
@@ -710,10 +859,161 @@ fn render_settings_card(ws: &Workspace, cx: &mut Context<Workspace>) -> impl Int
                                         .justify_between()
                                         .gap_3()
                                         .border_b_1()
-                                        .border_color(solid(BORDER_SUBTLE))
+                                        .border_color(solid(p.border_subtle))
+                                        .child(setting_label(
+                                            "NTFS MFT + USN Index Service",
+                                            "Read-only background service for <10 ms global search (Ctrl+K) and instant folder sizes without UAC.",
+                                            p,
+                                        ))
+                                        .child(
+                                            h_flex()
+                                                .flex_shrink_0()
+                                                .items_center()
+                                                .gap_1p5()
+                                                .child(
+                                                    div()
+                                                        .px_2()
+                                                        .py_0p5()
+                                                        .rounded(px(RADIUS_CONTROL))
+                                                        .bg(soft_tint(svc_badge_hex, 0.14))
+                                                        .text_size(px(11.))
+                                                        .font_medium()
+                                                        .text_color(solid(svc_badge_hex))
+                                                        .child(svc_badge_label),
+                                                )
+                                                .when(svc_supported && svc_not_installed, |el| {
+                                                    el.child(
+                                                        Button::new("svc-install")
+                                                            .with_size(Size::XSmall)
+                                                            .primary()
+                                                            .disabled(svc_busy)
+                                                            .label("Install & Start")
+                                                            .on_click(cx.listener(
+                                                                |this, _, _, cx| {
+                                                                    this.install_mft_service(cx);
+                                                                },
+                                                            )),
+                                                    )
+                                                })
+                                                .when(svc_supported && svc_stopped, |el| {
+                                                    el.child(
+                                                        Button::new("svc-start")
+                                                            .with_size(Size::XSmall)
+                                                            .primary()
+                                                            .disabled(svc_busy)
+                                                            .label("Start")
+                                                            .on_click(cx.listener(
+                                                                |this, _, _, cx| {
+                                                                    this.start_mft_service(cx);
+                                                                },
+                                                            )),
+                                                    )
+                                                })
+                                                .when(svc_supported && svc_running, |el| {
+                                                    el.child(
+                                                        Button::new("svc-rebuild")
+                                                            .with_size(Size::XSmall)
+                                                            .disabled(svc_busy)
+                                                            .label("Rebuild")
+                                                            .on_click(cx.listener(
+                                                                |this, _, _, cx| {
+                                                                    this.rebuild_mft_index(cx);
+                                                                },
+                                                            )),
+                                                    )
+                                                    .child(
+                                                        Button::new("svc-uninstall")
+                                                            .with_size(Size::XSmall)
+                                                            .danger()
+                                                            .disabled(svc_busy)
+                                                            .label("Uninstall")
+                                                            .on_click(cx.listener(
+                                                                |this, _, _, cx| {
+                                                                    this.uninstall_mft_service(cx);
+                                                                },
+                                                            )),
+                                                    )
+                                                }),
+                                        ),
+                                )
+                                .child(
+                                    h_flex()
+                                        .p_3()
+                                        .items_center()
+                                        .justify_between()
+                                        .gap_3()
+                                        .border_b_1()
+                                        .border_color(solid(p.border_subtle))
+                                        .child(setting_label(
+                                            "Use MFT Index Service",
+                                            "Prefer the background NTFS index service over multi-threaded fallback walk when available.",
+                                            p,
+                                        ))
+                                        .child(choice_pill(
+                                            "set-use-mft",
+                                            if ws.settings.use_mft_service {
+                                                "Enabled"
+                                            } else {
+                                                "Disabled"
+                                            },
+                                            ws.settings.use_mft_service,
+                                            p,
+                                            cx.listener(|this, _, _, cx| {
+                                                this.toggle_use_mft_service(cx);
+                                            }),
+                                        )),
+                                )
+                                .child(
+                                    h_flex()
+                                        .p_3()
+                                        .items_center()
+                                        .justify_between()
+                                        .gap_3()
+                                        .child(setting_label(
+                                            "Calculate Folder Sizes",
+                                            "Resolve recursive folder byte totals in Details view (instant via MFT Service or background walk).",
+                                            p,
+                                        ))
+                                        .child(choice_pill(
+                                            "set-folder-sizes",
+                                            if ws.settings.calculate_folder_sizes {
+                                                "Enabled"
+                                            } else {
+                                                "Disabled"
+                                            },
+                                            ws.settings.calculate_folder_sizes,
+                                            p,
+                                            cx.listener(|this, _, _, cx| {
+                                                this.toggle_calculate_folder_sizes(cx);
+                                            }),
+                                        )),
+                                ),
+                        ),
+                )
+                // Windows Default File Manager Integration section
+                .child(
+                    v_flex()
+                        .gap_2()
+                        .child(section_heading("WINDOWS INTEGRATION", p))
+                        .child(
+                            v_flex()
+                                .rounded(px(RADIUS_ROW))
+                                .bg(solid(p.bg_base))
+                                .border_1()
+                                .border_color(solid(p.border_subtle))
+                                .overflow_hidden()
+                                .child(
+                                    h_flex()
+                                        .p_3()
+                                        .items_center()
+                                        .justify_between()
+                                        .gap_3()
+                                        .border_b_1()
+                                        .border_color(solid(p.border_subtle))
                                         .child(setting_label(
                                             "Set TExplorer as Default File Manager",
                                             "Registers per-user HKCU folder handlers (no UAC). Keeps taskbar, desktop, and Control Panel untouched.",
+                                            p,
                                         ))
                                         .child(
                                             h_flex()
@@ -773,6 +1073,7 @@ fn render_settings_card(ws: &Workspace, cx: &mut Context<Workspace>) -> impl Int
                                             .child(setting_label(
                                                 "Intercept Win+E Shortcut",
                                                 "Open TExplorer when pressing Win+E via HKCU Shell CLSID routing (no global keyboard hooks).",
+                                                p,
                                             ))
                                             .child(choice_pill(
                                                 "win-e-toggle",
@@ -782,7 +1083,7 @@ fn render_settings_card(ws: &Workspace, cx: &mut Context<Workspace>) -> impl Int
                                                     "Disabled"
                                                 },
                                                 ws.settings.intercept_win_e,
-                                                accent.primary_hex(),
+                                                p,
                                                 cx.listener(|this, _, _, cx| {
                                                     this.toggle_intercept_win_e(cx);
                                                 }),
@@ -795,13 +1096,13 @@ fn render_settings_card(ws: &Workspace, cx: &mut Context<Workspace>) -> impl Int
                 .child(
                     v_flex()
                         .gap_2()
-                        .child(section_heading("UPDATES"))
+                        .child(section_heading("UPDATES", p))
                         .child(
                             v_flex()
                                 .rounded(px(RADIUS_ROW))
-                                .bg(solid(BG_BASE))
+                                .bg(solid(p.bg_base))
                                 .border_1()
-                                .border_color(solid(BORDER_SUBTLE))
+                                .border_color(solid(p.border_subtle))
                                 .overflow_hidden()
                                 .child(
                                     h_flex()
@@ -810,7 +1111,7 @@ fn render_settings_card(ws: &Workspace, cx: &mut Context<Workspace>) -> impl Int
                                         .justify_between()
                                         .gap_3()
                                         .border_b_1()
-                                        .border_color(solid(BORDER_SUBTLE))
+                                        .border_color(solid(p.border_subtle))
                                         .child(
                                             v_flex()
                                                 .flex_1()
@@ -820,7 +1121,7 @@ fn render_settings_card(ws: &Workspace, cx: &mut Context<Workspace>) -> impl Int
                                                     div()
                                                         .text_xs()
                                                         .font_semibold()
-                                                        .text_color(solid(TEXT_PRIMARY))
+                                                        .text_color(solid(p.text_primary))
                                                         .child(format!(
                                                             "TExplorer v{CURRENT_VERSION}"
                                                         )),
@@ -880,6 +1181,7 @@ fn render_settings_card(ws: &Workspace, cx: &mut Context<Workspace>) -> impl Int
                                         .child(setting_label(
                                             "Automatic Update Check",
                                             "Check GitHub Releases quietly when TExplorer starts.",
+                                            p,
                                         ))
                                         .child(choice_pill(
                                             "upd-auto-toggle",
@@ -889,7 +1191,7 @@ fn render_settings_card(ws: &Workspace, cx: &mut Context<Workspace>) -> impl Int
                                                 "Disabled"
                                             },
                                             ws.settings.auto_check_updates,
-                                            accent.primary_hex(),
+                                            p,
                                             cx.listener(|this, _, _, cx| {
                                                 this.toggle_auto_check_updates(cx);
                                             }),
@@ -900,15 +1202,23 @@ fn render_settings_card(ws: &Workspace, cx: &mut Context<Workspace>) -> impl Int
         )
 }
 
-fn section_heading(text: &'static str) -> impl IntoElement {
+fn section_heading(text: &'static str, p: Palette) -> impl IntoElement {
     div()
         .text_size(px(11.))
         .font_semibold()
-        .text_color(solid(TEXT_MUTED))
+        .text_color(solid(p.text_muted))
         .child(text)
 }
 
-fn setting_label(title: &'static str, subtitle: &'static str) -> impl IntoElement {
+fn setting_label(title: &'static str, subtitle: &'static str, p: Palette) -> impl IntoElement {
+    setting_label_shared(title, subtitle.into(), p)
+}
+
+fn setting_label_shared(
+    title: &'static str,
+    subtitle: SharedString,
+    p: Palette,
+) -> impl IntoElement {
     v_flex()
         .flex_1()
         .min_w_0()
@@ -917,13 +1227,13 @@ fn setting_label(title: &'static str, subtitle: &'static str) -> impl IntoElemen
             div()
                 .text_xs()
                 .font_semibold()
-                .text_color(solid(TEXT_PRIMARY))
+                .text_color(solid(p.text_primary))
                 .child(title),
         )
         .child(
             div()
                 .text_size(px(11.))
-                .text_color(solid(TEXT_MUTED))
+                .text_color(solid(p.text_muted))
                 .child(subtitle),
         )
 }
@@ -932,7 +1242,7 @@ fn choice_pill(
     id: &'static str,
     label: &'static str,
     active: bool,
-    accent_hex: u32,
+    p: Palette,
     on_click: impl Fn(&gpui_kit::ClickEvent, &mut gpui_kit::Window, &mut gpui_kit::App) + 'static,
 ) -> impl IntoElement {
     div()
@@ -942,28 +1252,28 @@ fn choice_pill(
         .rounded(px(RADIUS_CONTROL))
         .cursor_pointer()
         .bg(if active {
-            soft_tint(accent_hex, 0.16)
+            soft_tint(p.accent_primary, 0.16)
         } else {
-            solid(BG_SURFACE)
+            solid(p.bg_surface)
         })
         .border_1()
         .border_color(if active {
-            solid(accent_hex)
+            solid(p.accent_primary)
         } else {
-            solid(BORDER_SUBTLE)
+            solid(p.border_subtle)
         })
         .text_xs()
         .font_medium()
         .text_color(if active {
-            solid(accent_hex)
+            solid(p.accent_primary)
         } else {
-            solid(TEXT_SECONDARY)
+            solid(p.text_secondary)
         })
         .hover(move |s| {
             if active {
                 s
             } else {
-                s.bg(solid(BG_HOVER)).text_color(solid(TEXT_PRIMARY))
+                s.bg(solid(p.bg_hover)).text_color(solid(p.text_primary))
             }
         })
         .on_click(on_click)

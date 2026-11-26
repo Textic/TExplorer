@@ -13,9 +13,7 @@ use gpui_kit::{
 use texplorer_core::{Location, PaneSide, ViewMode};
 
 use crate::theme::{
-    BG_BASE, BG_ELEVATED, BG_HOVER, BG_SURFACE, BORDER, BORDER_SUBTLE, RADIUS_CONTROL, RADIUS_ROW,
-    STATUS_ERROR, TEXT_MUTED, TEXT_PRIMARY, TEXT_SECONDARY, format_size, full_hit_input, soft_tint,
-    solid,
+    Palette, RADIUS_CONTROL, RADIUS_ROW, format_size, full_hit_input, soft_tint, solid,
 };
 use crate::ui::views::{
     render_compact_view, render_details_view, render_grid_view, render_home_view,
@@ -30,13 +28,13 @@ pub fn render_pane(
     is_split: bool,
     cx: &mut Context<Workspace>,
 ) -> impl IntoElement {
+    let p = ws.palette();
     let Some(tab) = ws.active_tab() else {
-        return v_flex().size_full().bg(solid(BG_BASE)).into_any_element();
+        return v_flex().size_full().bg(solid(p.bg_base)).into_any_element();
     };
     let pane_ui = tab.pane_ui(side);
     let model = tab.model.pane(side);
     let is_active = !is_split || tab.model.active_pane == side;
-    let accent = ws.settings.accent;
     let unit = ws.settings.size_unit;
 
     let can_back = model.can_go_back();
@@ -71,9 +69,9 @@ pub fn render_pane(
             .px_2()
             .items_center()
             .rounded(px(RADIUS_ROW))
-            .bg(solid(BG_BASE))
+            .bg(solid(p.bg_base))
             .border_1()
-            .border_color(solid(accent.primary_hex()))
+            .border_color(solid(p.accent_primary))
             .child(
                 full_hit_input(
                     (side_tag, 101usize),
@@ -100,9 +98,9 @@ pub fn render_pane(
             .items_center()
             .overflow_x_scroll()
             .rounded(px(RADIUS_ROW))
-            .bg(solid(BG_BASE))
+            .bg(solid(p.bg_base))
             .border_1()
-            .border_color(solid(BORDER_SUBTLE))
+            .border_color(solid(p.border_subtle))
             .cursor_text()
             .on_mouse_down(
                 MouseButton::Left,
@@ -125,7 +123,7 @@ pub fn render_pane(
                         el.child(
                             Icon::new(LucideIcon::ChevronRight)
                                 .xsmall()
-                                .text_color(solid(TEXT_MUTED)),
+                                .text_color(solid(p.text_muted)),
                         )
                     })
                     .child(
@@ -144,11 +142,13 @@ pub fn render_pane(
                             .text_xs()
                             .font_medium()
                             .text_color(if is_last {
-                                solid(TEXT_PRIMARY)
+                                solid(p.text_primary)
                             } else {
-                                solid(TEXT_SECONDARY)
+                                solid(p.text_secondary)
                             })
-                            .hover(|s| s.bg(solid(BG_HOVER)).text_color(solid(TEXT_PRIMARY)))
+                            .hover(move |s| {
+                                s.bg(solid(p.bg_hover)).text_color(solid(p.text_primary))
+                            })
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(move |this, _: &MouseDownEvent, window, cx| {
@@ -178,7 +178,7 @@ pub fn render_pane(
             PaneSide::Right => "pane-root-right",
         })
         .size_full()
-        .bg(solid(BG_BASE))
+        .bg(solid(p.bg_base))
         .overflow_hidden()
         .on_mouse_down(
             MouseButton::Left,
@@ -189,9 +189,9 @@ pub fn render_pane(
         // Subtle 2px top accent indicator when Dual-Pane split is active
         .when(is_split, |el| {
             el.child(div().w_full().h(px(2.)).bg(if is_active {
-                solid(accent.primary_hex())
+                solid(p.accent_primary)
             } else {
-                solid(BORDER_SUBTLE)
+                solid(p.border_subtle)
             }))
         })
         // Pane Navigation Bar (38px flat strip)
@@ -203,9 +203,9 @@ pub fn render_pane(
                 .gap_1p5()
                 .flex_shrink_0()
                 .items_center()
-                .bg(solid(BG_SURFACE))
+                .bg(solid(p.bg_surface))
                 .border_b_1()
-                .border_color(solid(BORDER_SUBTLE))
+                .border_color(solid(p.border_subtle))
                 // History & Up navigation buttons
                 .child(
                     h_flex()
@@ -269,17 +269,17 @@ pub fn render_pane(
                             .flex_shrink_0()
                             .items_center()
                             .rounded(px(RADIUS_ROW))
-                            .bg(solid(BG_BASE))
+                            .bg(solid(p.bg_base))
                             .border_1()
                             .border_color(if filter_non_empty {
-                                solid(accent.primary_hex())
+                                solid(p.accent_primary)
                             } else {
-                                solid(BORDER_SUBTLE)
+                                solid(p.border_subtle)
                             })
                             .child(
                                 Icon::new(LucideIcon::Search)
                                     .xsmall()
-                                    .text_color(solid(TEXT_MUTED)),
+                                    .text_color(solid(p.text_muted)),
                             )
                             .child(
                                 full_hit_input(
@@ -303,9 +303,10 @@ pub fn render_pane(
                                         .justify_center()
                                         .rounded(px(3.))
                                         .cursor_pointer()
-                                        .text_color(solid(TEXT_MUTED))
-                                        .hover(|s| {
-                                            s.bg(solid(BG_HOVER)).text_color(solid(TEXT_PRIMARY))
+                                        .text_color(solid(p.text_muted))
+                                        .hover(move |s| {
+                                            s.bg(solid(p.bg_hover))
+                                                .text_color(solid(p.text_primary))
                                         })
                                         .on_mouse_down(
                                             MouseButton::Left,
@@ -327,15 +328,15 @@ pub fn render_pane(
                             .gap_0p5()
                             .p_0p5()
                             .rounded(px(RADIUS_CONTROL))
-                            .bg(solid(BG_BASE))
+                            .bg(solid(p.bg_base))
                             .border_1()
-                            .border_color(solid(BORDER_SUBTLE))
+                            .border_color(solid(p.border_subtle))
                             .child(view_mode_btn(
                                 side,
                                 ViewMode::Details,
                                 view_mode == ViewMode::Details,
                                 LucideIcon::LayoutList,
-                                accent.primary_hex(),
+                                p,
                                 cx,
                             ))
                             .child(view_mode_btn(
@@ -343,7 +344,7 @@ pub fn render_pane(
                                 ViewMode::Grid,
                                 view_mode == ViewMode::Grid,
                                 LucideIcon::LayoutGrid,
-                                accent.primary_hex(),
+                                p,
                                 cx,
                             ))
                             .child(view_mode_btn(
@@ -351,7 +352,7 @@ pub fn render_pane(
                                 ViewMode::Compact,
                                 view_mode == ViewMode::Compact,
                                 LucideIcon::List,
-                                accent.primary_hex(),
+                                p,
                                 cx,
                             )),
                     )
@@ -367,16 +368,18 @@ pub fn render_pane(
                             .rounded(px(RADIUS_CONTROL))
                             .cursor_pointer()
                             .bg(if show_hidden {
-                                soft_tint(accent.primary_hex(), 0.14)
+                                soft_tint(p.accent_primary, 0.14)
                             } else {
                                 gpui_kit::transparent_black()
                             })
                             .text_color(if show_hidden {
-                                solid(accent.primary_hex())
+                                solid(p.accent_primary)
                             } else {
-                                solid(TEXT_MUTED)
+                                solid(p.text_muted)
                             })
-                            .hover(|s| s.bg(solid(BG_HOVER)).text_color(solid(TEXT_PRIMARY)))
+                            .hover(move |s| {
+                                s.bg(solid(p.bg_hover)).text_color(solid(p.text_primary))
+                            })
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.toggle_hidden_for_pane(side, cx);
                             }))
@@ -422,17 +425,17 @@ pub fn render_pane(
                     .flex_shrink_0()
                     .items_center()
                     .justify_between()
-                    .bg(solid(BG_SURFACE))
+                    .bg(solid(p.bg_surface))
                     .border_t_1()
-                    .border_color(solid(BORDER_SUBTLE))
+                    .border_color(solid(p.border_subtle))
                     .child(
                         div()
                             .truncate()
                             .text_size(px(11.))
                             .text_color(if has_err {
-                                solid(STATUS_ERROR)
+                                solid(p.status_error)
                             } else {
-                                solid(TEXT_MUTED)
+                                solid(p.text_muted)
                             })
                             .child(summary),
                     )
@@ -441,11 +444,11 @@ pub fn render_pane(
                             div()
                                 .px_1p5()
                                 .rounded(px(3.))
-                                .bg(solid(BG_ELEVATED))
+                                .bg(solid(p.bg_elevated))
                                 .border_1()
-                                .border_color(solid(BORDER))
+                                .border_color(solid(p.border))
                                 .text_size(px(10.))
-                                .text_color(solid(TEXT_SECONDARY))
+                                .text_color(solid(p.text_secondary))
                                 .child("Filtered"),
                         )
                     }),
@@ -459,7 +462,7 @@ fn view_mode_btn(
     mode: ViewMode,
     active: bool,
     icon: LucideIcon,
-    accent_hex: u32,
+    p: Palette,
     cx: &mut Context<Workspace>,
 ) -> impl IntoElement {
     let id = match (side, mode) {
@@ -481,20 +484,20 @@ fn view_mode_btn(
         .rounded(px(3.))
         .cursor_pointer()
         .bg(if active {
-            soft_tint(accent_hex, 0.16)
+            soft_tint(p.accent_primary, 0.16)
         } else {
             gpui_kit::transparent_black()
         })
         .text_color(if active {
-            solid(accent_hex)
+            solid(p.accent_primary)
         } else {
-            solid(TEXT_MUTED)
+            solid(p.text_muted)
         })
         .hover(move |s| {
             if active {
                 s
             } else {
-                s.bg(solid(BG_HOVER)).text_color(solid(TEXT_PRIMARY))
+                s.bg(solid(p.bg_hover)).text_color(solid(p.text_primary))
             }
         })
         .on_click(cx.listener(move |this, _, _, cx| {

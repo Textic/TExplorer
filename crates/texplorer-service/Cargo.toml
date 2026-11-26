@@ -1,0 +1,28 @@
+[package]
+name = "texplorer-service"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Lightweight read-only Windows background service for TExplorer NTFS $MFT indexing and live USN Change Journal updates"
+
+[[bin]]
+name = "texplorer-service"
+path = "src/main.rs"
+
+[dependencies]
+rayon.workspace = true
+serde_json.workspace = true
+texplorer-mft = { path = "../texplorer-mft" }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_Pipes",
+    "Win32_System_Services",
+    "Win32_System_Threading",
+] }

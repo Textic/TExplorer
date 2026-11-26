@@ -15,15 +15,15 @@ use gpui_kit::{
 use texplorer_core::AppSettings;
 use texplorer_platform::{
     LaunchIntent, delegate_to_windows_explorer, parse_cli_args, restore_windows_explorer,
-    start_single_instance_server, try_forward_to_running_instance,
+    start_single_instance_server, system_prefers_dark_mode, try_forward_to_running_instance,
 };
 
 use crate::ui::workspace::{
     CancelOrDismiss, CloseTab, CopySelected, CreateNewFolder, CutSelected, DeletePermanent,
     DeleteToTrash, FocusAddressBar, FocusFilter, GoBack, GoForward, GoUp, NewTab, NextTab,
-    OpenSettings, PasteItems, PrevTab, Quit, RedoActionCmd, RefreshPane, RenameSelected,
-    SelectAllItems, SwitchActivePane, ToggleHiddenFiles, ToggleInspector, ToggleSidebar,
-    ToggleSplitPane, UndoActionCmd, Workspace,
+    OpenGlobalSearch, OpenSettings, PasteItems, PrevTab, Quit, RedoActionCmd, RefreshPane,
+    RenameSelected, SelectAllItems, SwitchActivePane, ToggleHiddenFiles, ToggleInspector,
+    ToggleSidebar, ToggleSplitPane, UndoActionCmd, Workspace,
 };
 
 icon_assets!(
@@ -142,12 +142,18 @@ fn main() {
     });
 
     let initial_settings = AppSettings::load();
+    let system_is_dark = system_prefers_dark_mode();
 
     gpui_kit::application()
         .with_assets(TExplorerAssets)
         .run(move |cx| {
             gpui_kit::init(cx);
-            theme::apply_obsidian_theme(initial_settings.accent, cx);
+            let initial_palette = theme::resolve_palette(
+                initial_settings.theme,
+                initial_settings.accent,
+                system_is_dark,
+            );
+            theme::apply_theme(initial_palette, cx);
 
             cx.bind_keys([
                 KeyBinding::new("ctrl-t", NewTab, Some("TExplorerWorkspace")),
@@ -165,6 +171,7 @@ fn main() {
                 KeyBinding::new("f5", RefreshPane, Some("TExplorerWorkspace")),
                 KeyBinding::new("ctrl-r", RefreshPane, Some("TExplorerWorkspace")),
                 KeyBinding::new("ctrl-f", FocusFilter, Some("TExplorerWorkspace")),
+                KeyBinding::new("ctrl-k", OpenGlobalSearch, Some("TExplorerWorkspace")),
                 KeyBinding::new("ctrl-b", ToggleSidebar, Some("TExplorerWorkspace")),
                 KeyBinding::new("alt-p", ToggleInspector, Some("TExplorerWorkspace")),
                 KeyBinding::new("ctrl-h", ToggleHiddenFiles, Some("TExplorerWorkspace")),
@@ -202,7 +209,16 @@ fn main() {
             gpui_kit::open_window(options, cx, move |window, cx| {
                 window.set_rem_size(px(theme::UI_REM_SIZE));
                 let rx = ipc_rx_opt.take().expect("single window initialization");
-                cx.new(|cx| Workspace::new(settings_for_window, intent_for_window, rx, window, cx))
+                cx.new(|cx| {
+                    Workspace::new(
+                        settings_for_window,
+                        system_is_dark,
+                        intent_for_window,
+                        rx,
+                        window,
+                        cx,
+                    )
+                })
             })
             .expect("failed to open TExplorer window");
         });

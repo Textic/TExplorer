@@ -1,14 +1,17 @@
 #ifndef MyAppVersion
-  #define MyAppVersion "0.2.0"
+  #define MyAppVersion "0.3.0"
 #endif
 #ifndef BinaryPath
   #define BinaryPath "..\..\target\release\texplorer.exe"
+#endif
+#ifndef ServiceBinaryPath
+  #define ServiceBinaryPath "..\..\target\release\texplorer-service.exe"
 #endif
 #ifndef OutputDir
   #define OutputDir "..\..\dist"
 #endif
 #ifndef OutputBaseFilename
-  #define OutputBaseFilename "texplorer-v0.2.0-windows-x86_64-setup"
+  #define OutputBaseFilename "texplorer-v0.3.0-windows-x86_64-setup"
 #endif
 
 [Setup]
@@ -43,6 +46,7 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{
 
 [Files]
 Source: "{#BinaryPath}"; DestDir: "{app}"; DestName: "texplorer.exe"; Flags: ignoreversion
+Source: "{#ServiceBinaryPath}"; DestDir: "{app}"; DestName: "texplorer-service.exe"; Flags: ignoreversion
 Source: "..\..\README.md"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\..\assets\texplorer.ico"; DestDir: "{app}\assets"; Flags: ignoreversion
 
@@ -52,8 +56,10 @@ Name: "{group}\{cm:UninstallProgram,TExplorer}"; Filename: "{uninstallexe}"
 Name: "{autodesktop}\TExplorer"; Filename: "{app}\texplorer.exe"; IconFilename: "{app}\texplorer.exe"; Tasks: desktopicon
 
 [Run]
+Filename: "{app}\texplorer-service.exe"; Parameters: "--restart-if-installed"; Flags: runhidden waituntilterminated skipifsilent
 Filename: "{app}\texplorer.exe"; Description: "{cm:LaunchProgram,TExplorer}"; Flags: nowait postinstall skipifsilent
 
 [UninstallRun]
-; Always restore original Windows Explorer HKCU folder associations on uninstall
+; Always stop/remove the optional MFT Index Service and restore Windows Explorer HKCU associations on uninstall
+Filename: "{app}\texplorer-service.exe"; Parameters: "--uninstall"; RunOnceId: "RemoveIndexService"; Flags: runhidden waituntilterminated
 Filename: "{app}\texplorer.exe"; Parameters: "--restore-explorer"; RunOnceId: "RestoreWindowsExplorer"; Flags: runhidden waituntilterminated

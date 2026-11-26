@@ -10,10 +10,7 @@ use gpui_kit::{
 };
 use texplorer_core::Location;
 
-use crate::theme::{
-    BG_BASE, BG_ELEVATED, BG_HOVER, BORDER_SUBTLE, RADIUS_CONTROL, STATUS_ERROR, TEXT_MUTED,
-    TEXT_PRIMARY, TEXT_SECONDARY, soft_tint, solid,
-};
+use crate::theme::{Palette, RADIUS_CONTROL, soft_tint, solid};
 use crate::ui::workspace::Workspace;
 use crate::updater::UpdateState;
 
@@ -25,7 +22,7 @@ pub fn render_header(
     window: &Window,
     cx: &mut Context<Workspace>,
 ) -> impl IntoElement {
-    let accent = ws.settings.accent;
+    let p = ws.palette();
     let active_tab = ws.active_tab_index;
     let split_active = ws.active_tab().map(|t| t.model.split_enabled).unwrap_or(false);
     let show_tabs = ws.settings.show_tabs;
@@ -33,7 +30,9 @@ pub fn render_header(
 
     let update_pill: Option<SharedString> = match &ws.update_state {
         UpdateState::Available(info) => Some(format!("Update {}", info.tag_name).into()),
-        UpdateState::Downloading { info, .. } => Some(format!("Downloading {}...", info.tag_name).into()),
+        UpdateState::Downloading { info, .. } => {
+            Some(format!("Downloading {}...", info.tag_name).into())
+        }
         UpdateState::Installing(info) => Some(format!("Installing {}...", info.tag_name).into()),
         _ => None,
     };
@@ -44,9 +43,9 @@ pub fn render_header(
         .h(px(38.))
         .flex_shrink_0()
         .items_center()
-        .bg(solid(BG_ELEVATED))
+        .bg(solid(p.bg_elevated))
         .border_b_1()
-        .border_color(solid(BORDER_SUBTLE))
+        .border_color(solid(p.border_subtle))
         // Minimal text-only brand area without emblem icon (toggleable in Settings)
         .when(show_brand, |el| {
             el.child(
@@ -61,7 +60,7 @@ pub fn render_header(
                         div()
                             .text_xs()
                             .font_semibold()
-                            .text_color(solid(TEXT_PRIMARY))
+                            .text_color(solid(p.text_primary))
                             .child("TExplorer"),
                     ),
             )
@@ -113,13 +112,13 @@ pub fn render_header(
                             .rounded(px(RADIUS_CONTROL))
                             .cursor_pointer()
                             .bg(if is_active {
-                                solid(BG_BASE)
+                                solid(p.bg_base)
                             } else {
                                 gpui_kit::transparent_black()
                             })
                             .border_1()
                             .border_color(if is_active {
-                                solid(BORDER_SUBTLE)
+                                solid(p.border_subtle)
                             } else {
                                 gpui_kit::transparent_black()
                             })
@@ -127,7 +126,7 @@ pub fn render_header(
                                 if is_active {
                                     s
                                 } else {
-                                    s.bg(solid(BG_HOVER))
+                                    s.bg(solid(p.bg_hover))
                                 }
                             })
                             .on_mouse_down(
@@ -144,9 +143,9 @@ pub fn render_header(
                             )
                             .child(
                                 Icon::new(tab_icon).xsmall().text_color(if is_active {
-                                    solid(accent.primary_hex())
+                                    solid(p.accent_primary)
                                 } else {
-                                    solid(TEXT_MUTED)
+                                    solid(p.text_muted)
                                 }),
                             )
                             .child(
@@ -157,9 +156,9 @@ pub fn render_header(
                                     .text_xs()
                                     .font_medium()
                                     .text_color(if is_active {
-                                        solid(TEXT_PRIMARY)
+                                        solid(p.text_primary)
                                     } else {
-                                        solid(TEXT_SECONDARY)
+                                        solid(p.text_secondary)
                                     })
                                     .child(title),
                             )
@@ -167,7 +166,7 @@ pub fn render_header(
                                 inner.child(
                                     Icon::new(LucideIcon::Columns2)
                                         .xsmall()
-                                        .text_color(solid(TEXT_MUTED)),
+                                        .text_color(solid(p.text_muted)),
                                 )
                             })
                             .child(
@@ -179,9 +178,9 @@ pub fn render_header(
                                     .items_center()
                                     .justify_center()
                                     .rounded(px(3.))
-                                    .text_color(solid(TEXT_MUTED))
-                                    .hover(|s| {
-                                        s.bg(solid(BG_HOVER)).text_color(solid(TEXT_PRIMARY))
+                                    .text_color(solid(p.text_muted))
+                                    .hover(move |s| {
+                                        s.bg(solid(p.bg_hover)).text_color(solid(p.text_primary))
                                     })
                                     .on_mouse_down(
                                         MouseButton::Left,
@@ -236,13 +235,13 @@ pub fn render_header(
                             .gap_1()
                             .rounded(px(RADIUS_CONTROL))
                             .cursor_pointer()
-                            .bg(soft_tint(accent.primary_hex(), 0.16))
+                            .bg(soft_tint(p.accent_primary, 0.16))
                             .border_1()
-                            .border_color(soft_tint(accent.primary_hex(), 0.35))
+                            .border_color(soft_tint(p.accent_primary, 0.35))
                             .text_size(px(11.))
                             .font_medium()
-                            .text_color(solid(accent.primary_hex()))
-                            .hover(move |s| s.bg(soft_tint(accent.primary_hex(), 0.24)))
+                            .text_color(solid(p.accent_primary))
+                            .hover(move |s| s.bg(soft_tint(p.accent_primary, 0.24)))
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.open_settings_modal(window, cx);
                             }))
@@ -250,6 +249,37 @@ pub fn render_header(
                             .child(label),
                     )
                 })
+                .child(
+                    div()
+                        .id("hdr-global-search")
+                        .h(px(26.))
+                        .px_2()
+                        .flex()
+                        .items_center()
+                        .gap_1p5()
+                        .rounded(px(RADIUS_CONTROL))
+                        .cursor_pointer()
+                        .bg(solid(p.bg_base))
+                        .border_1()
+                        .border_color(solid(p.border_subtle))
+                        .text_color(solid(p.text_secondary))
+                        .hover(move |s| {
+                            s.bg(solid(p.bg_hover))
+                                .border_color(solid(p.border))
+                                .text_color(solid(p.text_primary))
+                        })
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.open_global_search(window, cx);
+                        }))
+                        .child(Icon::new(LucideIcon::Search).xsmall())
+                        .child(div().text_xs().font_medium().child("Search"))
+                        .child(
+                            div()
+                                .text_size(px(10.))
+                                .text_color(solid(p.text_muted))
+                                .child("Ctrl+K"),
+                        ),
+                )
                 .child(
                     div()
                         .id("hdr-toggle-split")
@@ -261,20 +291,20 @@ pub fn render_header(
                         .rounded(px(RADIUS_CONTROL))
                         .cursor_pointer()
                         .bg(if split_active {
-                            soft_tint(accent.primary_hex(), 0.14)
+                            soft_tint(p.accent_primary, 0.14)
                         } else {
                             gpui_kit::transparent_black()
                         })
                         .text_color(if split_active {
-                            solid(accent.primary_hex())
+                            solid(p.accent_primary)
                         } else {
-                            solid(TEXT_SECONDARY)
+                            solid(p.text_secondary)
                         })
                         .hover(move |s| {
                             if split_active {
                                 s
                             } else {
-                                s.bg(solid(BG_HOVER)).text_color(solid(TEXT_PRIMARY))
+                                s.bg(solid(p.bg_hover)).text_color(solid(p.text_primary))
                             }
                         })
                         .on_click(cx.listener(|this, _, window, cx| {
@@ -305,10 +335,10 @@ pub fn render_header(
                 ),
         )
         // Native Windows window controls flush at the right edge
-        .child(render_window_controls(window))
+        .child(render_window_controls(window, p))
 }
 
-fn render_window_controls(window: &Window) -> impl IntoElement {
+fn render_window_controls(window: &Window, p: Palette) -> impl IntoElement {
     let max_icon = if window.is_maximized() {
         IconName::WindowRestore
     } else {
@@ -324,18 +354,21 @@ fn render_window_controls(window: &Window) -> impl IntoElement {
             IconName::WindowMinimize,
             WindowControlArea::Min,
             false,
+            p,
         ))
         .child(window_control_btn(
             "win-max",
             max_icon,
             WindowControlArea::Max,
             false,
+            p,
         ))
         .child(window_control_btn(
             "win-close",
             IconName::WindowClose,
             WindowControlArea::Close,
             true,
+            p,
         ))
 }
 
@@ -344,6 +377,7 @@ fn window_control_btn(
     icon: IconName,
     area: WindowControlArea,
     is_close: bool,
+    p: Palette,
 ) -> impl IntoElement {
     div()
         .id(id)
@@ -354,12 +388,12 @@ fn window_control_btn(
         .items_center()
         .justify_center()
         .cursor_pointer()
-        .text_color(solid(TEXT_MUTED))
+        .text_color(solid(p.text_muted))
         .hover(move |s| {
             if is_close {
-                s.bg(solid(STATUS_ERROR)).text_color(solid(BG_BASE))
+                s.bg(solid(p.status_error)).text_color(solid(p.danger_fg))
             } else {
-                s.bg(solid(BG_HOVER)).text_color(solid(TEXT_PRIMARY))
+                s.bg(solid(p.bg_hover)).text_color(solid(p.text_primary))
             }
         })
         .window_control_area(area)

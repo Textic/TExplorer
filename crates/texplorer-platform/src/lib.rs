@@ -6,6 +6,7 @@ pub mod default_explorer;
 pub mod elevation;
 pub mod launch;
 pub mod single_instance;
+pub mod theme_detect;
 pub mod volumes;
 pub mod watcher;
 
@@ -24,5 +25,6 @@ pub use single_instance::{
     LaunchIntent, SingleInstanceGuard, parse_cli_args, start_single_instance_server,
     try_forward_to_running_instance,
 };
+pub use theme_detect::system_prefers_dark_mode;
 pub use volumes::{list_known_folders, list_volumes, list_wsl_distros};
 pub use watcher::{DirectoryWatcher, WatchEvent};

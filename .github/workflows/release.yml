@@ -109,9 +109,10 @@ jobs:
         shell: pwsh
         run: |
           cargo test --workspace --target x86_64-pc-windows-msvc
-          cargo build --release -p texplorer-app --target x86_64-pc-windows-msvc
+          cargo build --release -p texplorer-app -p texplorer-service --target x86_64-pc-windows-msvc
           & .\packaging\windows\build-setup.ps1 `
             -BinaryPath "target\x86_64-pc-windows-msvc\release\texplorer.exe" `
+            -ServiceBinaryPath "target\x86_64-pc-windows-msvc\release\texplorer-service.exe" `
             -Version "${{ needs.prepare.outputs.version }}" `
             -Tag "${{ needs.prepare.outputs.tag }}" `
             -OutDir "dist"

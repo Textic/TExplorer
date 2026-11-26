@@ -10,5 +10,5 @@ pub use entry::{
     ViewMode, VolumeInfo, classify_extension, sort_entries,
 };
 pub use location::{BreadcrumbSegment, Location, SearchScope};
-pub use settings::{AccentPreset, AppSettings, SizeUnit};
+pub use settings::{AccentPreset, AppSettings, SizeUnit, ThemePreset};
 pub use workspace_model::{PaneModel, PaneSide, SelectionSet, TabModel};

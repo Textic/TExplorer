@@ -13,30 +13,165 @@ use gpui_kit::{
     prelude::*,
     px, rgb,
 };
-use texplorer_core::{AccentPreset, DriveKind, FileKind, KnownFolderKind, SizeUnit};
-
-// Obsidian Dark (Neutral Carbon Black) strict flat surface palette
-pub const BG_BASE: u32 = 0x09090b;
-pub const BG_SURFACE: u32 = 0x111113;
-pub const BG_ELEVATED: u32 = 0x18181b;
-pub const BG_HOVER: u32 = 0x202024;
-pub const BORDER_SUBTLE: u32 = 0x27272a;
-pub const BORDER: u32 = 0x323236;
-
-pub const TEXT_PRIMARY: u32 = 0xf4f4f5;
-pub const TEXT_SECONDARY: u32 = 0xa1a1aa;
-pub const TEXT_MUTED: u32 = 0x71717a;
-
-// Flat semantic status colors
-pub const STATUS_SUCCESS: u32 = 0x34d399;
-pub const STATUS_WARNING: u32 = 0xfbbf24;
-pub const STATUS_ERROR: u32 = 0xf87171;
-pub const STATUS_INFO: u32 = 0x60a5fa;
-pub const STATUS_VIOLET: u32 = 0xa78bfa;
+use texplorer_core::{AccentPreset, DriveKind, FileKind, KnownFolderKind, SizeUnit, ThemePreset};
 
 pub const RADIUS_ROW: f32 = 6.;
 pub const RADIUS_CONTROL: f32 = 4.;
 pub const UI_REM_SIZE: f32 = 17.0;
+
+/// Resolved flat surface, text, semantic, accent, and syntax color palette.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Palette {
+    pub is_dark: bool,
+    pub bg_base: u32,
+    pub bg_surface: u32,
+    pub bg_elevated: u32,
+    pub bg_hover: u32,
+    pub border_subtle: u32,
+    pub border: u32,
+    pub resize_hover: u32,
+    pub text_primary: u32,
+    pub text_secondary: u32,
+    pub text_muted: u32,
+    pub accent_primary: u32,
+    pub accent_hover: u32,
+    pub accent_active: u32,
+    pub accent_fg: u32,
+    pub status_success: u32,
+    pub status_warning: u32,
+    pub status_error: u32,
+    pub status_info: u32,
+    pub status_violet: u32,
+    pub media_video: u32,
+    pub media_audio: u32,
+    pub syntax_keyword: u32,
+    pub syntax_string: u32,
+    pub syntax_comment: u32,
+    pub syntax_type: u32,
+    pub syntax_number: u32,
+    pub danger_hover: u32,
+    pub danger_active: u32,
+    pub danger_fg: u32,
+}
+
+impl Palette {
+    /// Backdrop scrim opacity tuned per luminance mode so modals feel balanced in dark & light.
+    #[inline]
+    pub fn backdrop_alpha(self) -> f32 {
+        if self.is_dark { 0.64 } else { 0.32 }
+    }
+}
+
+/// Resolves the active `Palette` from the chosen `ThemePreset`, `AccentPreset`, and OS mode.
+pub fn resolve_palette(theme: ThemePreset, accent: AccentPreset, system_is_dark: bool) -> Palette {
+    let is_dark = theme.resolves_dark(system_is_dark);
+    let accent_primary = accent.primary_hex_for(is_dark);
+    let accent_hover = accent.hover_hex_for(is_dark);
+    let accent_active = accent.active_hex_for(is_dark);
+    let accent_fg = accent.text_on_accent_hex_for(is_dark);
+
+    match (theme, is_dark) {
+        // Obsidian Dark (Neutral Carbon Black) flat surface palette
+        (ThemePreset::ObsidianDark, _) => Palette {
+            is_dark: true,
+            bg_base: 0x09090b,
+            bg_surface: 0x111113,
+            bg_elevated: 0x18181b,
+            bg_hover: 0x202024,
+            border_subtle: 0x27272a,
+            border: 0x323236,
+            resize_hover: 0x3f3f46,
+            text_primary: 0xf4f4f5,
+            text_secondary: 0xa1a1aa,
+            text_muted: 0x71717a,
+            accent_primary,
+            accent_hover,
+            accent_active,
+            accent_fg,
+            status_success: 0x34d399,
+            status_warning: 0xfbbf24,
+            status_error: 0xf87171,
+            status_info: 0x60a5fa,
+            status_violet: 0xa78bfa,
+            media_video: 0xf472b6,
+            media_audio: 0x38bdf8,
+            syntax_keyword: 0xa78bfa,
+            syntax_string: 0x34d399,
+            syntax_comment: 0x71717a,
+            syntax_type: 0x60a5fa,
+            syntax_number: 0xfbbf24,
+            danger_hover: 0xef4444,
+            danger_active: 0xdc2626,
+            danger_fg: 0x09090b,
+        },
+        // Fluent / WinUI 3 Files Dark palette (composited solid tokens from files-community/Files)
+        (_, true) => Palette {
+            is_dark: true,
+            bg_base: 0x282828,
+            bg_surface: 0x202020,
+            bg_elevated: 0x2c2c2c,
+            bg_hover: 0x363636,
+            border_subtle: 0x323232,
+            border: 0x424242,
+            resize_hover: 0x525252,
+            text_primary: 0xffffff,
+            text_secondary: 0xcecece,
+            text_muted: 0x9b9b9b,
+            accent_primary,
+            accent_hover,
+            accent_active,
+            accent_fg,
+            status_success: 0x6ccb5f,
+            status_warning: 0xfce100,
+            status_error: 0xff99a4,
+            status_info: 0x50c0ff,
+            status_violet: 0xc586c0,
+            media_video: 0xf472b6,
+            media_audio: 0x50c0ff,
+            syntax_keyword: 0xc586c0,
+            syntax_string: 0xce9178,
+            syntax_comment: 0x6a9955,
+            syntax_type: 0x9cdcfe,
+            syntax_number: 0xfce100,
+            danger_hover: 0xf87171,
+            danger_active: 0xef4444,
+            danger_fg: 0x1a1a1a,
+        },
+        // Fluent / WinUI 3 Files Light palette (composited solid tokens from files-community/Files)
+        (_, false) => Palette {
+            is_dark: false,
+            bg_base: 0xfafafa,
+            bg_surface: 0xf2f2f2,
+            bg_elevated: 0xffffff,
+            bg_hover: 0xeaeaea,
+            border_subtle: 0xe3e3e3,
+            border: 0xd1d1d1,
+            resize_hover: 0xb8b8b8,
+            text_primary: 0x1a1a1a,
+            text_secondary: 0x5f5f5f,
+            text_muted: 0x858585,
+            accent_primary,
+            accent_hover,
+            accent_active,
+            accent_fg,
+            status_success: 0x0f7b0f,
+            status_warning: 0x9d5d00,
+            status_error: 0xc42b1c,
+            status_info: 0x0070cb,
+            status_violet: 0xaf00db,
+            media_video: 0xc2185b,
+            media_audio: 0x0070cb,
+            syntax_keyword: 0xaf00db,
+            syntax_string: 0xa31515,
+            syntax_comment: 0x008000,
+            syntax_type: 0x0451a5,
+            syntax_number: 0x9d5d00,
+            danger_hover: 0xa82315,
+            danger_active: 0x8d1d12,
+            danger_fg: 0xffffff,
+        },
+    }
+}
 
 #[inline]
 pub fn solid(hex: u32) -> Hsla {
@@ -50,14 +185,15 @@ pub fn soft_tint(hex: u32, alpha: f32) -> Hsla {
 }
 
 /// Crisp 1px flat panel cut divider at rest; expands cleanly to 2px on hover or drag.
-pub fn crisp_resize_handle_appearance(accent: AccentPreset) -> ResizeHandleRenderer {
-    let accent_hex = accent.primary_hex();
+pub fn crisp_resize_handle_appearance(palette: Palette) -> ResizeHandleRenderer {
     Rc::new(move |handle: &ResizeHandleContext, _, _| {
         let axis = handle.axis();
         let (color, thick) = match handle.state() {
-            ResizeHandleState::Idle => (solid(BORDER_SUBTLE), false),
-            ResizeHandleState::Hovered => (solid(0x3f3f46), true),
-            ResizeHandleState::Pressed | ResizeHandleState::Dragging => (solid(accent_hex), true),
+            ResizeHandleState::Idle => (solid(palette.border_subtle), false),
+            ResizeHandleState::Hovered => (solid(palette.resize_hover), true),
+            ResizeHandleState::Pressed | ResizeHandleState::Dragging => {
+                (solid(palette.accent_primary), true)
+            }
         };
 
         Some(
@@ -75,9 +211,18 @@ pub fn crisp_resize_handle_appearance(accent: AccentPreset) -> ResizeHandleRende
     })
 }
 
-/// Applies the Obsidian Dark strict flat theme with zero shadows and zero focus rings.
-pub fn apply_obsidian_theme(accent: AccentPreset, cx: &mut App) {
-    Theme::change(ThemeMode::Dark, None, cx);
+/// Applies the active flat theme palette (Files Dark, Files Light, or Obsidian Dark)
+/// with zero shadows and zero focus rings.
+pub fn apply_theme(p: Palette, cx: &mut App) {
+    Theme::change(
+        if p.is_dark {
+            ThemeMode::Dark
+        } else {
+            ThemeMode::Light
+        },
+        None,
+        cx,
+    );
     Theme::update(cx, |theme| {
         theme.shadow = false;
         theme.focus_ring = false;
@@ -86,22 +231,23 @@ pub fn apply_obsidian_theme(accent: AccentPreset, cx: &mut App) {
         theme.font_size = px(14.);
         theme.mono_font_size = px(12.);
 
-        let bg_base = solid(BG_BASE);
-        let bg_surface = solid(BG_SURFACE);
-        let bg_elevated = solid(BG_ELEVATED);
-        let bg_hover = solid(BG_HOVER);
-        let border = solid(BORDER_SUBTLE);
-        let fg = solid(TEXT_PRIMARY);
-        let fg_muted = solid(TEXT_SECONDARY);
+        let bg_base = solid(p.bg_base);
+        let bg_surface = solid(p.bg_surface);
+        let bg_elevated = solid(p.bg_elevated);
+        let bg_hover = solid(p.bg_hover);
+        let border = solid(p.border_subtle);
+        let fg = solid(p.text_primary);
+        let fg_muted = solid(p.text_secondary);
 
-        let primary = solid(accent.primary_hex());
-        let primary_hover = solid(accent.hover_hex());
-        let primary_active = solid(accent.active_hex());
-        let primary_fg = solid(accent.text_on_accent_hex());
+        let primary = solid(p.accent_primary);
+        let primary_hover = solid(p.accent_hover);
+        let primary_active = solid(p.accent_active);
+        let primary_fg = solid(p.accent_fg);
 
-        let danger = solid(STATUS_ERROR);
-        let danger_hover = solid(0xef4444);
-        let danger_active = solid(0xdc2626);
+        let danger = solid(p.status_error);
+        let danger_hover = solid(p.danger_hover);
+        let danger_active = solid(p.danger_active);
+        let danger_fg = solid(p.danger_fg);
 
         let c = &mut theme.colors;
         c.background = bg_base;
@@ -110,7 +256,7 @@ pub fn apply_obsidian_theme(accent: AccentPreset, cx: &mut App) {
         c.input = border;
         c.caret = primary;
         c.ring = primary;
-        c.selection = soft_tint(accent.primary_hex(), 0.22);
+        c.selection = soft_tint(p.accent_primary, if p.is_dark { 0.22 } else { 0.16 });
         c.drag_border = primary;
         c.drop_target = bg_hover;
 
@@ -147,11 +293,11 @@ pub fn apply_obsidian_theme(accent: AccentPreset, cx: &mut App) {
         c.danger = danger;
         c.danger_hover = danger_hover;
         c.danger_active = danger_active;
-        c.danger_foreground = solid(BG_BASE);
+        c.danger_foreground = danger_fg;
         c.button_danger = danger;
         c.button_danger_hover = danger_hover;
         c.button_danger_active = danger_active;
-        c.button_danger_foreground = solid(BG_BASE);
+        c.button_danger_foreground = danger_fg;
 
         c.popover = bg_elevated;
         c.popover_foreground = fg;
@@ -185,8 +331,8 @@ pub fn apply_obsidian_theme(accent: AccentPreset, cx: &mut App) {
         c.status_bar_border = border;
 
         c.scrollbar = bg_base;
-        c.scrollbar_thumb = solid(BORDER);
-        c.scrollbar_thumb_hover = solid(0x3f3f46);
+        c.scrollbar_thumb = solid(p.border);
+        c.scrollbar_thumb_hover = solid(p.resize_hover);
 
         c.switch = bg_hover;
         c.switch_thumb = fg;
@@ -219,18 +365,18 @@ pub fn full_hit_input(
 }
 
 /// Returns the semantic Lucide icon and flat accent color for a file category.
-pub fn file_kind_visual(kind: FileKind, accent: AccentPreset) -> (LucideIcon, u32) {
+pub fn file_kind_visual(kind: FileKind, p: Palette) -> (LucideIcon, u32) {
     match kind {
-        FileKind::Folder => (LucideIcon::Folder, accent.primary_hex()),
-        FileKind::Image => (LucideIcon::FileImage, STATUS_VIOLET),
-        FileKind::Video => (LucideIcon::Film, 0xf472b6),
-        FileKind::Audio => (LucideIcon::Music, 0x38bdf8),
-        FileKind::Code => (LucideIcon::FileCode, STATUS_INFO),
-        FileKind::Document => (LucideIcon::FileText, TEXT_PRIMARY),
-        FileKind::Archive => (LucideIcon::FileArchive, STATUS_WARNING),
-        FileKind::Executable => (LucideIcon::Package, STATUS_SUCCESS),
-        FileKind::Symlink => (LucideIcon::Link, STATUS_INFO),
-        FileKind::Other => (LucideIcon::File, TEXT_SECONDARY),
+        FileKind::Folder => (LucideIcon::Folder, p.accent_primary),
+        FileKind::Image => (LucideIcon::FileImage, p.status_violet),
+        FileKind::Video => (LucideIcon::Film, p.media_video),
+        FileKind::Audio => (LucideIcon::Music, p.media_audio),
+        FileKind::Code => (LucideIcon::FileCode, p.status_info),
+        FileKind::Document => (LucideIcon::FileText, p.text_primary),
+        FileKind::Archive => (LucideIcon::FileArchive, p.status_warning),
+        FileKind::Executable => (LucideIcon::Package, p.status_success),
+        FileKind::Symlink => (LucideIcon::Link, p.status_info),
+        FileKind::Other => (LucideIcon::File, p.text_secondary),
     }
 }
 
@@ -256,13 +402,13 @@ pub fn drive_kind_icon(kind: DriveKind) -> LucideIcon {
     }
 }
 
-pub fn usage_bar_color(fraction: f32, accent: AccentPreset) -> u32 {
+pub fn usage_bar_color(fraction: f32, p: Palette) -> u32 {
     if fraction >= 0.92 {
-        STATUS_ERROR
+        p.status_error
     } else if fraction >= 0.80 {
-        STATUS_WARNING
+        p.status_warning
     } else {
-        accent.primary_hex()
+        p.accent_primary
     }
 }
 

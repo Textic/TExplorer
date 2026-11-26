@@ -1,4 +1,5 @@
 pub mod context_menu;
+pub mod global_search;
 pub mod header;
 pub mod inspector;
 pub mod modals;
