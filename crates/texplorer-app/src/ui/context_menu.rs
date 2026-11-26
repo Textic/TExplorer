@@ -7,8 +7,10 @@ use gpui_kit::{
     div, prelude::*, px,
 };
 use texplorer_core::{
-    FileEntry, KnownFolder, KnownFolderKind, Location, PaneSide, SidebarSection, VolumeInfo,
+    FileEntry, KnownFolder, KnownFolderKind, Location, NetworkConnection, NetworkProtocol,
+    PaneSide, SidebarSection, VolumeInfo,
 };
+use uuid::Uuid;
 
 use crate::theme::{RADIUS_CONTROL, RADIUS_ROW, soft_tint, solid};
 use crate::ui::modals::SettingsCategory;
@@ -24,8 +26,14 @@ pub enum ContextMenuTarget {
         side: PaneSide,
         directory: PathBuf,
     },
+    RemotePaneBackground {
+        side: PaneSide,
+        connection_id: Uuid,
+        remote_path: String,
+    },
     KnownFolder(KnownFolder),
     Volume(VolumeInfo),
+    NetworkConnection(NetworkConnection),
     SidebarSection(SidebarSection),
     SidebarBackground,
 }
@@ -86,6 +94,17 @@ enum MenuAction {
     ToggleSidebarSectionCollapsed(SidebarSection),
     HideSidebarSection(SidebarSection),
     OpenSidebarSettings,
+    SendViaP2p(Vec<PathBuf>),
+    OpenNetworkConn(Box<NetworkConnection>, bool),
+    OpenNetworkConnSplit(Box<NetworkConnection>),
+    OpenSshTerminal(Box<NetworkConnection>),
+    EditNetworkConn(Box<NetworkConnection>),
+    DisconnectNetworkConn(Box<NetworkConnection>),
+    RemoveNetworkConn(Uuid),
+    DownloadRemoteEntry(PaneSide, Uuid, String, String),
+    RemoteNewFolder(PaneSide, Uuid, String),
+    RemoteRenameEntry(PaneSide, Uuid, String, String),
+    RemoteDeleteEntry(PaneSide, Uuid, String, bool),
 }
 
 /// Renders the flat floating context menu clamped cleanly inside the viewport.
@@ -387,6 +406,14 @@ fn build_rows(ws: &Workspace, target: &ContextMenuTarget) -> Vec<MenuRow> {
                     action: MenuAction::CompressToZip(*side),
                 });
                 rows.push(MenuRow::Item {
+                    id: "ctx-send-p2p",
+                    label: "Send via P2P...".into(),
+                    shortcut: None,
+                    icon: MenuIcon::Lucide(LucideIcon::Send),
+                    danger: false,
+                    action: MenuAction::SendViaP2p(selected_paths.clone()),
+                });
+                rows.push(MenuRow::Item {
                     id: "ctx-copy-path",
                     label: "Copy Path".into(),
                     shortcut: None,
@@ -511,6 +538,122 @@ fn build_rows(ws: &Workspace, target: &ContextMenuTarget) -> Vec<MenuRow> {
                     icon: MenuIcon::Lucide(LucideIcon::Link),
                     danger: false,
                     action: MenuAction::CopyPath(entry.location.display_path()),
+                });
+            } else if let Location::Remote {
+                connection_id,
+                remote_path,
+                ..
+            } = &entry.location
+            {
+                rows.push(MenuRow::Separator);
+                if !is_dir {
+                    rows.push(MenuRow::Item {
+                        id: "ctx-rem-download",
+                        label: "Download to Local".into(),
+                        shortcut: None,
+                        icon: MenuIcon::Lucide(LucideIcon::Download),
+                        danger: false,
+                        action: MenuAction::DownloadRemoteEntry(
+                            *side,
+                            *connection_id,
+                            remote_path.clone(),
+                            entry.name.clone(),
+                        ),
+                    });
+                }
+                rows.push(MenuRow::Item {
+                    id: "ctx-rem-rename",
+                    label: "Rename".into(),
+                    shortcut: Some("F2"),
+                    icon: MenuIcon::Lucide(LucideIcon::Pencil),
+                    danger: false,
+                    action: MenuAction::RemoteRenameEntry(
+                        *side,
+                        *connection_id,
+                        remote_path.clone(),
+                        entry.name.clone(),
+                    ),
+                });
+                rows.push(MenuRow::Item {
+                    id: "ctx-rem-copy-path",
+                    label: "Copy Remote Path".into(),
+                    shortcut: None,
+                    icon: MenuIcon::Lucide(LucideIcon::Link),
+                    danger: false,
+                    action: MenuAction::CopyPath(remote_path.clone()),
+                });
+                rows.push(MenuRow::Separator);
+                rows.push(MenuRow::Item {
+                    id: "ctx-rem-delete",
+                    label: if is_dir {
+                        "Delete Empty Folder"
+                    } else {
+                        "Delete Remote File"
+                    }
+                    .into(),
+                    shortcut: Some("Del"),
+                    icon: MenuIcon::Kit(IconName::Delete),
+                    danger: true,
+                    action: MenuAction::RemoteDeleteEntry(
+                        *side,
+                        *connection_id,
+                        remote_path.clone(),
+                        is_dir,
+                    ),
+                });
+            }
+            rows
+        }
+        ContextMenuTarget::RemotePaneBackground {
+            side,
+            connection_id,
+            remote_path,
+        } => {
+            let mut rows = vec![
+                MenuRow::Item {
+                    id: "ctx-rem-bg-mkdir",
+                    label: "New Remote Folder".into(),
+                    shortcut: Some("Ctrl+Shift+N"),
+                    icon: MenuIcon::Lucide(LucideIcon::FolderPlus),
+                    danger: false,
+                    action: MenuAction::RemoteNewFolder(*side, *connection_id, remote_path.clone()),
+                },
+                MenuRow::Item {
+                    id: "ctx-rem-bg-refresh",
+                    label: "Refresh".into(),
+                    shortcut: Some("F5"),
+                    icon: MenuIcon::Lucide(LucideIcon::RefreshCw),
+                    danger: false,
+                    action: MenuAction::RefreshPane(*side),
+                },
+                MenuRow::Item {
+                    id: "ctx-rem-bg-copy",
+                    label: "Copy Remote Path".into(),
+                    shortcut: None,
+                    icon: MenuIcon::Lucide(LucideIcon::Copy),
+                    danger: false,
+                    action: MenuAction::CopyPath(remote_path.clone()),
+                },
+            ];
+            if let Some(conn) = ws.settings.network_connection(*connection_id).cloned() {
+                rows.push(MenuRow::Separator);
+                if conn.protocol == NetworkProtocol::Sftp {
+                    rows.push(MenuRow::Item {
+                        id: "ctx-rem-bg-ssh",
+                        label: "Open SSH Terminal".into(),
+                        shortcut: None,
+                        icon: MenuIcon::Lucide(LucideIcon::Terminal),
+                        danger: false,
+                        action: MenuAction::OpenSshTerminal(Box::new(conn.clone())),
+                    });
+                }
+                rows.push(MenuRow::Item {
+                    id: "ctx-rem-bg-disconnect",
+                    label: "Disconnect".into(),
+                    shortcut: None,
+                    icon: MenuIcon::Lucide(LucideIcon::Unplug),
+                    danger: false,
+                    action: MenuAction::DisconnectNetworkConn(Box::new(conn)),
                 });
             }
             rows
@@ -716,6 +859,82 @@ fn build_rows(ws: &Workspace, target: &ContextMenuTarget) -> Vec<MenuRow> {
             ]);
             rows
         }
+        ContextMenuTarget::NetworkConnection(conn) => {
+            let mut rows = vec![MenuRow::Item {
+                id: "ctx-net-open",
+                label: "Connect & Open".into(),
+                shortcut: None,
+                icon: MenuIcon::Lucide(LucideIcon::FolderOpen),
+                danger: false,
+                action: MenuAction::OpenNetworkConn(Box::new(conn.clone()), false),
+            }];
+            if ws.settings.show_tabs {
+                rows.push(MenuRow::Item {
+                    id: "ctx-net-tab",
+                    label: "Open in New Tab".into(),
+                    shortcut: None,
+                    icon: MenuIcon::Lucide(LucideIcon::Plus),
+                    danger: false,
+                    action: MenuAction::OpenNetworkConn(Box::new(conn.clone()), true),
+                });
+            }
+            rows.push(MenuRow::Item {
+                id: "ctx-net-split",
+                label: "Open in Split Pane".into(),
+                shortcut: None,
+                icon: MenuIcon::Lucide(LucideIcon::Columns2),
+                danger: false,
+                action: MenuAction::OpenNetworkConnSplit(Box::new(conn.clone())),
+            });
+            if conn.protocol == NetworkProtocol::Sftp {
+                rows.push(MenuRow::Separator);
+                rows.push(MenuRow::Item {
+                    id: "ctx-net-ssh-term",
+                    label: "Open SSH Terminal".into(),
+                    shortcut: None,
+                    icon: MenuIcon::Lucide(LucideIcon::Terminal),
+                    danger: false,
+                    action: MenuAction::OpenSshTerminal(Box::new(conn.clone())),
+                });
+            }
+            rows.push(MenuRow::Separator);
+            rows.push(MenuRow::Item {
+                id: "ctx-net-edit",
+                label: "Edit Connection...".into(),
+                shortcut: None,
+                icon: MenuIcon::Lucide(LucideIcon::Pencil),
+                danger: false,
+                action: MenuAction::EditNetworkConn(Box::new(conn.clone())),
+            });
+            if ws.is_network_connected(conn.id) || conn.protocol == NetworkProtocol::Smb {
+                rows.push(MenuRow::Item {
+                    id: "ctx-net-disconnect",
+                    label: "Disconnect".into(),
+                    shortcut: None,
+                    icon: MenuIcon::Lucide(LucideIcon::Unplug),
+                    danger: false,
+                    action: MenuAction::DisconnectNetworkConn(Box::new(conn.clone())),
+                });
+            }
+            rows.push(MenuRow::Item {
+                id: "ctx-net-remove",
+                label: "Remove from Network".into(),
+                shortcut: None,
+                icon: MenuIcon::Kit(IconName::Delete),
+                danger: true,
+                action: MenuAction::RemoveNetworkConn(conn.id),
+            });
+            rows.push(MenuRow::Separator);
+            rows.push(MenuRow::Item {
+                id: "ctx-net-customize",
+                label: "Customize Sidebar...".into(),
+                shortcut: None,
+                icon: MenuIcon::Lucide(LucideIcon::Settings),
+                danger: false,
+                action: MenuAction::OpenSidebarSettings,
+            });
+            rows
+        }
         ContextMenuTarget::SidebarSection(section) => {
             let collapsed = ws.settings.is_sidebar_section_collapsed(*section);
             vec![
@@ -816,6 +1035,39 @@ fn execute_action(
         MenuAction::HideSidebarSection(sec) => ws.toggle_sidebar_section_visible(sec, cx),
         MenuAction::OpenSidebarSettings => {
             ws.open_settings_category(SettingsCategory::Interface, window, cx);
+        }
+        MenuAction::SendViaP2p(paths) => {
+            ws.open_p2p_send_modal(paths, window, cx);
+        }
+        MenuAction::OpenNetworkConn(conn, new_tab) => {
+            ws.open_network_connection(*conn, new_tab, window, cx);
+        }
+        MenuAction::OpenNetworkConnSplit(conn) => {
+            ws.open_network_connection_in_split(*conn, window, cx);
+        }
+        MenuAction::OpenSshTerminal(conn) => {
+            ws.open_ssh_terminal(&conn, cx);
+        }
+        MenuAction::EditNetworkConn(conn) => {
+            ws.open_network_connect_modal(Some(*conn), None, window, cx);
+        }
+        MenuAction::DisconnectNetworkConn(conn) => {
+            ws.disconnect_network_connection(*conn, cx);
+        }
+        MenuAction::RemoveNetworkConn(id) => {
+            ws.remove_network_connection(id, cx);
+        }
+        MenuAction::DownloadRemoteEntry(side, conn_id, remote_path, name) => {
+            ws.download_remote_file_to_local(side, conn_id, remote_path, name, window, cx);
+        }
+        MenuAction::RemoteNewFolder(side, conn_id, parent_remote) => {
+            ws.open_remote_new_folder_prompt(side, conn_id, parent_remote, window, cx);
+        }
+        MenuAction::RemoteRenameEntry(side, conn_id, remote_path, current_name) => {
+            ws.open_remote_rename_prompt(side, conn_id, remote_path, current_name, window, cx);
+        }
+        MenuAction::RemoteDeleteEntry(side, conn_id, remote_path, is_dir) => {
+            ws.delete_remote_entry(side, conn_id, remote_path, is_dir, cx);
         }
     }
 }

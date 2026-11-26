@@ -1,0 +1,21 @@
+[package]
+name = "texplorer-net"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Network VFS protocols (SSH/SFTP, FTP/FTPS) and encrypted Internet+LAN P2P file transfer (iroh QUIC) for T Explorer"
+
+[dependencies]
+base64.workspace = true
+chrono.workspace = true
+iroh.workspace = true
+russh.workspace = true
+russh-sftp.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+suppaftp.workspace = true
+texplorer-core = { path = "../texplorer-core" }
+tokio.workspace = true
+uuid.workspace = true

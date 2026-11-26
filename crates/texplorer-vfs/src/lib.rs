@@ -23,6 +23,9 @@ pub fn list_location(location: &Location) -> Result<Vec<FileEntry>, String> {
             archive_path,
             inner_path,
         } => archive::list_archive_dir(archive_path, inner_path),
+        Location::Remote { .. } => {
+            Err("Remote network locations must be listed through texplorer-net.".to_string())
+        }
         Location::Search { query, scope } => {
             let cancel = AtomicBool::new(false);
             search::execute_search(query, scope, true, 1_000, &cancel).map(|res| res.entries)

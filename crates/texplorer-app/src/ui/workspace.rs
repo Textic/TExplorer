@@ -20,16 +20,22 @@ use gpui_kit::{
     },
     div, prelude::*, px,
 };
+use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use texplorer_core::{
     AccentPreset, AppSession, AppSettings, FileEntry, FileKind, KnownFolder, KnownFolderKind,
-    Location, PaneSide, SavedPaneState, SavedTabState, SearchScope, SidebarSection, SizeUnit,
-    SortColumn, SortSpec, TabModel, ThemePreset, ViewMode, VolumeInfo, WindowGeometry,
-    sort_entries,
+    Location, NetworkConnection, NetworkProtocol, PaneSide, ParsedNetworkUri, SavedPaneState,
+    SavedTabState, SearchScope, SidebarSection, SizeUnit, SortColumn, SortSpec, SshAuthMode,
+    TabModel, ThemePreset, ViewMode, VolumeInfo, WindowGeometry, join_remote_path,
+    normalize_remote_path, normalize_smb_share_path, parse_network_uri, sort_entries,
 };
 use texplorer_mft::{
     IndexServiceInstallState, IndexServiceStatus, install_service_elevated,
     query_live_service_status, query_service_install_state, rebuild_index_via_service,
     start_service_elevated, uninstall_service_elevated,
+};
+use texplorer_net::{
+    ActiveP2pShare, IncomingP2pOffer, NearbyPeer, P2pDirection, P2pEvent, P2pService,
+    RemoteClientPool, RemoteCredentials, decode_ticket,
 };
 use texplorer_ops::{
     BulkRenameSpec, ConflictDecision, ConflictPrompt, ConflictResolution, RenameCasing,
@@ -38,13 +44,16 @@ use texplorer_ops::{
     unique_keep_both_path,
 };
 use texplorer_platform::{
-    DefaultExplorerStatus, DirectoryWatcher, FileLockStatus, LaunchIntent, ShellWorker,
-    VideoNotify, VideoPlayerHandle, VideoStartOptions, bring_current_process_window_to_front,
-    cursor_screen_pos, delete_permanently, enable_default_explorer, get_clipboard_files,
-    inspect_file_lock, list_known_folders, list_volumes, list_wsl_distros, move_to_trash,
+    DefaultExplorerStatus, DirectoryWatcher, FileLockStatus, LaunchIntent, NativeDropEvent,
+    ShellWorker, VideoNotify, VideoPlayerHandle, VideoStartOptions,
+    bring_current_process_window_to_front, connect_smb_share, cursor_screen_pos,
+    delete_network_password, delete_permanently, disconnect_smb_share, enable_default_explorer,
+    get_clipboard_files, inspect_file_lock, install_native_drop_target, is_elevated,
+    list_known_folders, list_volumes, list_wsl_distros, load_network_password, move_to_trash,
     open_in_editor, open_item, open_terminal_here, query_default_explorer_status,
-    restore_windows_explorer, reveal_in_windows_explorer, set_clipboard_files,
-    set_win_e_interception, spawn_video_player, system_prefers_dark_mode,
+    restore_windows_explorer, reveal_in_windows_explorer, save_network_password,
+    set_clipboard_files, set_win_e_interception, spawn_as_desktop_user, spawn_video_player,
+    system_prefers_dark_mode,
 };
 use texplorer_vfs::archive::{
     compress_to_zip, extract_archive_all, extract_archive_entries, is_supported_archive,
@@ -56,7 +65,7 @@ use uuid::Uuid;
 
 use crate::preview::{
     PreviewPayload, ThumbnailCache, ThumbnailKey, load_archive_entry_preview_blocking,
-    load_preview_blocking, raw_bgra_to_render_image,
+    load_preview_blocking, preview_from_remote_bytes, raw_bgra_to_render_image,
 };
 use crate::theme::{
     Palette, RADIUS_ROW, apply_theme, crisp_resize_handle_appearance, resolve_palette, solid,
@@ -71,6 +80,9 @@ use crate::ui::global_search::{GlobalSearchState, render_global_search_modal};
 use crate::ui::header::render_header;
 use crate::ui::inspector::{HashInspectState, render_inspector};
 use crate::ui::modals::{ActiveModal, SettingsCategory, TextPromptKind, render_active_modal};
+use crate::ui::network::{
+    ActiveP2pTransferUi, NetworkConnectModalState, P2pModalState, P2pModalTab, render_p2p_overlays,
+};
 use crate::ui::pane::render_pane;
 use crate::ui::quicklook::render_quicklook_modal;
 use crate::ui::sidebar::render_sidebar;
@@ -207,6 +219,27 @@ enum BgEvent {
         install_state: IndexServiceInstallState,
         live_status: Option<IndexServiceStatus>,
     },
+    NetworkTestFinished {
+        result: Result<String, String>,
+    },
+    SmbConnectFinished {
+        unc: String,
+        new_tab: bool,
+        in_split: bool,
+        result: Result<String, String>,
+    },
+    RemoteOpFinished {
+        result: Result<Option<String>, String>,
+        refresh_side: Option<PaneSide>,
+    },
+    RemoteFileOpened {
+        result: Result<PathBuf, String>,
+    },
+    P2pShareCreated {
+        result: Result<ActiveP2pShare, String>,
+    },
+    P2p(P2pEvent),
+    NativeDrop(NativeDropEvent),
 }
 
 #[derive(Clone, Copy)]
@@ -248,6 +281,8 @@ pub struct VideoPlaybackState {
 pub struct TransferJobState {
     pub snapshot: TransferSnapshot,
     pub control: Arc<TransferControl>,
+    pub sources: Vec<PathBuf>,
+    pub cleanup_stage_dir: Option<PathBuf>,
 }
 
 /// UI-bound state for a single explorer pane.
@@ -342,6 +377,8 @@ pub struct Workspace {
     command_palette_subs: Vec<Subscription>,
     folder_size_cache: HashMap<PathBuf, u64>,
     folder_size_cancels: HashMap<(Uuid, PaneSide), Arc<AtomicBool>>,
+    fresh_disk_size_dirs: HashMap<PathBuf, Instant>,
+    pub native_drop_hover_side: Option<PaneSide>,
     pub quicklook_open: bool,
     pub preview_location: Option<Location>,
     pub preview_payload: PreviewPayload,
@@ -374,6 +411,14 @@ pub struct Workspace {
     pub marquee: Option<MarqueeSelection>,
     pub column_resize: Option<ColumnResizeState>,
     entry_claimed_mouse_down: bool,
+    remote_pool: RemoteClientPool,
+    session_passwords: HashMap<Uuid, String>,
+    p2p_service: P2pService,
+    pub p2p_device_name: String,
+    pub p2p_nearby_peers: Vec<NearbyPeer>,
+    pub active_p2p_share: Option<ActiveP2pShare>,
+    pub incoming_p2p_offers: Vec<IncomingP2pOffer>,
+    pub active_p2p_transfers: Vec<ActiveP2pTransferUi>,
     bg_tx: UnboundedSender<BgEvent>,
 }
 
@@ -402,6 +447,18 @@ impl Workspace {
         let default_explorer_status = query_default_explorer_status();
         let service_install_state = query_service_install_state();
         let shell_worker = ShellWorker::spawn();
+        let p2p_device_name = std::env::var("COMPUTERNAME")
+            .or_else(|_| std::env::var("HOSTNAME"))
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| "TExplorer-PC".to_string());
+        let p2p_tx = bg_tx.clone();
+        let p2p_service = {
+            let _rt_guard = tokio_runtime().enter();
+            P2pService::start(p2p_device_name.clone(), move |ev| {
+                let _ = p2p_tx.unbounded_send(BgEvent::P2p(ev));
+            })
+        };
 
         let explicit_launch = match initial_intent {
             LaunchIntent::OpenLocation(path) => Some((Location::local(path), None)),
@@ -459,6 +516,8 @@ impl Workspace {
             command_palette_subs: Vec::new(),
             folder_size_cache: HashMap::new(),
             folder_size_cancels: HashMap::new(),
+            fresh_disk_size_dirs: HashMap::new(),
+            native_drop_hover_side: None,
             quicklook_open: false,
             preview_location: None,
             preview_payload: PreviewPayload::Loading,
@@ -491,6 +550,14 @@ impl Workspace {
             marquee: None,
             column_resize: None,
             entry_claimed_mouse_down: false,
+            remote_pool: RemoteClientPool::new(),
+            session_passwords: HashMap::new(),
+            p2p_service,
+            p2p_device_name,
+            p2p_nearby_peers: Vec::new(),
+            active_p2p_share: None,
+            incoming_p2p_offers: Vec::new(),
+            active_p2p_transfers: Vec::new(),
             bg_tx,
         };
 
@@ -521,6 +588,15 @@ impl Workspace {
         } else if !restored {
             ws.open_tab_with_selection(Location::Home, None, window, cx);
         }
+        if let Ok(wh) = HasWindowHandle::window_handle(window)
+            && let RawWindowHandle::Win32(win32) = wh.as_raw()
+        {
+            let drop_tx = ws.bg_tx.clone();
+            let _ = install_native_drop_target(win32.hwnd.get(), move |ev| {
+                let _ = drop_tx.unbounded_send(BgEvent::NativeDrop(ev));
+            });
+        }
+
         ws.refresh_service_status(cx);
         if ws.settings.auto_check_updates {
             ws.check_for_updates(false, cx);
@@ -956,12 +1032,24 @@ impl Workspace {
                         status,
                         TransferStatus::Completed | TransferStatus::Cancelled
                     );
+                    let mut job_sources: Vec<PathBuf> = Vec::new();
+                    let mut stage_to_clean: Option<PathBuf> = None;
                     if let Some(job) = self
                         .transfers
                         .iter_mut()
                         .find(|j| j.snapshot.job_id == job_id)
                     {
                         job.snapshot = snapshot;
+                        job_sources = job.sources.clone();
+                        stage_to_clean = job.cleanup_stage_dir.take();
+                    }
+                    if let Some(stage_dir) = stage_to_clean {
+                        tokio_runtime().spawn(async move {
+                            let _ = tokio::task::spawn_blocking(move || {
+                                let _ = std::fs::remove_dir_all(&stage_dir);
+                            })
+                            .await;
+                        });
                     }
                     if let Some(undo) = undo_action {
                         self.undo_history.push(undo);
@@ -969,8 +1057,31 @@ impl Workspace {
                     if kind == TransferKind::Move && matches!(status, TransferStatus::Completed) {
                         self.cut_paths.clear();
                     }
-                    self.invalidate_folder_sizes_under(&target_dir);
-                    self.refresh_panes_showing(&target_dir, cx);
+                    let mut dirs_to_refresh: Vec<PathBuf> = vec![target_dir.clone()];
+                    if let Some(parent) = target_dir.parent() {
+                        dirs_to_refresh.push(parent.to_path_buf());
+                    }
+                    self.mark_fresh_disk_sizes(&target_dir);
+                    if let Some(parent) = target_dir.parent() {
+                        self.mark_fresh_disk_sizes(parent);
+                    }
+                    for src in &job_sources {
+                        if let Some(name) = src.file_name() {
+                            let dest_item = target_dir.join(name);
+                            self.mark_fresh_disk_sizes(&dest_item);
+                            self.invalidate_folder_sizes_under(&dest_item);
+                        }
+                        if let Some(src_parent) = src.parent() {
+                            self.mark_fresh_disk_sizes(src_parent);
+                            if !dirs_to_refresh.iter().any(|d| paths_same(d, src_parent)) {
+                                dirs_to_refresh.push(src_parent.to_path_buf());
+                            }
+                        }
+                    }
+                    for dir in &dirs_to_refresh {
+                        self.invalidate_folder_sizes_under(dir);
+                        self.refresh_panes_showing(dir, cx);
+                    }
                     if let TransferStatus::Failed(err) = status {
                         self.show_toast(err, ToastKind::Error, window, cx);
                     }
@@ -1020,7 +1131,9 @@ impl Workspace {
                     self.folder_size_cache.clear();
                 }
                 for (path, bytes) in &sizes {
-                    self.folder_size_cache.insert(path.clone(), *bytes);
+                    if !self.is_path_under_active_transfer(path) {
+                        self.folder_size_cache.insert(path.clone(), *bytes);
+                    }
                 }
                 if let Some(tab) = self.tabs.iter_mut().find(|t| t.model.id == tab_id) {
                     let pane = tab.model.pane_mut(side);
@@ -1096,6 +1209,380 @@ impl Workspace {
                 }
                 cx.notify();
             }
+            BgEvent::NetworkTestFinished { result } => {
+                if let Some(ActiveModal::NetworkConnect(ref mut form)) = self.active_modal {
+                    form.busy = false;
+                    match result {
+                        Ok(msg) => {
+                            form.status_message = Some(msg);
+                            form.status_is_error = false;
+                        }
+                        Err(err) => {
+                            form.status_message = Some(err);
+                            form.status_is_error = true;
+                        }
+                    }
+                    cx.notify();
+                }
+            }
+            BgEvent::SmbConnectFinished {
+                unc,
+                new_tab,
+                in_split,
+                result,
+            } => match result {
+                Ok(connected_unc) => {
+                    let target = Location::local(connected_unc);
+                    if in_split {
+                        self.open_in_opposite_pane(target, window, cx);
+                    } else if new_tab && self.settings.show_tabs {
+                        self.open_new_tab(target, window, cx);
+                    } else {
+                        self.navigate_active_pane(target, window, cx);
+                    }
+                }
+                Err(err) => {
+                    self.show_toast(format!("{unc}: {err}"), ToastKind::Error, window, cx);
+                }
+            },
+            BgEvent::RemoteOpFinished {
+                result,
+                refresh_side,
+            } => {
+                match result {
+                    Ok(Some(msg)) => self.show_toast(msg, ToastKind::Success, window, cx),
+                    Ok(None) => {}
+                    Err(err) => self.show_toast(err, ToastKind::Error, window, cx),
+                }
+                if let Some(side) = refresh_side {
+                    self.refresh_pane(side, window, cx);
+                }
+                cx.notify();
+            }
+            BgEvent::RemoteFileOpened { result } => match result {
+                Ok(local_cache_path) => {
+                    let tx = self.bg_tx.clone();
+                    tokio_runtime().spawn(async move {
+                        let res = tokio::task::spawn_blocking(move || {
+                            open_item(&local_cache_path).map(|()| None)
+                        })
+                        .await
+                        .unwrap_or_else(|e| Err(format!("Failed opening downloaded file: {e}")));
+                        let _ = tx.unbounded_send(BgEvent::ShellOpFinished {
+                            result: res,
+                            refresh_side: None,
+                        });
+                    });
+                }
+                Err(err) => self.show_toast(err, ToastKind::Error, window, cx),
+            },
+            BgEvent::P2pShareCreated { result } => {
+                if let Some(ActiveModal::P2p(ref mut modal)) = self.active_modal {
+                    modal.generating_share = false;
+                    match result {
+                        Ok(share) => {
+                            modal.error = None;
+                            self.active_p2p_share = Some(share);
+                        }
+                        Err(err) => {
+                            modal.error = Some(err);
+                        }
+                    }
+                    cx.notify();
+                } else if let Ok(share) = result {
+                    self.active_p2p_share = Some(share);
+                    cx.notify();
+                }
+            }
+            BgEvent::P2p(ev) => match ev {
+                P2pEvent::EndpointReady { .. } => {
+                    cx.notify();
+                }
+                P2pEvent::EndpointError(err) => {
+                    self.show_toast(err, ToastKind::Error, window, cx);
+                }
+                P2pEvent::PeersUpdated(peers) => {
+                    self.p2p_nearby_peers = peers;
+                    cx.notify();
+                }
+                P2pEvent::IncomingOffer(offer) => {
+                    self.incoming_p2p_offers.push(offer);
+                    cx.notify();
+                }
+                P2pEvent::TransferProgress {
+                    transfer_id,
+                    direction,
+                    peer_name,
+                    summary,
+                    current_file,
+                    bytes_transferred,
+                    total_bytes,
+                } => {
+                    if let Some(existing) = self
+                        .active_p2p_transfers
+                        .iter_mut()
+                        .find(|t| t.transfer_id == transfer_id)
+                    {
+                        existing.current_file = current_file;
+                        existing.bytes_transferred = bytes_transferred;
+                        existing.total_bytes = total_bytes;
+                    } else {
+                        self.active_p2p_transfers.push(ActiveP2pTransferUi {
+                            transfer_id,
+                            direction,
+                            peer_name,
+                            summary,
+                            current_file,
+                            bytes_transferred,
+                            total_bytes,
+                        });
+                    }
+                    cx.notify();
+                }
+                P2pEvent::TransferFinished {
+                    transfer_id,
+                    direction,
+                    peer_name,
+                    summary,
+                    dest_dir,
+                    result,
+                } => {
+                    self.active_p2p_transfers
+                        .retain(|t| t.transfer_id != transfer_id);
+                    match result {
+                        Ok(_) => {
+                            let msg = match direction {
+                                P2pDirection::Send => {
+                                    format!("Sent {summary} to {peer_name} via P2P")
+                                }
+                                P2pDirection::Receive => {
+                                    format!("Received {summary} from {peer_name}")
+                                }
+                            };
+                            self.show_toast(msg, ToastKind::Success, window, cx);
+                            if let Some(dest) = dest_dir {
+                                self.mark_fresh_disk_sizes(&dest);
+                                self.invalidate_folder_sizes_under(&dest);
+                                self.refresh_panes_showing(&dest, cx);
+                            }
+                        }
+                        Err(err) => {
+                            self.show_toast(
+                                format!("P2P transfer failed: {err}"),
+                                ToastKind::Error,
+                                window,
+                                cx,
+                            );
+                        }
+                    }
+                    cx.notify();
+                }
+            },
+            BgEvent::NativeDrop(drop_ev) => {
+                self.handle_native_drop_event(drop_ev, window, cx);
+            }
+        }
+    }
+
+    fn cleanup_stage_dir_async(stage_dir: Option<PathBuf>) {
+        if let Some(dir) = stage_dir {
+            tokio_runtime().spawn(async move {
+                let _ = tokio::task::spawn_blocking(move || {
+                    let _ = std::fs::remove_dir_all(&dir);
+                })
+                .await;
+            });
+        }
+    }
+
+    fn hit_test_native_drop_pane(
+        &self,
+        client_x: f32,
+        client_y: f32,
+        window: &Window,
+    ) -> Option<(PaneSide, Option<PathBuf>)> {
+        let tab = self.active_tab()?;
+        let scale = window.scale_factor().max(1.0);
+        let lx = client_x / scale;
+        let ly = client_y / scale;
+
+        let sides: &[PaneSide] = if tab.model.split_enabled {
+            &[PaneSide::Left, PaneSide::Right]
+        } else {
+            &[PaneSide::Left]
+        };
+
+        let mut chosen_side: Option<PaneSide> = None;
+        for &side in sides {
+            let b = tab.pane_ui(side).scroll_handle.0.borrow().base_handle.bounds();
+            let bx: f32 = b.origin.x.into();
+            let by: f32 = b.origin.y.into();
+            let bw: f32 = b.size.width.into();
+            let bh: f32 = b.size.height.into();
+            if bw > 1.0 && bh > 1.0 && lx >= bx && lx <= bx + bw && ly >= by && ly <= by + bh {
+                chosen_side = Some(side);
+                break;
+            }
+        }
+
+        if chosen_side.is_none() && tab.model.split_enabled {
+            let left_b = tab
+                .pane_ui(PaneSide::Left)
+                .scroll_handle
+                .0
+                .borrow()
+                .base_handle
+                .bounds();
+            let right_b = tab
+                .pane_ui(PaneSide::Right)
+                .scroll_handle
+                .0
+                .borrow()
+                .base_handle
+                .bounds();
+            let rx: f32 = right_b.origin.x.into();
+            let rw: f32 = right_b.size.width.into();
+            let lx_b: f32 = left_b.origin.x.into();
+            let lw: f32 = left_b.size.width.into();
+            if rw > 1.0 && lx >= rx {
+                chosen_side = Some(PaneSide::Right);
+            } else if lw > 1.0 && lx >= lx_b {
+                chosen_side = Some(PaneSide::Left);
+            } else {
+                let win_w = self
+                    .last_window_geometry
+                    .as_ref()
+                    .map(|g| g.width)
+                    .unwrap_or(1280.0);
+                let sidebar_w = if self.settings.show_sidebar { 256.0 } else { 0.0 };
+                let inspector_w = if self.settings.show_inspector { 328.0 } else { 0.0 };
+                let mid_x = sidebar_w + ((win_w - sidebar_w - inspector_w).max(200.0) * 0.5);
+                chosen_side = Some(if lx >= mid_x {
+                    PaneSide::Right
+                } else {
+                    PaneSide::Left
+                });
+            }
+        }
+        let side = chosen_side.unwrap_or(tab.model.active_pane);
+
+        // If dropped directly over a local folder row in Details/Compact view, target that subfolder.
+        let mut hovered_folder: Option<PathBuf> = None;
+        let pane = tab.model.pane(side);
+        if matches!(pane.view_mode, ViewMode::Details | ViewMode::Compact) {
+            let state = tab.pane_ui(side).scroll_handle.0.borrow();
+            let b = state.base_handle.bounds();
+            let bx: f32 = b.origin.x.into();
+            let by: f32 = b.origin.y.into();
+            let bw: f32 = b.size.width.into();
+            let bh: f32 = b.size.height.into();
+            let scroll_y: f32 = state.base_handle.offset().y.into();
+            if bw > 1.0 && bh > 1.0 && lx >= bx && lx <= bx + bw && ly >= by && ly <= by + bh {
+                let row_h = if pane.view_mode == ViewMode::Details {
+                    32.0
+                } else {
+                    28.0
+                };
+                let content_y = ly - by - scroll_y;
+                if content_y >= 0.0 {
+                    let row_idx = (content_y / row_h).floor() as usize;
+                    if let Some(entry) = pane.visible_entry(row_idx)
+                        && entry.is_dir()
+                        && let Some(local) = entry.location.as_local_path()
+                    {
+                        hovered_folder = Some(local.to_path_buf());
+                    }
+                }
+            }
+        }
+
+        Some((side, hovered_folder))
+    }
+
+    fn handle_native_drop_event(
+        &mut self,
+        event: NativeDropEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match event {
+            NativeDropEvent::Entered { client_x, client_y }
+            | NativeDropEvent::Over { client_x, client_y } => {
+                let next = self
+                    .hit_test_native_drop_pane(client_x, client_y, window)
+                    .map(|(side, _)| side);
+                if self.native_drop_hover_side != next {
+                    self.native_drop_hover_side = next;
+                    cx.notify();
+                }
+            }
+            NativeDropEvent::Left => {
+                if self.native_drop_hover_side.take().is_some() {
+                    cx.notify();
+                }
+            }
+            NativeDropEvent::Dropped {
+                client_x,
+                client_y,
+                paths,
+                stage_dir,
+            } => {
+                self.native_drop_hover_side = None;
+                cx.notify();
+                if paths.is_empty() {
+                    Self::cleanup_stage_dir_async(stage_dir);
+                    return;
+                }
+                let Some((side, hovered_folder)) =
+                    self.hit_test_native_drop_pane(client_x, client_y, window)
+                else {
+                    Self::cleanup_stage_dir_async(stage_dir);
+                    return;
+                };
+                let pane_loc = self
+                    .active_tab()
+                    .map(|t| t.model.pane(side).location.clone());
+                match pane_loc {
+                    Some(Location::Local(pane_dir)) => {
+                        let dest_dir = hovered_folder.unwrap_or(pane_dir);
+                        if !dest_dir.is_dir() {
+                            Self::cleanup_stage_dir_async(stage_dir);
+                            return;
+                        }
+                        let effective = filter_effective_transfer_sources(
+                            TransferKind::Copy,
+                            paths,
+                            &dest_dir,
+                            true,
+                        );
+                        if effective.is_empty() {
+                            Self::cleanup_stage_dir_async(stage_dir);
+                            return;
+                        }
+                        self.enqueue_transfer_with_cleanup(
+                            TransferKind::Copy,
+                            effective,
+                            dest_dir,
+                            stage_dir,
+                            cx,
+                        );
+                    }
+                    Some(Location::Remote { .. }) => {
+                        self.handle_dropped_paths_into_pane_with_cleanup(
+                            side, paths, stage_dir, window, cx,
+                        );
+                    }
+                    _ => {
+                        Self::cleanup_stage_dir_async(stage_dir);
+                        self.show_toast(
+                            "Open a folder pane to drop items into it.",
+                            ToastKind::Info,
+                            window,
+                            cx,
+                        );
+                    }
+                }
+            }
         }
     }
 
@@ -1106,7 +1593,13 @@ impl Workspace {
                 if side == PaneSide::Right && !tab.model.split_enabled {
                     continue;
                 }
-                if tab.model.pane(side).location.as_local_path() == Some(dir) {
+                if tab
+                    .model
+                    .pane(side)
+                    .location
+                    .as_local_path()
+                    .is_some_and(|p| paths_same(p, dir))
+                {
                     to_reload.push((tab.model.id, side));
                 }
             }
@@ -1139,7 +1632,12 @@ impl Workspace {
         let target = self
             .active_tab()
             .and_then(|t| t.model.active_pane_ref().primary_selected_entry())
-            .filter(|e| matches!(e.location, Location::Local(_) | Location::Archive { .. }))
+            .filter(|e| {
+                matches!(
+                    e.location,
+                    Location::Local(_) | Location::Archive { .. } | Location::Remote { .. }
+                )
+            })
             .map(|e| (e.location.clone(), e.kind));
 
         let Some((location, kind)) = target else {
@@ -1162,6 +1660,55 @@ impl Workspace {
         let worker = self.shell_worker.clone();
         let palette = self.palette();
         let tx = self.bg_tx.clone();
+        if let Location::Remote {
+            connection_id,
+            ref remote_path,
+            ..
+        } = location
+        {
+            if kind == FileKind::Folder {
+                self.preview_payload = PreviewPayload::Unsupported {
+                    reason: "Remote folder — open to browse its contents.".to_string(),
+                };
+                cx.notify();
+                return;
+            }
+            let Some(conn) = self.settings.network_connection(connection_id).cloned() else {
+                self.preview_payload = PreviewPayload::Unsupported {
+                    reason: "Network connection not found.".to_string(),
+                };
+                cx.notify();
+                return;
+            };
+            let creds = self.resolve_remote_credentials(connection_id);
+            let pool = self.remote_pool.clone();
+            let rpath = remote_path.clone();
+            let max_bytes = if matches!(kind, FileKind::Image) {
+                8 * 1024 * 1024
+            } else {
+                192 * 1024
+            };
+            tokio_runtime().spawn(async move {
+                let payload = match pool.read_file_bytes(&conn, &creds, &rpath, max_bytes).await {
+                    Ok((bytes, truncated)) => tokio::task::spawn_blocking(move || {
+                        preview_from_remote_bytes(&rpath, bytes, truncated, palette)
+                    })
+                    .await
+                    .unwrap_or_else(|_| PreviewPayload::Unsupported {
+                        reason: "Preview decoder failed.".to_string(),
+                    }),
+                    Err(err) => PreviewPayload::Unsupported { reason: err },
+                };
+                let _ = tx.unbounded_send(BgEvent::PreviewReady {
+                    generation,
+                    location,
+                    payload,
+                });
+            });
+            cx.notify();
+            return;
+        }
+
         tokio_runtime().spawn(async move {
             let loc_clone = location.clone();
             let payload = tokio::task::spawn_blocking(move || match loc_clone {
@@ -1583,6 +2130,41 @@ impl Workspace {
         pane.loading = true;
         pane.error = None;
         let tx = self.bg_tx.clone();
+        if let Location::Remote {
+            connection_id,
+            ref remote_path,
+            ..
+        } = location
+        {
+            let Some(conn) = self.settings.network_connection(connection_id).cloned() else {
+                if let Some(tab) = self.tabs.iter_mut().find(|t| t.model.id == tab_id) {
+                    let p = tab.model.pane_mut(side);
+                    p.loading = false;
+                    p.error = Some("Saved network connection no longer exists.".to_string());
+                }
+                cx.notify();
+                return;
+            };
+            let creds = self.resolve_remote_credentials(connection_id);
+            let pool = self.remote_pool.clone();
+            let rpath = remote_path.clone();
+            tokio_runtime().spawn(async move {
+                let result = pool.list_dir(&conn, &creds, &rpath).await.map(|mut entries| {
+                    sort_entries(&mut entries, sort);
+                    entries
+                });
+                let _ = tx.unbounded_send(BgEvent::DirectoryLoaded {
+                    tab_id,
+                    side,
+                    generation,
+                    sort,
+                    result,
+                });
+            });
+            cx.notify();
+            return;
+        }
+
         tokio_runtime().spawn(async move {
             let loc_clone = location.clone();
             let result = tokio::task::spawn_blocking(move || {
@@ -1609,6 +2191,19 @@ impl Workspace {
         cx.notify();
     }
 
+    fn mark_fresh_disk_sizes(&mut self, path: &Path) {
+        let expiry = Instant::now() + Duration::from_secs(5);
+        self.fresh_disk_size_dirs.insert(path.to_path_buf(), expiry);
+    }
+
+    fn is_path_under_active_transfer(&self, path: &Path) -> bool {
+        self.transfers.iter().any(|job| {
+            !job.snapshot.status.is_terminal()
+                && (is_same_or_descendant_path(path, &job.snapshot.target_dir)
+                    || is_same_or_descendant_path(&job.snapshot.target_dir, path))
+        })
+    }
+
     fn spawn_folder_size_calculation(
         &mut self,
         tab_id: Uuid,
@@ -1619,10 +2214,20 @@ impl Workspace {
         if let Some(prev) = self.folder_size_cancels.remove(&(tab_id, side)) {
             prev.store(true, Ordering::Relaxed);
         }
+        let now = Instant::now();
+        self.fresh_disk_size_dirs.retain(|_, exp| *exp > now);
+        let force_disk = folders.iter().any(|folder| {
+            self.is_path_under_active_transfer(folder)
+                || self.fresh_disk_size_dirs.keys().any(|fresh| {
+                    is_same_or_descendant_path(folder, fresh)
+                        || is_same_or_descendant_path(fresh, folder)
+                })
+        });
+
         let cancel = Arc::new(AtomicBool::new(false));
         self.folder_size_cancels
             .insert((tab_id, side), Arc::clone(&cancel));
-        let use_mft = self.settings.use_mft_service;
+        let use_mft = self.settings.use_mft_service && !force_disk;
         let tx = self.bg_tx.clone();
 
         tokio_runtime().spawn(async move {
@@ -1643,8 +2248,9 @@ impl Workspace {
     }
 
     fn invalidate_folder_sizes_under(&mut self, dir: &Path) {
-        self.folder_size_cache
-            .retain(|k, _| !k.starts_with(dir) && !dir.starts_with(k));
+        self.folder_size_cache.retain(|k, _| {
+            !is_same_or_descendant_path(k, dir) && !is_same_or_descendant_path(dir, k)
+        });
     }
 
     fn rebind_watcher(&mut self, tab_id: Uuid, side: PaneSide) {
@@ -1706,6 +2312,36 @@ impl Workspace {
     ) {
         if let Some(tab) = self.tabs.iter_mut().find(|t| t.model.id == tab_id) {
             tab.pane_ui_mut(side).editing_address = false;
+        }
+        if let Some(parsed) = parse_network_uri(raw) {
+            if parsed.protocol == NetworkProtocol::Smb {
+                self.navigate_pane(side, Location::local(parsed.host), window, cx);
+                return;
+            }
+            if let Some(existing) = self
+                .settings
+                .network_connections
+                .iter()
+                .find(|c| {
+                    c.protocol == parsed.protocol
+                        && c.host.eq_ignore_ascii_case(&parsed.host)
+                        && c.port == parsed.port
+                        && (parsed.username.is_empty()
+                            || c.username.eq_ignore_ascii_case(&parsed.username))
+                })
+                .cloned()
+            {
+                let loc = Location::remote(
+                    existing.id,
+                    existing.display_name(),
+                    existing.protocol,
+                    parsed.remote_path,
+                );
+                self.navigate_pane(side, loc, window, cx);
+                return;
+            }
+            self.open_network_connect_modal(None, Some(parsed), window, cx);
+            return;
         }
         if let Some(mut target) = Location::parse_user_input(raw) {
             if let Some(local) = target.as_local_path() {
@@ -2306,25 +2942,40 @@ impl Workspace {
         ev: &MouseDownEvent,
         cx: &mut Context<Self>,
     ) {
-        let dir_opt = self.active_tab().and_then(|t| {
-            t.model
-                .pane(side)
-                .location
-                .as_local_path()
-                .map(|p| p.to_path_buf())
-        });
-        if let Some(directory) = dir_opt {
-            self.set_active_pane(side, cx);
-            if ev.modifiers.shift {
-                self.context_menu = None;
-                self.show_native_windows_bg_menu(directory, cx);
-                return;
+        let loc_opt = self
+            .active_tab()
+            .map(|t| t.model.pane(side).location.clone());
+        match loc_opt {
+            Some(Location::Local(directory)) => {
+                self.set_active_pane(side, cx);
+                if ev.modifiers.shift {
+                    self.context_menu = None;
+                    self.show_native_windows_bg_menu(directory, cx);
+                    return;
+                }
+                self.open_context_menu(
+                    ev.position,
+                    ContextMenuTarget::PaneBackground { side, directory },
+                    cx,
+                );
             }
-            self.open_context_menu(
-                ev.position,
-                ContextMenuTarget::PaneBackground { side, directory },
-                cx,
-            );
+            Some(Location::Remote {
+                connection_id,
+                remote_path,
+                ..
+            }) => {
+                self.set_active_pane(side, cx);
+                self.open_context_menu(
+                    ev.position,
+                    ContextMenuTarget::RemotePaneBackground {
+                        side,
+                        connection_id,
+                        remote_path,
+                    },
+                    cx,
+                );
+            }
+            _ => {}
         }
     }
 
@@ -2375,6 +3026,13 @@ impl Workspace {
             }
         } else if matches!(location, Location::Archive { .. }) {
             self.toggle_quicklook(cx);
+        } else if let Location::Remote {
+            connection_id,
+            remote_path,
+            ..
+        } = location
+        {
+            self.open_remote_file_cached(connection_id, remote_path, window, cx);
         }
     }
 
@@ -2439,6 +3097,94 @@ impl Workspace {
         }
     }
 
+    pub fn handle_dropped_paths_into_pane(
+        &mut self,
+        side: PaneSide,
+        sources: Vec<PathBuf>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.handle_dropped_paths_into_pane_with_cleanup(side, sources, None, window, cx);
+    }
+
+    fn handle_dropped_paths_into_pane_with_cleanup(
+        &mut self,
+        side: PaneSide,
+        sources: Vec<PathBuf>,
+        stage_dir: Option<PathBuf>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if sources.is_empty() {
+            Self::cleanup_stage_dir_async(stage_dir);
+            return;
+        }
+        let Some(Location::Remote {
+            connection_id,
+            remote_path,
+            ..
+        }) = self.active_tab().map(|t| t.model.pane(side).location.clone())
+        else {
+            Self::cleanup_stage_dir_async(stage_dir);
+            return;
+        };
+        let Some(conn) = self.settings.network_connection(connection_id).cloned() else {
+            Self::cleanup_stage_dir_async(stage_dir);
+            return;
+        };
+        let files: Vec<PathBuf> = sources.into_iter().filter(|p| p.is_file()).collect();
+        if files.is_empty() {
+            Self::cleanup_stage_dir_async(stage_dir);
+            self.show_toast(
+                "Drop files to upload to the remote server.",
+                ToastKind::Info,
+                window,
+                cx,
+            );
+            return;
+        }
+        let count = files.len();
+        self.show_toast(
+            format!("Uploading {count} file(s) to {}...", conn.display_name()),
+            ToastKind::Info,
+            window,
+            cx,
+        );
+        let creds = self.resolve_remote_credentials(connection_id);
+        let pool = self.remote_pool.clone();
+        let tx = self.bg_tx.clone();
+        tokio_runtime().spawn(async move {
+            let mut uploaded = 0usize;
+            let mut first_err: Option<String> = None;
+            for src in files {
+                let Some(name) = src.file_name().map(|n| n.to_string_lossy().into_owned()) else {
+                    continue;
+                };
+                let target_remote = join_remote_path(&remote_path, &name);
+                match pool.upload_file(&conn, &creds, &src, &target_remote).await {
+                    Ok(_) => uploaded += 1,
+                    Err(err) if first_err.is_none() => first_err = Some(err),
+                    Err(_) => {}
+                }
+            }
+            if let Some(dir) = stage_dir {
+                let _ = tokio::task::spawn_blocking(move || {
+                    let _ = std::fs::remove_dir_all(&dir);
+                })
+                .await;
+            }
+            let result = if let Some(err) = first_err {
+                Err(err)
+            } else {
+                Ok(Some(format!("Uploaded {uploaded} file(s)")))
+            };
+            let _ = tx.unbounded_send(BgEvent::RemoteOpFinished {
+                result,
+                refresh_side: Some(side),
+            });
+        });
+    }
+
     pub fn handle_dropped_paths(
         &mut self,
         sources: Vec<PathBuf>,
@@ -2470,8 +3216,20 @@ impl Workspace {
         dest_dir: PathBuf,
         cx: &mut Context<Self>,
     ) {
+        self.enqueue_transfer_with_cleanup(kind, sources, dest_dir, None, cx);
+    }
+
+    fn enqueue_transfer_with_cleanup(
+        &mut self,
+        kind: TransferKind,
+        sources: Vec<PathBuf>,
+        dest_dir: PathBuf,
+        cleanup_stage_dir: Option<PathBuf>,
+        cx: &mut Context<Self>,
+    ) {
         let sources = filter_effective_transfer_sources(kind, sources, &dest_dir, false);
         if sources.is_empty() {
+            Self::cleanup_stage_dir_async(cleanup_stage_dir);
             return;
         }
         let (xfer_tx, mut xfer_rx) = unbounded::<TransferEvent>();
@@ -2502,6 +3260,8 @@ impl Workspace {
                 current_item: String::new(),
             },
             control,
+            sources,
+            cleanup_stage_dir,
         });
 
         let bg_tx = self.bg_tx.clone();
@@ -3973,6 +4733,78 @@ impl Workspace {
             return;
         };
         let value = input.read(cx).value().to_string();
+        match kind {
+            TextPromptKind::RemoteNewFolder {
+                side,
+                connection_id,
+                parent_remote_path,
+            } => {
+                let trimmed = value.trim().trim_matches(['/', '\\']);
+                if trimmed.is_empty() {
+                    self.show_toast("Folder name cannot be empty.", ToastKind::Error, window, cx);
+                    return;
+                }
+                let Some(conn) = self.settings.network_connection(connection_id).cloned() else {
+                    self.close_modal(cx);
+                    return;
+                };
+                let target = join_remote_path(&parent_remote_path, trimmed);
+                let creds = self.resolve_remote_credentials(connection_id);
+                let pool = self.remote_pool.clone();
+                let tx = self.bg_tx.clone();
+                let name_owned = trimmed.to_string();
+                self.close_modal(cx);
+                tokio_runtime().spawn(async move {
+                    let res = pool
+                        .create_dir(&conn, &creds, &target)
+                        .await
+                        .map(|()| Some(format!("Created remote folder \"{name_owned}\"")));
+                    let _ = tx.unbounded_send(BgEvent::RemoteOpFinished {
+                        result: res,
+                        refresh_side: Some(side),
+                    });
+                });
+                return;
+            }
+            TextPromptKind::RemoteRename {
+                side,
+                connection_id,
+                remote_path,
+            } => {
+                let trimmed = value.trim().trim_matches(['/', '\\']);
+                if trimmed.is_empty() {
+                    self.show_toast("Name cannot be empty.", ToastKind::Error, window, cx);
+                    return;
+                }
+                let Some(conn) = self.settings.network_connection(connection_id).cloned() else {
+                    self.close_modal(cx);
+                    return;
+                };
+                let parent = match remote_path.rsplit_once('/') {
+                    Some(("", _)) | None => "/",
+                    Some((head, _)) => head,
+                };
+                let new_remote = join_remote_path(parent, trimmed);
+                let creds = self.resolve_remote_credentials(connection_id);
+                let pool = self.remote_pool.clone();
+                let tx = self.bg_tx.clone();
+                let name_owned = trimmed.to_string();
+                self.close_modal(cx);
+                tokio_runtime().spawn(async move {
+                    let res = pool
+                        .rename(&conn, &creds, &remote_path, &new_remote)
+                        .await
+                        .map(|()| Some(format!("Renamed to \"{name_owned}\"")));
+                    let _ = tx.unbounded_send(BgEvent::RemoteOpFinished {
+                        result: res,
+                        refresh_side: Some(side),
+                    });
+                });
+                return;
+            }
+            _ => {}
+        }
+
         let outcome = match kind {
             TextPromptKind::NewFolder { side, parent } => {
                 texplorer_vfs::create_folder(&parent, &value)
@@ -3993,6 +4825,9 @@ impl Workspace {
                         },
                     )
                 })
+            }
+            TextPromptKind::RemoteNewFolder { .. } | TextPromptKind::RemoteRename { .. } => {
+                unreachable!()
             }
         };
 
@@ -4338,6 +5173,930 @@ impl Workspace {
         }
     }
 
+    // --- Network Connections (SMB, SSH/SFTP, FTP/FTPS) & Encrypted P2P Transfers ---
+
+    pub fn is_network_connected(&self, id: Uuid) -> bool {
+        self.remote_pool.is_connected(id)
+    }
+
+    fn resolve_remote_credentials(&self, id: Uuid) -> RemoteCredentials {
+        let password = self
+            .session_passwords
+            .get(&id)
+            .cloned()
+            .or_else(|| load_network_password(&id.to_string()));
+        RemoteCredentials { password }
+    }
+
+    pub fn open_network_connect_modal(
+        &mut self,
+        editing: Option<NetworkConnection>,
+        prefill: Option<ParsedNetworkUri>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.context_menu = None;
+        self.quicklook_open = false;
+        self.stop_video_playback();
+        self.modal_subs.clear();
+
+        let (editing_id, protocol, auth_mode, save_password, init_name, init_host, init_port, init_rpath, init_user, init_key, init_pass) =
+            if let Some(conn) = editing {
+                let stored_pass = self
+                    .session_passwords
+                    .get(&conn.id)
+                    .cloned()
+                    .or_else(|| load_network_password(&conn.id.to_string()))
+                    .unwrap_or_default();
+                let key_str = conn
+                    .private_key_path
+                    .as_ref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(default_ssh_key_path_str);
+                (
+                    Some(conn.id),
+                    conn.protocol,
+                    conn.auth_mode,
+                    conn.save_password,
+                    conn.name,
+                    conn.host,
+                    conn.port.to_string(),
+                    conn.remote_path,
+                    conn.username,
+                    key_str,
+                    stored_pass,
+                )
+            } else if let Some(uri) = prefill {
+                let name_guess = uri.host.clone();
+                (
+                    None,
+                    uri.protocol,
+                    SshAuthMode::Password,
+                    true,
+                    name_guess,
+                    uri.host,
+                    uri.port.to_string(),
+                    uri.remote_path,
+                    uri.username,
+                    default_ssh_key_path_str(),
+                    String::new(),
+                )
+            } else {
+                (
+                    None,
+                    NetworkProtocol::Smb,
+                    SshAuthMode::Password,
+                    true,
+                    String::new(),
+                    String::new(),
+                    NetworkProtocol::Smb.default_port().to_string(),
+                    "/".to_string(),
+                    String::new(),
+                    default_ssh_key_path_str(),
+                    String::new(),
+                )
+            };
+
+        let name_input = cx.new(|cx| InputState::new(window, cx).placeholder("e.g. Home NAS or Prod VPS"));
+        let host_placeholder = if protocol == NetworkProtocol::Smb {
+            r"\\192.168.1.50\Shared"
+        } else {
+            "192.168.1.50 or server.example.com"
+        };
+        let host_input = cx.new(|cx| InputState::new(window, cx).placeholder(host_placeholder));
+        let port_input = cx.new(|cx| InputState::new(window, cx).placeholder("22"));
+        let remote_path_input = cx.new(|cx| InputState::new(window, cx).placeholder("/"));
+        let username_input = cx.new(|cx| InputState::new(window, cx).placeholder("root / admin"));
+        let password_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("Password")
+                .masked(true)
+        });
+        let key_path_input =
+            cx.new(|cx| InputState::new(window, cx).placeholder(r"C:\Users\you\.ssh\id_ed25519"));
+
+        name_input.update(cx, |s, cx| s.set_value(init_name, window, cx));
+        host_input.update(cx, |s, cx| s.set_value(init_host, window, cx));
+        port_input.update(cx, |s, cx| s.set_value(init_port, window, cx));
+        remote_path_input.update(cx, |s, cx| s.set_value(init_rpath, window, cx));
+        username_input.update(cx, |s, cx| s.set_value(init_user, window, cx));
+        password_input.update(cx, |s, cx| s.set_value(init_pass, window, cx));
+        key_path_input.update(cx, |s, cx| s.set_value(init_key, window, cx));
+        host_input.update(cx, |s, cx| s.focus(window, cx));
+
+        self.active_modal = Some(ActiveModal::NetworkConnect(NetworkConnectModalState {
+            editing_id,
+            protocol,
+            auth_mode,
+            save_password,
+            name_input,
+            host_input,
+            port_input,
+            remote_path_input,
+            username_input,
+            password_input,
+            key_path_input,
+            busy: false,
+            status_message: None,
+            status_is_error: false,
+        }));
+        cx.notify();
+    }
+
+    pub fn set_network_modal_protocol(
+        &mut self,
+        protocol: NetworkProtocol,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(ActiveModal::NetworkConnect(ref mut form)) = self.active_modal else {
+            return;
+        };
+        let prev_default = form.protocol.default_port().to_string();
+        form.protocol = protocol;
+        let port_input = form.port_input.clone();
+        let current_port = port_input.read(cx).value().trim().to_string();
+        if current_port.is_empty() || current_port == prev_default {
+            let next_port = protocol.default_port().to_string();
+            port_input.update(cx, |s, cx| s.set_value(next_port, window, cx));
+        }
+        form.status_message = None;
+        cx.notify();
+    }
+
+    pub fn set_network_modal_auth_mode(&mut self, mode: SshAuthMode, cx: &mut Context<Self>) {
+        if let Some(ActiveModal::NetworkConnect(ref mut form)) = self.active_modal {
+            form.auth_mode = mode;
+            form.status_message = None;
+            cx.notify();
+        }
+    }
+
+    pub fn toggle_network_modal_save_password(&mut self, cx: &mut Context<Self>) {
+        if let Some(ActiveModal::NetworkConnect(ref mut form)) = self.active_modal {
+            form.save_password = !form.save_password;
+            cx.notify();
+        }
+    }
+
+    fn build_network_conn_from_modal(
+        &self,
+        cx: &Context<Self>,
+    ) -> Result<(NetworkConnection, String), String> {
+        let Some(ActiveModal::NetworkConnect(ref form)) = self.active_modal else {
+            return Err("No active network form.".to_string());
+        };
+        let raw_host = form.host_input.read(cx).value().trim().to_string();
+        if raw_host.is_empty() {
+            return Err(if form.protocol == NetworkProtocol::Smb {
+                "Enter a shared folder path (e.g. \\\\server\\share).".to_string()
+            } else {
+                "Enter a host name or IP address.".to_string()
+            });
+        }
+
+        let host = if form.protocol == NetworkProtocol::Smb {
+            normalize_smb_share_path(&raw_host)
+                .ok_or_else(|| "Invalid SMB path (expected \\\\server\\share).".to_string())?
+        } else {
+            raw_host
+        };
+
+        let port = form
+            .port_input
+            .read(cx)
+            .value()
+            .trim()
+            .parse::<u16>()
+            .unwrap_or_else(|_| form.protocol.default_port());
+        let name = form.name_input.read(cx).value().trim().to_string();
+        let username = form.username_input.read(cx).value().trim().to_string();
+        let password = form.password_input.read(cx).value().to_string();
+        let remote_path = normalize_remote_path(form.remote_path_input.read(cx).value().trim());
+        let key_str = form.key_path_input.read(cx).value().trim().to_string();
+        let private_key_path = if form.protocol == NetworkProtocol::Sftp
+            && form.auth_mode == SshAuthMode::PrivateKey
+            && !key_str.is_empty()
+        {
+            Some(PathBuf::from(key_str))
+        } else {
+            None
+        };
+
+        let conn = NetworkConnection {
+            id: form.editing_id.unwrap_or_else(Uuid::new_v4),
+            name,
+            protocol: form.protocol,
+            host,
+            port,
+            username,
+            remote_path,
+            auth_mode: form.auth_mode,
+            private_key_path,
+            save_password: form.save_password,
+        };
+        Ok((conn, password))
+    }
+
+    pub fn test_network_modal_connection(&mut self, cx: &mut Context<Self>) {
+        let (conn, password) = match self.build_network_conn_from_modal(cx) {
+            Ok(v) => v,
+            Err(err) => {
+                if let Some(ActiveModal::NetworkConnect(ref mut form)) = self.active_modal {
+                    form.status_message = Some(err);
+                    form.status_is_error = true;
+                }
+                cx.notify();
+                return;
+            }
+        };
+        if let Some(ActiveModal::NetworkConnect(ref mut form)) = self.active_modal {
+            form.busy = true;
+            form.status_message = Some("Testing connection...".to_string());
+            form.status_is_error = false;
+        }
+        cx.notify();
+
+        let tx = self.bg_tx.clone();
+        let pool = self.remote_pool.clone();
+        tokio_runtime().spawn(async move {
+            let result = match conn.protocol {
+                NetworkProtocol::Smb => {
+                    let unc = conn.host.clone();
+                    let user = conn.username.clone();
+                    let pass = password.clone();
+                    tokio::task::spawn_blocking(move || {
+                        let connected = connect_smb_share(
+                            &unc,
+                            (!user.is_empty()).then_some(user.as_str()),
+                            (!pass.is_empty()).then_some(pass.as_str()),
+                        )?;
+                        let count = std::fs::read_dir(&connected)
+                            .map(|rd| rd.count())
+                            .map_err(|e| format!("Share connected, but folder read failed: {e}"))?;
+                        Ok(format!("Connected to {connected} ({count} items)"))
+                    })
+                    .await
+                    .unwrap_or_else(|e| Err(format!("SMB test failed: {e}")))
+                }
+                _ => {
+                    let creds = RemoteCredentials {
+                        password: (!password.is_empty()).then_some(password),
+                    };
+                    pool.test_connection(&conn, &creds).await
+                }
+            };
+            let _ = tx.unbounded_send(BgEvent::NetworkTestFinished { result });
+        });
+    }
+
+    pub fn save_and_connect_network_modal(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let (conn, password) = match self.build_network_conn_from_modal(cx) {
+            Ok(v) => v,
+            Err(err) => {
+                if let Some(ActiveModal::NetworkConnect(ref mut form)) = self.active_modal {
+                    form.status_message = Some(err);
+                    form.status_is_error = true;
+                }
+                cx.notify();
+                return;
+            }
+        };
+
+        if !password.is_empty() {
+            self.session_passwords.insert(conn.id, password.clone());
+            if conn.save_password {
+                if let Err(err) =
+                    save_network_password(&conn.id.to_string(), &conn.username, &password)
+                {
+                    self.show_toast(err, ToastKind::Error, window, cx);
+                }
+            } else {
+                let _ = delete_network_password(&conn.id.to_string());
+            }
+        } else if !conn.save_password {
+            self.session_passwords.remove(&conn.id);
+            let _ = delete_network_password(&conn.id.to_string());
+        }
+
+        self.settings.upsert_network_connection(conn.clone());
+        let _ = self.settings.save();
+        self.close_modal(cx);
+        self.open_network_connection(conn, false, window, cx);
+    }
+
+    pub fn open_network_connection(
+        &mut self,
+        conn: NetworkConnection,
+        new_tab: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_network_connection_target(conn, new_tab, false, window, cx);
+    }
+
+    pub fn open_network_connection_in_split(
+        &mut self,
+        conn: NetworkConnection,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_network_connection_target(conn, false, true, window, cx);
+    }
+
+    fn open_network_connection_target(
+        &mut self,
+        conn: NetworkConnection,
+        new_tab: bool,
+        in_split: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match conn.protocol {
+            NetworkProtocol::Smb => {
+                let unc = conn.host.clone();
+                let user = conn.username.clone();
+                let pass = self
+                    .resolve_remote_credentials(conn.id)
+                    .password
+                    .unwrap_or_default();
+                let tx = self.bg_tx.clone();
+                tokio_runtime().spawn(async move {
+                    let unc_for_event = unc.clone();
+                    let result = tokio::task::spawn_blocking(move || {
+                        if user.is_empty() && pass.is_empty() && Path::new(&unc).is_dir() {
+                            return Ok(unc);
+                        }
+                        connect_smb_share(
+                            &unc,
+                            (!user.is_empty()).then_some(user.as_str()),
+                            (!pass.is_empty()).then_some(pass.as_str()),
+                        )
+                    })
+                    .await
+                    .unwrap_or_else(|e| Err(format!("SMB connection worker failed: {e}")));
+                    let _ = tx.unbounded_send(BgEvent::SmbConnectFinished {
+                        unc: unc_for_event,
+                        new_tab,
+                        in_split,
+                        result,
+                    });
+                });
+            }
+            NetworkProtocol::Sftp | NetworkProtocol::Ftp | NetworkProtocol::Ftps => {
+                let target = Location::remote(
+                    conn.id,
+                    conn.display_name(),
+                    conn.protocol,
+                    conn.normalized_remote_path(),
+                );
+                if in_split {
+                    self.open_in_opposite_pane(target, window, cx);
+                } else if new_tab && self.settings.show_tabs {
+                    self.open_new_tab(target, window, cx);
+                } else {
+                    self.navigate_active_pane(target, window, cx);
+                }
+            }
+        }
+    }
+
+    pub fn open_ssh_terminal(&mut self, conn: &NetworkConnection, cx: &mut Context<Self>) {
+        let host = conn.host.trim();
+        if host.is_empty() {
+            return;
+        }
+        let target = if conn.username.trim().is_empty() {
+            host.to_string()
+        } else {
+            format!("{}@{host}", conn.username.trim())
+        };
+        let port = if conn.port == 0 { 22 } else { conn.port };
+        let term = self.settings.terminal_command.clone();
+        let key_arg = conn
+            .private_key_path
+            .as_ref()
+            .filter(|_| conn.auth_mode == SshAuthMode::PrivateKey)
+            .map(|p| p.display().to_string());
+        let tx = self.bg_tx.clone();
+        tokio_runtime().spawn(async move {
+            let result = tokio::task::spawn_blocking(move || {
+                let mut ssh_args = vec!["ssh".to_string(), target, "-p".to_string(), port.to_string()];
+                if let Some(k) = key_arg {
+                    ssh_args.push("-i".to_string());
+                    ssh_args.push(k);
+                }
+                let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("."));
+                if is_elevated() {
+                    let arg_line = ssh_args
+                        .iter()
+                        .map(|a| {
+                            if a.contains(' ') {
+                                format!("\"{}\"", a.replace('"', "\\\""))
+                            } else {
+                                a.clone()
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    let (exe, full_args) = if term.to_ascii_lowercase().contains("wt") {
+                        (term.as_str(), arg_line)
+                    } else {
+                        ("cmd.exe", format!("/K {arg_line}"))
+                    };
+                    if spawn_as_desktop_user(exe, &full_args, &home).is_ok() {
+                        return Ok(None);
+                    }
+                }
+                let spawn_res = if term.to_ascii_lowercase().contains("wt") {
+                    std::process::Command::new(&term).args(&ssh_args).spawn()
+                } else {
+                    std::process::Command::new("cmd.exe")
+                        .arg("/K")
+                        .args(&ssh_args)
+                        .spawn()
+                };
+                spawn_res
+                    .map(|_| None)
+                    .map_err(|e| format!("Failed launching SSH terminal: {e}"))
+            })
+            .await
+            .unwrap_or_else(|e| Err(format!("SSH terminal launch failed: {e}")));
+            let _ = tx.unbounded_send(BgEvent::ShellOpFinished {
+                result,
+                refresh_side: None,
+            });
+        });
+        self.set_toast_simple("Opening SSH terminal...", ToastKind::Info, cx);
+    }
+
+    pub fn disconnect_network_connection(
+        &mut self,
+        conn: NetworkConnection,
+        cx: &mut Context<Self>,
+    ) {
+        let id = conn.id;
+        let name = conn.display_name();
+        let pool = self.remote_pool.clone();
+        let tx = self.bg_tx.clone();
+        if conn.protocol == NetworkProtocol::Smb {
+            let unc = conn.host.clone();
+            tokio_runtime().spawn(async move {
+                let res = tokio::task::spawn_blocking(move || {
+                    disconnect_smb_share(&unc).map(|()| Some(format!("Disconnected {name}")))
+                })
+                .await
+                .unwrap_or_else(|e| Err(format!("Disconnect failed: {e}")));
+                let _ = tx.unbounded_send(BgEvent::RemoteOpFinished {
+                    result: res,
+                    refresh_side: None,
+                });
+            });
+        } else {
+            tokio_runtime().spawn(async move {
+                pool.disconnect(id).await;
+                let _ = tx.unbounded_send(BgEvent::RemoteOpFinished {
+                    result: Ok(Some(format!("Disconnected {name}"))),
+                    refresh_side: None,
+                });
+            });
+        }
+        cx.notify();
+    }
+
+    pub fn remove_network_connection(&mut self, id: Uuid, cx: &mut Context<Self>) {
+        if self.settings.remove_network_connection(id) {
+            let _ = self.settings.save();
+            self.session_passwords.remove(&id);
+            let _ = delete_network_password(&id.to_string());
+            let pool = self.remote_pool.clone();
+            tokio_runtime().spawn(async move {
+                pool.disconnect(id).await;
+            });
+            self.set_toast_simple("Removed network connection", ToastKind::Info, cx);
+        }
+    }
+
+    fn open_remote_file_cached(
+        &mut self,
+        connection_id: Uuid,
+        remote_path: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(conn) = self.settings.network_connection(connection_id).cloned() else {
+            return;
+        };
+        let filename = remote_path
+            .rsplit('/')
+            .next()
+            .filter(|s| !s.is_empty())
+            .unwrap_or("remote_file")
+            .to_string();
+        let cache_dir = dirs::cache_dir()
+            .unwrap_or_else(std::env::temp_dir)
+            .join("TExplorer")
+            .join("remote-cache")
+            .join(connection_id.to_string());
+        let local_dest = cache_dir.join(&filename);
+        self.show_toast(
+            format!("Downloading {filename}..."),
+            ToastKind::Info,
+            window,
+            cx,
+        );
+        let creds = self.resolve_remote_credentials(connection_id);
+        let pool = self.remote_pool.clone();
+        let tx = self.bg_tx.clone();
+        tokio_runtime().spawn(async move {
+            let result = pool
+                .download_file(&conn, &creds, &remote_path, &local_dest)
+                .await
+                .map(|_| local_dest);
+            let _ = tx.unbounded_send(BgEvent::RemoteFileOpened { result });
+        });
+    }
+
+    pub fn download_remote_file_to_local(
+        &mut self,
+        side: PaneSide,
+        connection_id: Uuid,
+        remote_path: String,
+        filename: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(conn) = self.settings.network_connection(connection_id).cloned() else {
+            return;
+        };
+        let dest_dir = self
+            .active_tab()
+            .filter(|t| t.model.split_enabled)
+            .and_then(|t| {
+                t.model
+                    .pane(side.opposite())
+                    .location
+                    .as_local_path()
+                    .map(|p| p.to_path_buf())
+            })
+            .or_else(dirs::download_dir)
+            .unwrap_or_else(std::env::temp_dir);
+        let dest_file = unique_keep_both_path(&dest_dir.join(&filename));
+        let refresh_opposite = self
+            .active_tab()
+            .filter(|t| t.model.split_enabled)
+            .and_then(|t| {
+                t.model
+                    .pane(side.opposite())
+                    .location
+                    .as_local_path()
+                    .map(|_| side.opposite())
+            });
+        self.show_toast(
+            format!("Downloading {filename} to {}...", dest_dir.display()),
+            ToastKind::Info,
+            window,
+            cx,
+        );
+        let creds = self.resolve_remote_credentials(connection_id);
+        let pool = self.remote_pool.clone();
+        let tx = self.bg_tx.clone();
+        tokio_runtime().spawn(async move {
+            let result = pool
+                .download_file(&conn, &creds, &remote_path, &dest_file)
+                .await
+                .map(|_| Some(format!("Downloaded {filename}")));
+            let _ = tx.unbounded_send(BgEvent::RemoteOpFinished {
+                result,
+                refresh_side: refresh_opposite,
+            });
+        });
+    }
+
+    pub fn open_remote_new_folder_prompt(
+        &mut self,
+        side: PaneSide,
+        connection_id: Uuid,
+        parent_remote_path: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_text_prompt(
+            "New Remote Folder",
+            "Create",
+            "new-folder",
+            TextPromptKind::RemoteNewFolder {
+                side,
+                connection_id,
+                parent_remote_path,
+            },
+            window,
+            cx,
+        );
+    }
+
+    pub fn open_remote_rename_prompt(
+        &mut self,
+        side: PaneSide,
+        connection_id: Uuid,
+        remote_path: String,
+        current_name: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_text_prompt(
+            "Rename Remote Item",
+            "Rename",
+            &current_name,
+            TextPromptKind::RemoteRename {
+                side,
+                connection_id,
+                remote_path,
+            },
+            window,
+            cx,
+        );
+    }
+
+    pub fn delete_remote_entry(
+        &mut self,
+        side: PaneSide,
+        connection_id: Uuid,
+        remote_path: String,
+        is_dir: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(conn) = self.settings.network_connection(connection_id).cloned() else {
+            return;
+        };
+        let creds = self.resolve_remote_credentials(connection_id);
+        let pool = self.remote_pool.clone();
+        let tx = self.bg_tx.clone();
+        let name = remote_path
+            .rsplit('/')
+            .next()
+            .unwrap_or(&remote_path)
+            .to_string();
+        tokio_runtime().spawn(async move {
+            let result = pool
+                .delete_entry(&conn, &creds, &remote_path, is_dir)
+                .await
+                .map(|()| Some(format!("Deleted remote item \"{name}\"")));
+            let _ = tx.unbounded_send(BgEvent::RemoteOpFinished {
+                result,
+                refresh_side: Some(side),
+            });
+        });
+        cx.notify();
+    }
+
+    fn default_p2p_dest_dir(&self) -> PathBuf {
+        self.active_tab()
+            .and_then(|t| t.model.active_pane_ref().location.as_local_path())
+            .filter(|p| p.is_dir())
+            .map(|p| p.to_path_buf())
+            .or_else(dirs::download_dir)
+            .unwrap_or_else(std::env::temp_dir)
+    }
+
+    pub fn open_p2p_modal_from_sidebar(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let side = self
+            .active_tab()
+            .map(|t| t.model.active_pane)
+            .unwrap_or(PaneSide::Left);
+        let selected = self.selected_local_paths(side);
+        let tab = if selected.is_empty() && self.active_p2p_share.is_none() {
+            P2pModalTab::Receive
+        } else {
+            P2pModalTab::Send
+        };
+        self.open_p2p_modal(tab, selected, window, cx);
+    }
+
+    pub fn open_p2p_send_modal(
+        &mut self,
+        paths: Vec<PathBuf>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_p2p_modal(P2pModalTab::Send, paths, window, cx);
+    }
+
+    pub fn open_p2p_send_to_peer(
+        &mut self,
+        peer: NearbyPeer,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let side = self
+            .active_tab()
+            .map(|t| t.model.active_pane)
+            .unwrap_or(PaneSide::Left);
+        let selected = self.selected_local_paths(side);
+        if selected.is_empty() {
+            self.open_p2p_modal(P2pModalTab::Send, Vec::new(), window, cx);
+            self.show_toast(
+                format!(
+                    "Select files in a folder first to send directly to {}.",
+                    peer.device_name
+                ),
+                ToastKind::Info,
+                window,
+                cx,
+            );
+            return;
+        }
+        let svc = self.p2p_service.clone();
+        let peer_name = peer.device_name.clone();
+        self.show_toast(
+            format!("Sending P2P request to {peer_name}..."),
+            ToastKind::Info,
+            window,
+            cx,
+        );
+        let tx = self.bg_tx.clone();
+        tokio_runtime().spawn(async move {
+            if let Err(err) = svc.send_to_peer(peer, selected).await {
+                let _ = tx.unbounded_send(BgEvent::P2p(P2pEvent::EndpointError(err)));
+            }
+        });
+    }
+
+    fn open_p2p_modal(
+        &mut self,
+        tab: P2pModalTab,
+        selected_paths: Vec<PathBuf>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.context_menu = None;
+        self.quicklook_open = false;
+        self.stop_video_playback();
+        self.modal_subs.clear();
+
+        let dest_dir = self.default_p2p_dest_dir();
+        let ticket_input =
+            cx.new(|cx| InputState::new(window, cx).placeholder("Paste texp1-... share code here"));
+        let sub = cx.subscribe_in(
+            &ticket_input,
+            window,
+            |this, state, ev: &InputEvent, _window, cx| {
+                if matches!(ev, InputEvent::Change)
+                    && let Some(ActiveModal::P2p(ref mut m)) = this.active_modal
+                {
+                    m.ticket_text = state.read(cx).value().to_string();
+                    m.error = None;
+                    cx.notify();
+                }
+            },
+        );
+        self.modal_subs.push(sub);
+        if tab == P2pModalTab::Receive {
+            ticket_input.update(cx, |s, cx| s.focus(window, cx));
+        }
+
+        self.active_modal = Some(ActiveModal::P2p(P2pModalState {
+            tab,
+            selected_paths,
+            ticket_input,
+            ticket_text: String::new(),
+            dest_dir,
+            generating_share: false,
+            error: None,
+        }));
+        cx.notify();
+    }
+
+    pub fn set_p2p_modal_tab(
+        &mut self,
+        tab: P2pModalTab,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(ActiveModal::P2p(ref mut m)) = self.active_modal {
+            m.tab = tab;
+            m.error = None;
+            if tab == P2pModalTab::Receive {
+                let input = m.ticket_input.clone();
+                input.update(cx, |s, cx| s.focus(window, cx));
+            }
+            cx.notify();
+        }
+    }
+
+    pub fn p2p_load_current_selection(&mut self, cx: &mut Context<Self>) {
+        let side = self
+            .active_tab()
+            .map(|t| t.model.active_pane)
+            .unwrap_or(PaneSide::Left);
+        let paths = self.selected_local_paths(side);
+        if let Some(ActiveModal::P2p(ref mut m)) = self.active_modal {
+            if paths.is_empty() {
+                m.error = Some("No local files or folders are selected in the active pane.".to_string());
+            } else {
+                m.selected_paths = paths;
+                m.error = None;
+            }
+            cx.notify();
+        }
+    }
+
+    pub fn generate_p2p_share_code(&mut self, cx: &mut Context<Self>) {
+        let paths = match &mut self.active_modal {
+            Some(ActiveModal::P2p(m)) if !m.selected_paths.is_empty() => {
+                m.generating_share = true;
+                m.error = None;
+                m.selected_paths.clone()
+            }
+            _ => return,
+        };
+        let svc = self.p2p_service.clone();
+        let tx = self.bg_tx.clone();
+        tokio_runtime().spawn(async move {
+            let result = svc.create_share_offer(paths).await;
+            let _ = tx.unbounded_send(BgEvent::P2pShareCreated { result });
+        });
+        cx.notify();
+    }
+
+    pub fn stop_active_p2p_share(&mut self, cx: &mut Context<Self>) {
+        if let Some(share) = self.active_p2p_share.take() {
+            let svc = self.p2p_service.clone();
+            tokio_runtime().spawn(async move {
+                svc.cancel_share_offer(share.transfer_id).await;
+            });
+            self.set_toast_simple("Stopped P2P share", ToastKind::Info, cx);
+        }
+    }
+
+    pub fn send_p2p_to_peer(&mut self, peer: NearbyPeer, cx: &mut Context<Self>) {
+        let paths = match &self.active_modal {
+            Some(ActiveModal::P2p(m)) if !m.selected_paths.is_empty() => m.selected_paths.clone(),
+            _ => return,
+        };
+        let peer_name = peer.device_name.clone();
+        let svc = self.p2p_service.clone();
+        let tx = self.bg_tx.clone();
+        self.close_modal(cx);
+        self.set_toast_simple(
+            format!("Waiting for {peer_name} to accept P2P transfer..."),
+            ToastKind::Info,
+            cx,
+        );
+        tokio_runtime().spawn(async move {
+            if let Err(err) = svc.send_to_peer(peer, paths).await {
+                let _ = tx.unbounded_send(BgEvent::P2p(P2pEvent::EndpointError(err)));
+            }
+        });
+    }
+
+    pub fn start_p2p_receive_from_modal(&mut self, cx: &mut Context<Self>) {
+        let (ticket_code, dest_dir) = match &self.active_modal {
+            Some(ActiveModal::P2p(m)) => (m.ticket_text.trim().to_string(), m.dest_dir.clone()),
+            _ => return,
+        };
+        if let Err(err) = decode_ticket(&ticket_code) {
+            if let Some(ActiveModal::P2p(ref mut m)) = self.active_modal {
+                m.error = Some(err);
+            }
+            cx.notify();
+            return;
+        }
+        let svc = self.p2p_service.clone();
+        let tx = self.bg_tx.clone();
+        self.close_modal(cx);
+        self.set_toast_simple("Connecting to P2P sender...", ToastKind::Info, cx);
+        tokio_runtime().spawn(async move {
+            if let Err(err) = svc.receive_from_ticket(&ticket_code, dest_dir).await {
+                let _ = tx.unbounded_send(BgEvent::P2p(P2pEvent::EndpointError(err)));
+            }
+        });
+    }
+
+    pub fn respond_incoming_p2p(
+        &mut self,
+        transfer_id: Uuid,
+        accept: bool,
+        cx: &mut Context<Self>,
+    ) {
+        self.incoming_p2p_offers
+            .retain(|o| o.transfer_id != transfer_id);
+        let dest = if accept {
+            Some(self.default_p2p_dest_dir())
+        } else {
+            None
+        };
+        let svc = self.p2p_service.clone();
+        tokio_runtime().spawn(async move {
+            svc.respond_to_incoming(transfer_id, dest).await;
+        });
+        cx.notify();
+    }
+
     fn set_toast_simple(
         &mut self,
         message: impl Into<SharedString>,
@@ -4525,6 +6284,12 @@ impl Workspace {
             _ => {}
         }
     }
+}
+
+fn default_ssh_key_path_str() -> String {
+    dirs::home_dir()
+        .map(|h| h.join(".ssh").join("id_ed25519").display().to_string())
+        .unwrap_or_else(|| r"C:\Users\.ssh\id_ed25519".to_string())
 }
 
 fn archive_stem_name(path: &Path) -> String {
@@ -4987,16 +6752,31 @@ impl Render for Workspace {
                 if this.is_modal_blocking() {
                     return;
                 }
-                let info = this.active_tab().and_then(|t| {
+                let loc_info = this.active_tab().map(|t| {
                     let side = t.model.active_pane;
-                    t.model
-                        .pane(side)
-                        .location
-                        .as_local_path()
-                        .map(|p| (side, p.to_path_buf()))
+                    (side, t.model.pane(side).location.clone())
                 });
-                if let Some((side, dir)) = info {
-                    this.open_new_folder_prompt(side, dir, window, cx);
+                match loc_info {
+                    Some((side, Location::Local(dir))) => {
+                        this.open_new_folder_prompt(side, dir, window, cx);
+                    }
+                    Some((
+                        side,
+                        Location::Remote {
+                            connection_id,
+                            remote_path,
+                            ..
+                        },
+                    )) => {
+                        this.open_remote_new_folder_prompt(
+                            side,
+                            connection_id,
+                            remote_path,
+                            window,
+                            cx,
+                        );
+                    }
+                    _ => {}
                 }
             }))
             .on_action(cx.listener(|this, _: &RenameSelected, window, cx| {
@@ -5006,11 +6786,31 @@ impl Render for Workspace {
                 let info = this.active_tab().and_then(|t| {
                     let side = t.model.active_pane;
                     let entry = t.model.pane(side).primary_selected_entry()?;
-                    let path = entry.location.as_local_path()?.to_path_buf();
-                    Some((side, path, entry.name.clone()))
+                    Some((side, entry.location.clone(), entry.name.clone()))
                 });
-                if let Some((side, path, name)) = info {
-                    this.open_rename_prompt(side, path, name, window, cx);
+                match info {
+                    Some((side, Location::Local(path), name)) => {
+                        this.open_rename_prompt(side, path, name, window, cx);
+                    }
+                    Some((
+                        side,
+                        Location::Remote {
+                            connection_id,
+                            remote_path,
+                            ..
+                        },
+                        name,
+                    )) => {
+                        this.open_remote_rename_prompt(
+                            side,
+                            connection_id,
+                            remote_path,
+                            name,
+                            window,
+                            cx,
+                        );
+                    }
+                    _ => {}
                 }
             }))
             .on_action(cx.listener(|this, _: &DeleteToTrash, window, cx| {
@@ -5021,7 +6821,16 @@ impl Render for Workspace {
                     .active_tab()
                     .map(|t| t.model.active_pane)
                     .unwrap_or(PaneSide::Left);
-                this.trash_selected(side, window, cx);
+                let remote_target = this.active_tab().and_then(|t| {
+                    let entry = t.model.pane(side).primary_selected_entry()?;
+                    let (conn_id, _, rpath) = entry.location.as_remote()?;
+                    Some((conn_id, rpath.to_string(), entry.is_dir()))
+                });
+                if let Some((conn_id, rpath, is_dir)) = remote_target {
+                    this.delete_remote_entry(side, conn_id, rpath, is_dir, cx);
+                } else {
+                    this.trash_selected(side, window, cx);
+                }
             }))
             .on_action(cx.listener(|this, _: &DeletePermanent, _, cx| {
                 if this.is_modal_blocking() {
@@ -5073,6 +6882,11 @@ impl Render for Workspace {
             .child(div().flex_1().min_h_0().w_full().overflow_hidden().child(body))
             // Bottom-right floating transfer queue drawer
             .when(has_transfers, |el| el.child(render_transfer_drawer(self, cx)))
+            // Floating P2P incoming confirmations and live P2P transfer progress
+            .when(
+                !self.incoming_p2p_offers.is_empty() || !self.active_p2p_transfers.is_empty(),
+                |el| el.child(render_p2p_overlays(self, cx)),
+            )
             // Subtle bottom-right toast banner (lifted above transfer drawer when visible)
             .when_some(self.toast.clone(), |el, toast| {
                 let dot_hex = match toast.kind {

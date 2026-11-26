@@ -18,12 +18,14 @@ futures-channel.workspace = true
 futures-util.workspace = true
 gpui-kit.workspace = true
 image.workspace = true
+raw-window-handle = "0.6"
 reqwest.workspace = true
 serde.workspace = true
 sha2.workspace = true
 smallvec.workspace = true
 texplorer-core = { path = "../texplorer-core" }
 texplorer-mft = { path = "../texplorer-mft" }
+texplorer-net = { path = "../texplorer-net" }
 texplorer-ops = { path = "../texplorer-ops" }
 texplorer-platform = { path = "../texplorer-platform" }
 texplorer-vfs = { path = "../texplorer-vfs" }

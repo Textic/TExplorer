@@ -1,5 +1,5 @@
 use gpui_kit::{
-    AnyElement, Context, MouseButton, MouseDownEvent, Render, SharedString, Window,
+    AnyElement, Context, MouseButton, MouseDownEvent, Pixels, Point, Render, SharedString, Window,
     assets::IconName as LucideIcon,
     component::{
         Icon, IconName, Sizable as _, Size, StyledExt as _,
@@ -10,7 +10,9 @@ use gpui_kit::{
     },
     div, prelude::*, px, relative,
 };
-use texplorer_core::{KnownFolderKind, Location, SidebarSection};
+use texplorer_core::{
+    KnownFolderKind, Location, NetworkConnection, NetworkProtocol, SidebarSection,
+};
 
 use crate::theme::{
     Palette, RADIUS_CONTROL, RADIUS_ROW, drive_kind_icon, known_folder_icon, soft_tint, solid,
@@ -37,11 +39,15 @@ pub struct DraggedQuickAccessItem {
 pub struct SidebarDragGhost {
     pub label: SharedString,
     pub palette: Palette,
+    pub cursor_offset: Point<Pixels>,
 }
 
 impl Render for SidebarDragGhost {
     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
         h_flex()
+            .relative()
+            .left(self.cursor_offset.x + px(12.))
+            .top(self.cursor_offset.y + px(10.))
             .px_2p5()
             .py_1()
             .gap_1p5()
@@ -108,6 +114,9 @@ pub fn render_sidebar(ws: &Workspace, cx: &mut Context<Workspace>) -> impl IntoE
                 }
                 SidebarSection::Drives => Some(
                     render_drives_section(ws, &current_loc, collapsed, p, cx).into_any_element(),
+                ),
+                SidebarSection::Network => Some(
+                    render_network_section(ws, &current_loc, collapsed, p, cx).into_any_element(),
                 ),
                 SidebarSection::LinuxWsl => {
                     if ws.wsl_distros.is_empty() {
@@ -232,10 +241,11 @@ fn render_quick_access_section(
                         gpui_kit::transparent_black()
                     })
                     .hover(move |s| s.bg(solid(p.bg_elevated)))
-                    .on_drag(drag_payload, move |drag, _, _, cx| {
+                    .on_drag(drag_payload, move |drag, cursor_offset, _, cx| {
                         cx.new(|_| SidebarDragGhost {
                             label: drag.label.clone(),
                             palette: p,
+                            cursor_offset,
                         })
                     })
                     .drag_over::<DraggedQuickAccessItem>(move |style, drag, _, _| {
@@ -550,6 +560,318 @@ fn render_drives_section(
         })
 }
 
+fn render_network_section(
+    ws: &Workspace,
+    current_loc: &Location,
+    collapsed: bool,
+    p: Palette,
+    cx: &mut Context<Workspace>,
+) -> impl IntoElement {
+    let actions = h_flex()
+        .items_center()
+        .gap_0p5()
+        .child(
+            Button::new("sb-net-p2p")
+                .with_size(Size::XSmall)
+                .ghost()
+                .icon(LucideIcon::Radio)
+                .tooltip("P2P Transfer (Send / Receive)")
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.open_p2p_modal_from_sidebar(window, cx);
+                })),
+        )
+        .child(
+            Button::new("sb-net-add")
+                .with_size(Size::XSmall)
+                .ghost()
+                .icon(LucideIcon::Plus)
+                .tooltip("Connect to Server or Shared Folder")
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.open_network_connect_modal(None, None, window, cx);
+                })),
+        )
+        .into_any_element();
+
+    let active_share_count = usize::from(ws.active_p2p_share.is_some());
+    let peer_count = ws.p2p_nearby_peers.len();
+
+    v_flex()
+        .gap_0p5()
+        .child(collapsible_section_header(
+            "sb-sec-network",
+            SidebarSection::Network,
+            collapsed,
+            p,
+            Some(actions),
+            cx,
+        ))
+        .when(!collapsed, |el| {
+            el.children(
+                ws.settings
+                    .network_connections
+                    .iter()
+                    .enumerate()
+                    .map(|(i, conn)| render_network_connection_row(ws, i, conn, current_loc, p, cx)),
+            )
+            // When no server is configured yet, offer a crisp 1-click entry to add one.
+            .when(ws.settings.network_connections.is_empty(), |inner| {
+                inner.child(
+                    h_flex()
+                        .id("sb-net-empty-add")
+                        .w_full()
+                        .h(px(30.))
+                        .px_2p5()
+                        .gap_2()
+                        .items_center()
+                        .rounded(px(RADIUS_CONTROL))
+                        .cursor_pointer()
+                        .hover(move |s| s.bg(solid(p.bg_elevated)))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _: &MouseDownEvent, window, cx| {
+                                this.open_network_connect_modal(None, None, window, cx);
+                            }),
+                        )
+                        .child(
+                            Icon::new(LucideIcon::Plus)
+                                .xsmall()
+                                .text_color(solid(p.text_muted)),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .truncate()
+                                .text_xs()
+                                .text_color(solid(p.text_muted))
+                                .child("Connect server / share..."),
+                        ),
+                )
+            })
+            // Quick P2P Transfer entry (Internet + LAN encrypted sharing)
+            .child(
+                h_flex()
+                    .id("sb-p2p-entry")
+                    .w_full()
+                    .h(px(32.))
+                    .px_2p5()
+                    .gap_2()
+                    .items_center()
+                    .rounded(px(RADIUS_CONTROL))
+                    .cursor_pointer()
+                    .hover(move |s| s.bg(solid(p.bg_elevated)))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _: &MouseDownEvent, window, cx| {
+                            this.open_p2p_modal_from_sidebar(window, cx);
+                        }),
+                    )
+                    .child(
+                        Icon::new(LucideIcon::Send)
+                            .xsmall()
+                            .text_color(if active_share_count > 0 || peer_count > 0 {
+                                solid(p.accent_primary)
+                            } else {
+                                solid(p.text_secondary)
+                            }),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .text_xs()
+                            .text_color(solid(p.text_secondary))
+                            .child("P2P Transfer"),
+                    )
+                    .when(active_share_count > 0, |row| {
+                        row.child(
+                            div()
+                                .px_1p5()
+                                .py(px(1.))
+                                .rounded(px(3.))
+                                .bg(soft_tint(p.status_success, 0.16))
+                                .text_size(px(10.5))
+                                .font_semibold()
+                                .text_color(solid(p.status_success))
+                                .child("LIVE"),
+                        )
+                    })
+                    .when(active_share_count == 0 && peer_count > 0, |row| {
+                        row.child(
+                            div()
+                                .px_1p5()
+                                .py(px(1.))
+                                .rounded(px(3.))
+                                .bg(soft_tint(p.accent_primary, 0.16))
+                                .text_size(px(10.5))
+                                .font_semibold()
+                                .text_color(solid(p.accent_primary))
+                                .child(format!("{peer_count}")),
+                        )
+                    }),
+            )
+            // Nearby LAN peers discovered automatically on the same network
+            .children(
+                ws.p2p_nearby_peers
+                    .iter()
+                    .enumerate()
+                    .map(|(i, peer)| {
+                        let peer_click = peer.clone();
+                        let name: SharedString = peer.device_name.clone().into();
+                        h_flex()
+                            .id(("sb-p2p-peer", i))
+                            .w_full()
+                            .h(px(30.))
+                            .pl_5()
+                            .pr_2p5()
+                            .gap_2()
+                            .items_center()
+                            .rounded(px(RADIUS_CONTROL))
+                            .cursor_pointer()
+                            .hover(move |s| s.bg(solid(p.bg_elevated)))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, _: &MouseDownEvent, window, cx| {
+                                    this.open_p2p_send_to_peer(peer_click.clone(), window, cx);
+                                }),
+                            )
+                            .child(
+                                div()
+                                    .w(px(6.))
+                                    .h(px(6.))
+                                    .flex_shrink_0()
+                                    .rounded(px(999.))
+                                    .bg(solid(p.status_success)),
+                            )
+                            .child(
+                                Icon::new(LucideIcon::Laptop)
+                                    .xsmall()
+                                    .text_color(solid(p.text_secondary)),
+                            )
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_xs()
+                                    .text_color(solid(p.text_secondary))
+                                    .child(name),
+                            )
+                    }),
+            )
+        })
+}
+
+fn render_network_connection_row(
+    ws: &Workspace,
+    idx: usize,
+    conn: &NetworkConnection,
+    current_loc: &Location,
+    p: Palette,
+    cx: &mut Context<Workspace>,
+) -> impl IntoElement + use<> {
+    let active = match current_loc {
+        Location::Remote { connection_id, .. } => *connection_id == conn.id,
+        Location::Local(path) => conn
+            .smb_unc_path()
+            .is_some_and(|unc| path.starts_with(&unc)),
+        _ => false,
+    };
+    let connected = ws.is_network_connected(conn.id);
+    let icon = match conn.protocol {
+        NetworkProtocol::Smb => LucideIcon::Network,
+        NetworkProtocol::Sftp => LucideIcon::Server,
+        NetworkProtocol::Ftp => LucideIcon::Globe,
+        NetworkProtocol::Ftps => LucideIcon::Lock,
+    };
+    let label: SharedString = conn.display_name().into();
+    let badge = conn.protocol.short_badge();
+    let conn_open = conn.clone();
+    let conn_mid = conn.clone();
+    let conn_ctx = conn.clone();
+
+    h_flex()
+        .id(("sb-net-conn", idx))
+        .w_full()
+        .h(px(32.))
+        .px_2p5()
+        .gap_2()
+        .items_center()
+        .rounded(px(RADIUS_CONTROL))
+        .cursor_pointer()
+        .bg(if active {
+            solid(p.bg_elevated)
+        } else {
+            gpui_kit::transparent_black()
+        })
+        .hover(move |s| s.bg(solid(p.bg_elevated)))
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(move |this, _: &MouseDownEvent, window, cx| {
+                this.open_network_connection(conn_open.clone(), false, window, cx);
+            }),
+        )
+        .on_mouse_down(
+            MouseButton::Middle,
+            cx.listener(move |this, _: &MouseDownEvent, window, cx| {
+                this.open_network_connection(conn_mid.clone(), true, window, cx);
+            }),
+        )
+        .on_mouse_down(
+            MouseButton::Right,
+            cx.listener(move |this, ev: &MouseDownEvent, window, cx| {
+                window.prevent_default();
+                this.open_context_menu(
+                    ev.position,
+                    ContextMenuTarget::NetworkConnection(conn_ctx.clone()),
+                    cx,
+                );
+            }),
+        )
+        .child(Icon::new(icon).xsmall().text_color(if active {
+            solid(p.accent_primary)
+        } else {
+            solid(p.text_secondary)
+        }))
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .truncate()
+                .text_xs()
+                .text_color(if active {
+                    solid(p.text_primary)
+                } else {
+                    solid(p.text_secondary)
+                })
+                .child(label),
+        )
+        .when(connected, |el| {
+            el.child(
+                div()
+                    .w(px(5.))
+                    .h(px(5.))
+                    .flex_shrink_0()
+                    .rounded(px(999.))
+                    .bg(solid(p.status_success)),
+            )
+        })
+        .child(
+            div()
+                .flex_shrink_0()
+                .px_1()
+                .py(px(1.))
+                .rounded(px(3.))
+                .bg(solid(p.bg_base))
+                .border_1()
+                .border_color(solid(p.border_subtle))
+                .text_size(px(10.))
+                .text_color(solid(p.text_muted))
+                .child(badge),
+        )
+}
+
 fn render_wsl_section(
     ws: &Workspace,
     current_loc: &Location,
@@ -673,10 +995,11 @@ fn collapsible_section_header(
                 .cursor_pointer()
                 .text_color(solid(p.text_muted))
                 .hover(move |s| s.bg(solid(p.bg_elevated)).text_color(solid(p.text_primary)))
-                .on_drag(drag_payload, move |drag, _, _, cx| {
+                .on_drag(drag_payload, move |drag, cursor_offset, _, cx| {
                     cx.new(|_| SidebarDragGhost {
                         label: drag.label.clone(),
                         palette: p,
+                        cursor_offset,
                     })
                 })
                 .drag_over::<DraggedSidebarSection>(move |style, drag, _, _| {

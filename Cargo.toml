@@ -4,6 +4,7 @@ members = [
     "crates/texplorer-core",
     "crates/texplorer-platform",
     "crates/texplorer-vfs",
+    "crates/texplorer-net",
     "crates/texplorer-ops",
     "crates/texplorer-mft",
     "crates/texplorer-service",
@@ -12,12 +13,13 @@ members = [
 default-members = ["crates/texplorer-app"]
 
 [workspace.package]
-version = "0.6.0"
+version = "0.7.0"
 edition = "2024"
 authors = ["Textic"]
 license = "MIT"
 
 [workspace.dependencies]
+base64 = "0.22"
 bitflags = { version = "2.6", features = ["serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 dirs = "6.0"
@@ -26,6 +28,7 @@ futures-channel = "0.3"
 futures-util = "0.3"
 gpui-kit = "0.10.0"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp", "ico"] }
+iroh = "1.5"
 md-5 = "0.10"
 rayon = "1.10"
 regex = "1.11"
@@ -40,13 +43,16 @@ reqwest = { version = "0.13", default-features = false, features = [
     "brotli",
     "deflate",
 ] }
+russh = { version = "0.65", default-features = false, features = ["flate2", "ring", "rsa"] }
+russh-sftp = "4.0"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sevenz-rust = "0.6"
 sha2 = "0.10"
 smallvec = "1.15"
+suppaftp = { version = "13.0", features = ["native-tls"] }
 tar = "0.4"
-tokio = { version = "1.48", features = ["rt-multi-thread", "macros", "time", "sync", "fs", "io-util"] }
+tokio = { version = "1.48", features = ["rt-multi-thread", "macros", "time", "sync", "fs", "io-util", "net"] }
 trash = "5.2"
 uuid = { version = "1.0", features = ["v4", "serde"] }
 windows = "0.58"

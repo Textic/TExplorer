@@ -450,6 +450,86 @@ pub fn load_archive_entry_preview_blocking(
     }
 }
 
+/// Builds a rich inline preview payload from raw bytes downloaded from a remote SFTP/FTP server.
+pub fn preview_from_remote_bytes(
+    remote_path: &str,
+    bytes: Vec<u8>,
+    truncated: bool,
+    palette: Palette,
+) -> PreviewPayload {
+    let ext = remote_path
+        .rsplit_once('.')
+        .map(|(_, e)| e.to_ascii_lowercase())
+        .unwrap_or_default();
+
+    if !truncated
+        && matches!(
+            ext.as_str(),
+            "png" | "jpg" | "jpeg" | "webp" | "gif" | "bmp" | "ico"
+        )
+    {
+        let animated = match ext.as_str() {
+            "gif" => decode_animated_gif_bytes(&bytes, MAX_ANIMATED_DIM),
+            "webp" => decode_animated_webp_bytes(&bytes, MAX_ANIMATED_DIM),
+            _ => None,
+        };
+        if let Some((image, orig_width, orig_height, frame_count)) = animated {
+            return PreviewPayload::Image {
+                image,
+                orig_width,
+                orig_height,
+                frame_count,
+            };
+        }
+        if let Ok(dyn_img) = image::load_from_memory(&bytes) {
+            let orig_w = dyn_img.width();
+            let orig_h = dyn_img.height();
+            let resized = if orig_w > 1280 || orig_h > 1280 {
+                dyn_img.resize(1280, 1280, FilterType::Triangle)
+            } else {
+                dyn_img
+            };
+            let mut rgba = resized.to_rgba8();
+            for px in rgba.pixels_mut() {
+                px.0.swap(0, 2);
+            }
+            let frame = Frame::new(rgba);
+            return PreviewPayload::Image {
+                image: Arc::new(RenderImage::new(smallvec![frame])),
+                orig_width: orig_w,
+                orig_height: orig_h,
+                frame_count: 1,
+            };
+        }
+    }
+
+    if !bytes.contains(&0)
+        && let Ok(text) = String::from_utf8(bytes)
+    {
+        if matches!(ext.as_str(), "md" | "markdown") {
+            return PreviewPayload::Markdown {
+                source: text,
+                truncated,
+            };
+        }
+        let language = if is_text_or_code_extension(&ext) {
+            language_label(&ext)
+        } else {
+            "Plain Text"
+        };
+        let lines = highlight_code_lines(&text, &ext, 450, palette);
+        return PreviewPayload::Code {
+            language,
+            lines,
+            truncated,
+        };
+    }
+
+    PreviewPayload::Unsupported {
+        reason: "Binary remote file — click Open or Download to view locally.".to_string(),
+    }
+}
+
 fn load_folder_summary(path: &Path) -> PreviewPayload {
     let Ok(rd) = std::fs::read_dir(path) else {
         return PreviewPayload::Unsupported {

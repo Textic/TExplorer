@@ -106,47 +106,215 @@ pub fn reveal_in_windows_explorer(path: &Path) -> Result<(), String> {
     }
 }
 
-/// Opens a native terminal in `path` (or its parent directory if `path` is a file).
-pub fn open_terminal_here(path: &Path, preferred_cmd: &str) -> Result<(), String> {
-    let dir = if path.is_dir() {
+/// Normalizes a filesystem directory path for passing to external Windows terminals (`wt.exe`,
+/// `pwsh.exe`, `powershell.exe`): strips extended `\\?\` prefixes and trims redundant trailing
+/// separators from non-root paths while preserving drive roots (`C:\`).
+pub fn normalize_terminal_dir(path: &Path) -> PathBuf {
+    let base = if path.is_dir() {
         path
     } else {
         path.parent().unwrap_or(path)
     };
+    let raw = base.to_string_lossy();
+    let stripped = if let Some(unc) = raw.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{unc}")
+    } else if let Some(rest) = raw.strip_prefix(r"\\?\") {
+        rest.to_string()
+    } else {
+        raw.into_owned()
+    };
+    let bytes = stripped.as_bytes();
+    if bytes.len() == 3 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' && (bytes[2] == b'\\' || bytes[2] == b'/') {
+        return PathBuf::from(format!("{}:\\", bytes[0] as char));
+    }
+    if bytes.len() == 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+        return PathBuf::from(format!("{}:\\", bytes[0] as char));
+    }
+    let trimmed = stripped.trim_end_matches(['\\', '/']);
+    if trimmed.is_empty() {
+        base.to_path_buf()
+    } else {
+        PathBuf::from(trimmed)
+    }
+}
+
+/// Formats `-d "<dir>"` for Windows Terminal (`wt.exe`), safely escaping drive roots (`X:\`) so
+/// `CommandLineToArgvW` never treats `\"` as an escaped quote.
+pub fn format_wt_dir_args(dir: &Path) -> String {
+    let raw = dir.to_string_lossy();
+    let escaped = if raw.ends_with('\\') {
+        format!("{raw}\\")
+    } else {
+        raw.into_owned()
+    };
+    format!("-d \"{}\"", escaped.replace('"', "\\\""))
+}
+
+/// Launches `file` via the desktop `explorer.exe` shell (`IShellDispatch2::ShellExecute`) so child
+/// processes run under the normal non-elevated desktop user token and user environment even when
+/// TExplorer itself was launched elevated.
+pub fn spawn_as_desktop_user(file: &str, args: &str, working_dir: &Path) -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    {
+        use windows::Win32::System::Com::{
+            CLSCTX_LOCAL_SERVER, COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE,
+            CoCreateInstance, CoInitializeEx, CoUninitialize, IDispatch, IServiceProvider,
+        };
+        use windows::Win32::UI::Shell::{
+            CSIDL_DESKTOP, IShellBrowser, IShellDispatch2, IShellFolderViewDual, IShellView,
+            IShellWindows, SID_STopLevelBrowser, SVGIO_BACKGROUND, SWC_DESKTOP, SWFO_NEEDDISPATCH,
+            ShellWindows,
+        };
+        use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+        use windows_core::{BSTR, Interface, VARIANT};
+
+        let com_inited = unsafe {
+            CoInitializeEx(None, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE).is_ok()
+        };
+        struct ComGuard(bool);
+        impl Drop for ComGuard {
+            fn drop(&mut self) {
+                if self.0 {
+                    unsafe {
+                        CoUninitialize();
+                    }
+                }
+            }
+        }
+        let _com_guard = ComGuard(com_inited);
+
+        let shell_windows: IShellWindows =
+            unsafe { CoCreateInstance(&ShellWindows, None, CLSCTX_LOCAL_SERVER) }
+                .map_err(|e| format!("Failed connecting to Windows Shell desktop: {e}"))?;
+        let loc = VARIANT::from(CSIDL_DESKTOP as i32);
+        let empty = VARIANT::default();
+        let mut hwnd = 0i32;
+        let desktop_disp: IDispatch = unsafe {
+            shell_windows.FindWindowSW(&loc, &empty, SWC_DESKTOP, &mut hwnd, SWFO_NEEDDISPATCH)
+        }
+        .map_err(|e| format!("Failed locating desktop shell window: {e}"))?;
+
+        let service_provider: IServiceProvider = desktop_disp
+            .cast()
+            .map_err(|e| format!("Failed querying IServiceProvider: {e}"))?;
+        let browser: IShellBrowser =
+            unsafe { service_provider.QueryService(&SID_STopLevelBrowser) }
+                .map_err(|e| format!("Failed querying desktop IShellBrowser: {e}"))?;
+        let view: IShellView = unsafe { browser.QueryActiveShellView() }
+            .map_err(|e| format!("Failed querying active desktop IShellView: {e}"))?;
+        let bg_disp: IDispatch = unsafe { view.GetItemObject(SVGIO_BACKGROUND) }
+            .map_err(|e| format!("Failed obtaining desktop background object: {e}"))?;
+        let folder_view: IShellFolderViewDual = bg_disp
+            .cast()
+            .map_err(|e| format!("Failed querying IShellFolderViewDual: {e}"))?;
+        let app_disp: IDispatch = unsafe { folder_view.Application() }
+            .map_err(|e| format!("Failed obtaining Shell application object: {e}"))?;
+        let dispatch: IShellDispatch2 = app_disp
+            .cast()
+            .map_err(|e| format!("Failed querying IShellDispatch2: {e}"))?;
+
+        let clean_dir = normalize_terminal_dir(working_dir);
+        let dir_str = clean_dir.to_string_lossy().into_owned();
+        unsafe {
+            dispatch.ShellExecute(
+                &BSTR::from(file),
+                &VARIANT::from(BSTR::from(args)),
+                &VARIANT::from(BSTR::from(dir_str)),
+                &VARIANT::from(BSTR::from("open")),
+                &VARIANT::from(SW_SHOWNORMAL.0),
+            )
+        }
+        .map_err(|e| format!("Desktop shell failed launching \"{file}\": {e}"))?;
+        Ok(())
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = (file, args, working_dir);
+        Err("Desktop shell launch is only supported on Windows.".to_string())
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn windows_terminal_available() -> bool {
+    if let Some(local_app_data) = std::env::var_os("LOCALAPPDATA") {
+        let alias = PathBuf::from(local_app_data)
+            .join("Microsoft")
+            .join("WindowsApps")
+            .join("wt.exe");
+        if alias.exists() {
+            return true;
+        }
+    }
+    if let Some(path_var) = std::env::var_os("PATH") {
+        for dir in std::env::split_paths(&path_var) {
+            if dir.join("wt.exe").exists() {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Opens a native terminal in `path` (or its parent directory if `path` is a file).
+/// Always spawns as the normal desktop user even if TExplorer is running elevated.
+pub fn open_terminal_here(path: &Path, preferred_cmd: &str) -> Result<(), String> {
+    let dir = normalize_terminal_dir(path);
 
     #[cfg(target_os = "windows")]
     {
         let preferred = preferred_cmd.trim();
-        if (preferred.is_empty() || preferred.eq_ignore_ascii_case("wt.exe") || preferred.eq_ignore_ascii_case("wt"))
-            && Command::new("wt.exe")
+        let wants_wt = preferred.is_empty()
+            || preferred.eq_ignore_ascii_case("wt.exe")
+            || preferred.eq_ignore_ascii_case("wt");
+        let elevated = crate::elevation::is_elevated();
+
+        if wants_wt && windows_terminal_available() {
+            if elevated {
+                let wt_args = format_wt_dir_args(&dir);
+                if spawn_as_desktop_user("wt.exe", &wt_args, &dir).is_ok() {
+                    return Ok(());
+                }
+            }
+            if Command::new("wt.exe")
                 .arg("-d")
-                .arg(dir)
+                .arg(&dir)
+                .current_dir(&dir)
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .spawn()
                 .is_ok()
-        {
-            return Ok(());
+            {
+                return Ok(());
+            }
         }
-        if !preferred.is_empty()
-            && !preferred.eq_ignore_ascii_case("wt.exe")
-            && !preferred.eq_ignore_ascii_case("wt")
-            && Command::new(preferred)
-                .current_dir(dir)
+
+        if !preferred.is_empty() && !wants_wt {
+            if elevated && spawn_as_desktop_user(preferred, "", &dir).is_ok() {
+                return Ok(());
+            }
+            if Command::new(preferred)
+                .current_dir(&dir)
                 .stdin(Stdio::null())
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .spawn()
                 .is_ok()
-        {
-            return Ok(());
+            {
+                return Ok(());
+            }
         }
+
         let escaped = dir.to_string_lossy().replace('\'', "''");
+        let ps_args = format!("-NoExit -Command \"Set-Location -LiteralPath '{escaped}'\"");
+        if elevated && spawn_as_desktop_user("powershell.exe", &ps_args, &dir).is_ok() {
+            return Ok(());
+        }
         Command::new("powershell.exe")
             .arg("-NoExit")
             .arg("-Command")
             .arg(format!("Set-Location -LiteralPath '{escaped}'"))
+            .current_dir(&dir)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -178,6 +346,13 @@ pub fn open_in_editor(path: &Path, editor_cmd: &str) -> Result<(), String> {
     {
         use std::os::windows::process::CommandExt;
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        let working_dir = normalize_terminal_dir(path);
+        if crate::elevation::is_elevated() {
+            let quoted_target = format!("\"{}\"", path.to_string_lossy().replace('"', "\\\""));
+            if spawn_as_desktop_user(cmd, &quoted_target, &working_dir).is_ok() {
+                return Ok(());
+            }
+        }
         if Command::new(cmd)
             .arg(path)
             .stdin(Stdio::null())
@@ -319,5 +494,30 @@ fn remove_dir_readonly(path: &Path) -> Result<(), String> {
                 .map_err(|err| format!("Failed to delete folder \"{}\": {err}", path.display()))
         }
         Err(e) => Err(format!("Failed to delete folder \"{}\": {e}", path.display())),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalizes_terminal_dir_and_wt_quotes() {
+        assert_eq!(
+            normalize_terminal_dir(Path::new(r"\\?\X:\TExplorer\")),
+            PathBuf::from(r"X:\TExplorer")
+        );
+        assert_eq!(
+            normalize_terminal_dir(Path::new(r"\\?\C:\")),
+            PathBuf::from(r"C:\")
+        );
+        assert_eq!(
+            format_wt_dir_args(Path::new(r"X:\")),
+            r#"-d "X:\\""#
+        );
+        assert_eq!(
+            format_wt_dir_args(Path::new(r"C:\Users\My Folder")),
+            r#"-d "C:\Users\My Folder""#
+        );
     }
 }

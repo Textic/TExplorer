@@ -1,8 +1,10 @@
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 use crate::entry::{KnownFolder, KnownFolderKind, ViewMode};
+use crate::network::NetworkConnection;
 
 /// Base surface theme preset. Files palettes appear first, followed by Obsidian Dark.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -187,15 +189,17 @@ pub enum SidebarSection {
     QuickAccess,
     Pinned,
     Drives,
+    Network,
     LinuxWsl,
 }
 
 impl SidebarSection {
     /// Default vertical order for left sidebar categories.
-    pub const DEFAULT_ORDER: [Self; 4] = [
+    pub const DEFAULT_ORDER: [Self; 5] = [
         Self::QuickAccess,
         Self::Pinned,
         Self::Drives,
+        Self::Network,
         Self::LinuxWsl,
     ];
 
@@ -204,6 +208,7 @@ impl SidebarSection {
             Self::QuickAccess => "Quick Access",
             Self::Pinned => "Pinned",
             Self::Drives => "Drives",
+            Self::Network => "Network",
             Self::LinuxWsl => "Linux / WSL",
         }
     }
@@ -213,6 +218,7 @@ impl SidebarSection {
             Self::QuickAccess => "QUICK ACCESS",
             Self::Pinned => "PINNED",
             Self::Drives => "DRIVES",
+            Self::Network => "NETWORK",
             Self::LinuxWsl => "LINUX / WSL",
         }
     }
@@ -244,6 +250,7 @@ pub struct AppSettings {
     pub quick_access_order: Vec<KnownFolderKind>,
     pub hidden_quick_access: Vec<KnownFolderKind>,
     pub pinned_folders: Vec<PathBuf>,
+    pub network_connections: Vec<NetworkConnection>,
     pub details_col_modified: u16,
     pub details_col_type: u16,
     pub details_col_size: u16,
@@ -278,6 +285,7 @@ impl Default for AppSettings {
             quick_access_order: Vec::new(),
             hidden_quick_access: Vec::new(),
             pinned_folders: Vec::new(),
+            network_connections: Vec::new(),
             details_col_modified: 164,
             details_col_type: 144,
             details_col_size: 106,
@@ -570,6 +578,31 @@ impl AppSettings {
         self.hidden_sidebar_sections.clear();
         self.collapsed_sidebar_sections.clear();
     }
+
+    /// Inserts or updates a saved network connection profile by `id`.
+    pub fn upsert_network_connection(&mut self, conn: NetworkConnection) {
+        if let Some(existing) = self
+            .network_connections
+            .iter_mut()
+            .find(|c| c.id == conn.id)
+        {
+            *existing = conn;
+        } else {
+            self.network_connections.push(conn);
+        }
+    }
+
+    /// Removes a saved network connection profile by `id`.
+    pub fn remove_network_connection(&mut self, id: Uuid) -> bool {
+        let before = self.network_connections.len();
+        self.network_connections.retain(|c| c.id != id);
+        self.network_connections.len() != before
+    }
+
+    /// Looks up a saved network connection profile by `id`.
+    pub fn network_connection(&self, id: Uuid) -> Option<&NetworkConnection> {
+        self.network_connections.iter().find(|c| c.id == id)
+    }
 }
 
 #[cfg(test)]
@@ -589,6 +622,7 @@ mod tests {
                 SidebarSection::Drives,
                 SidebarSection::QuickAccess,
                 SidebarSection::Pinned,
+                SidebarSection::Network,
                 SidebarSection::LinuxWsl,
             ]
         );

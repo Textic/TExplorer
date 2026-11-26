@@ -2,10 +2,13 @@
 
 pub mod clipboard;
 pub mod com_shell;
+pub mod credentials;
 pub mod default_explorer;
 pub mod elevation;
 pub mod launch;
 pub mod locks;
+pub mod network_share;
+pub mod ole_drop;
 pub mod single_instance;
 pub mod theme_detect;
 pub mod video_player;
@@ -15,6 +18,7 @@ pub mod win_e_hook;
 
 pub use clipboard::{ClipboardFiles, get_clipboard_files, set_clipboard_files};
 pub use com_shell::{RawBgraImage, ShellWorker, cursor_screen_pos};
+pub use credentials::{delete_network_password, load_network_password, save_network_password};
 pub use default_explorer::{
     DefaultExplorerStatus, delegate_to_windows_explorer, enable_default_explorer,
     query_default_explorer_status, restore_windows_explorer, set_win_e_interception,
@@ -23,9 +27,11 @@ pub use default_explorer::{
 pub use elevation::is_elevated;
 pub use launch::{
     delete_permanently, move_to_trash, open_in_editor, open_item, open_terminal_here,
-    reveal_in_windows_explorer, show_properties_dialog,
+    reveal_in_windows_explorer, show_properties_dialog, spawn_as_desktop_user,
 };
 pub use locks::{FileLockStatus, LockingProcess, inspect_file_lock};
+pub use network_share::{connect_smb_share, disconnect_smb_share};
+pub use ole_drop::{NativeDropEvent, install_native_drop_target};
 pub use single_instance::{
     LaunchIntent, SingleInstanceGuard, parse_cli_args, start_single_instance_server,
     try_forward_to_running_instance,
