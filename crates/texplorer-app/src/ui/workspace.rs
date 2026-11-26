@@ -1,4 +1,4 @@
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -44,17 +44,16 @@ use texplorer_ops::{
     unique_keep_both_path,
 };
 use texplorer_platform::{
-    DefaultExplorerStatus, DirectoryWatcher, FileLockStatus, LaunchIntent, NativeDropEvent,
-    ShellWorker, VideoNotify, VideoPlayerHandle, VideoStartOptions,
+    DefaultExplorerStatus, DirectoryWatcher, FileLockStatus, LaunchIntent, NativeDragOutcome,
+    NativeDropEvent, ShellWorker, VideoNotify, VideoPlayerHandle, VideoStartOptions,
     bring_current_process_window_to_front, connect_smb_share, cursor_screen_pos,
     delete_network_password, delete_permanently, disconnect_smb_share, enable_default_explorer,
     get_clipboard_files, inspect_file_lock, install_native_drop_target, is_elevated,
     list_known_folders, list_volumes, list_wsl_distros, load_network_password, move_to_trash,
     open_in_editor, open_item, open_terminal_here, pick_files_dialog, pick_folder_dialog,
-    query_default_explorer_status,
-    restore_windows_explorer, reveal_in_windows_explorer, save_network_password,
-    set_clipboard_files, set_win_e_interception, spawn_as_desktop_user, spawn_video_player,
-    system_prefers_dark_mode,
+    query_default_explorer_status, restore_windows_explorer, reveal_in_windows_explorer,
+    save_network_password, set_clipboard_files, set_win_e_interception, spawn_as_desktop_user,
+    spawn_video_player, start_native_file_drag, system_prefers_dark_mode,
 };
 use texplorer_vfs::archive::{
     compress_to_zip, extract_archive_all, extract_archive_entries, is_supported_archive,
@@ -65,8 +64,9 @@ use texplorer_vfs::search::{SearchOutcome, execute_search};
 use uuid::Uuid;
 
 use crate::preview::{
-    PreviewPayload, ThumbnailCache, ThumbnailKey, load_archive_entry_preview_blocking,
-    load_preview_blocking, preview_from_remote_bytes, raw_bgra_to_render_image,
+    PDF_PREVIEW_MAX_DIM, PreviewPayload, ThumbnailCache, ThumbnailKey, decode_pdf_page_from_bytes,
+    decode_pdf_page_from_path, load_archive_entry_preview_blocking, load_preview_blocking,
+    preview_from_remote_bytes, raw_bgra_to_render_image,
 };
 use crate::theme::{
     Palette, RADIUS_ROW, apply_theme, crisp_resize_handle_appearance, resolve_palette, solid,
@@ -176,6 +176,12 @@ enum BgEvent {
         generation: u64,
         location: Location,
         payload: PreviewPayload,
+    },
+    PdfPageReady {
+        generation: u64,
+        location: Location,
+        page_index: u32,
+        result: Result<PreviewPayload, String>,
     },
     VideoNotify {
         generation: u64,
@@ -387,9 +393,13 @@ pub struct Workspace {
     pub preview_location: Option<Location>,
     pub preview_payload: PreviewPayload,
     pub preview_generation: u64,
+    pub pdf_zoom: f32,
+    pdf_page_cache: HashMap<u32, (Arc<RenderImage>, u32, u32)>,
     pub video_playback: Option<VideoPlaybackState>,
     video_generation: u64,
     stale_gpu_images: Vec<Arc<RenderImage>>,
+    pub active_local_drag_paths: Rc<RefCell<Option<Vec<PathBuf>>>>,
+    external_ole_drag_active: bool,
     pub hash_target: Option<PathBuf>,
     pub hash_state: HashInspectState,
     hash_generation: u64,
@@ -526,9 +536,13 @@ impl Workspace {
             preview_location: None,
             preview_payload: PreviewPayload::Loading,
             preview_generation: 0,
+            pdf_zoom: 1.0,
+            pdf_page_cache: HashMap::new(),
             video_playback: None,
             video_generation: 0,
             stale_gpu_images: Vec::new(),
+            active_local_drag_paths: Rc::new(RefCell::new(None)),
+            external_ole_drag_active: false,
             hash_target: None,
             hash_state: HashInspectState::Idle,
             hash_generation: 0,
@@ -748,12 +762,25 @@ impl Workspace {
                                     }
                                 }
                             }
+                            let had_pending = pane.pending_select_name.is_some();
                             if pane.sort == sort
                                 && !(patched_cached_sizes && pane.sort.column == SortColumn::Size)
                             {
                                 pane.set_presorted_entries(entries);
                             } else {
                                 pane.set_entries(entries);
+                            }
+                            if had_pending && let Some(idx) = pane.selection.cursor {
+                                let scroll_idx = match pane.view_mode {
+                                    ViewMode::Grid => {
+                                        let cols = if tab.model.split_enabled { 4 } else { 6 };
+                                        idx / cols
+                                    }
+                                    _ => idx,
+                                };
+                                tab.pane_ui(side)
+                                    .scroll_handle
+                                    .scroll_to_item(scroll_idx, ScrollStrategy::Center);
                             }
                         }
                         Err(err) => {
@@ -894,8 +921,10 @@ impl Workspace {
             BgEvent::UpdateDownloadFinished { info, result } => match result {
                 Ok(staged) => {
                     self.update_state = UpdateState::Installing(info);
+                    self.save_session(Some(window));
+                    let dark_mode = self.palette().is_dark;
                     cx.notify();
-                    if let Err(err) = spawn_detached_updater(&staged) {
+                    if let Err(err) = spawn_detached_updater(&staged, dark_mode) {
                         self.update_state = UpdateState::Failed(err);
                         cx.notify();
                     } else {
@@ -917,8 +946,67 @@ impl Workspace {
                 payload,
             } => {
                 if generation == self.preview_generation {
+                    if let PreviewPayload::Pdf {
+                        ref image,
+                        page_index,
+                        page_width,
+                        page_height,
+                        ..
+                    } = payload
+                    {
+                        self.pdf_page_cache
+                            .insert(page_index, (image.clone(), page_width, page_height));
+                    }
                     self.preview_location = Some(location);
                     self.preview_payload = payload;
+                    cx.notify();
+                }
+            }
+            BgEvent::PdfPageReady {
+                generation,
+                location,
+                page_index,
+                result,
+            } => {
+                if generation == self.preview_generation
+                    && self.preview_location.as_ref() == Some(&location)
+                {
+                    match result {
+                        Ok(PreviewPayload::Pdf {
+                            image,
+                            page_index: rendered_idx,
+                            page_count,
+                            page_width,
+                            page_height,
+                            ..
+                        }) => {
+                            if self.pdf_page_cache.len() >= 16 {
+                                self.pdf_page_cache.clear();
+                            }
+                            self.pdf_page_cache
+                                .insert(rendered_idx, (image.clone(), page_width, page_height));
+                            self.preview_payload = PreviewPayload::Pdf {
+                                image,
+                                page_index: rendered_idx,
+                                page_count,
+                                page_width,
+                                page_height,
+                                loading_page: None,
+                            };
+                        }
+                        Ok(_) => {}
+                        Err(err) => {
+                            if let PreviewPayload::Pdf {
+                                ref mut loading_page,
+                                ..
+                            } = self.preview_payload
+                                && *loading_page == Some(page_index)
+                            {
+                                *loading_page = None;
+                            }
+                            self.show_toast(err, ToastKind::Error, window, cx);
+                        }
+                    }
                     cx.notify();
                 }
             }
@@ -1612,6 +1700,10 @@ impl Workspace {
                             Self::cleanup_stage_dir_async(stage_dir);
                             return;
                         }
+                        if self.external_ole_drag_active && stage_dir.is_none() {
+                            self.handle_dropped_paths(paths, dest_dir, false, window, cx);
+                            return;
+                        }
                         let effective = filter_effective_transfer_sources(
                             TransferKind::Copy,
                             paths,
@@ -1706,6 +1798,8 @@ impl Workspace {
         let Some((location, kind)) = target else {
             self.preview_location = None;
             self.preview_payload = PreviewPayload::Loading;
+            self.pdf_page_cache.clear();
+            self.pdf_zoom = 1.0;
             return;
         };
 
@@ -1719,6 +1813,8 @@ impl Workspace {
         let generation = self.preview_generation;
         self.preview_location = Some(location.clone());
         self.preview_payload = PreviewPayload::Loading;
+        self.pdf_page_cache.clear();
+        self.pdf_zoom = 1.0;
 
         let worker = self.shell_worker.clone();
         let palette = self.palette();
@@ -1746,7 +1842,10 @@ impl Workspace {
             let creds = self.resolve_remote_credentials(connection_id);
             let pool = self.remote_pool.clone();
             let rpath = remote_path.clone();
-            let max_bytes = if matches!(kind, FileKind::Image) {
+            let is_pdf = rpath.to_ascii_lowercase().ends_with(".pdf");
+            let max_bytes = if is_pdf {
+                12 * 1024 * 1024
+            } else if matches!(kind, FileKind::Image) {
                 8 * 1024 * 1024
             } else {
                 192 * 1024
@@ -2678,13 +2777,52 @@ impl Workspace {
         cx.notify();
     }
 
-    /// Tracks rubber-band drag motion and Details column resize drag.
+    /// Tracks rubber-band drag motion, Details column resize drag, and outbound native OLE drag handoff.
     fn handle_mouse_move(
         &mut self,
         ev: &MouseMoveEvent,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // When dragging local files out of the TExplorer window edge, hand off cleanly to
+        // native Windows OLE Shell drag-and-drop so Chrome, Discord, Explorer, and other apps
+        // accept the dropped files with native icons and cursors.
+        if ev.dragging() && cx.has_active_drag() && !self.external_ole_drag_active {
+            let vp = window.viewport_size();
+            let x: f32 = ev.position.x.into();
+            let y: f32 = ev.position.y.into();
+            let vw: f32 = vp.width.into();
+            let vh: f32 = vp.height.into();
+            let left_window = x <= 1.0 || y <= 1.0 || x >= vw - 1.0 || y >= vh - 1.0;
+            if left_window
+                && let Some(paths) = self.active_local_drag_paths.borrow_mut().take()
+                && !paths.is_empty()
+            {
+                cx.stop_active_drag(window);
+                let hwnd_raw = HasWindowHandle::window_handle(window)
+                    .ok()
+                    .and_then(|wh| match wh.as_raw() {
+                        RawWindowHandle::Win32(win32) => Some(win32.hwnd.get()),
+                        _ => None,
+                    })
+                    .unwrap_or(0);
+                self.external_ole_drag_active = true;
+                cx.spawn(async move |weak, cx| {
+                    let outcome = start_native_file_drag(hwnd_raw, &paths);
+                    let _ = weak.update(cx, |this, cx| {
+                        this.external_ole_drag_active = false;
+                        if matches!(outcome, Ok(NativeDragOutcome::Moved)) {
+                            this.refresh_visible_panes(cx);
+                        }
+                        cx.notify();
+                    });
+                })
+                .detach();
+                return;
+            }
+        } else if !ev.dragging() && !cx.has_active_drag() {
+            *self.active_local_drag_paths.borrow_mut() = None;
+        }
         if self
             .video_playback
             .as_ref()
@@ -2893,6 +3031,7 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         self.entry_claimed_mouse_down = false;
+        *self.active_local_drag_paths.borrow_mut() = None;
         let mut save_video_prefs = false;
         if let Some(video) = self.video_playback.as_mut() {
             if video.scrubbing {
@@ -3633,6 +3772,165 @@ impl Workspace {
             video.handle.seek(target);
             cx.notify();
         }
+    }
+
+    pub fn pdf_step_page(&mut self, delta: i32, cx: &mut Context<Self>) {
+        let Some((current, page_count)) = (match &self.preview_payload {
+            PreviewPayload::Pdf {
+                page_index,
+                page_count,
+                loading_page,
+                ..
+            } => Some((loading_page.unwrap_or(*page_index), *page_count)),
+            _ => None,
+        }) else {
+            return;
+        };
+        if page_count <= 1 {
+            return;
+        }
+        let target = if delta >= 0 {
+            current.saturating_add(delta as u32).min(page_count - 1)
+        } else {
+            current.saturating_sub(delta.unsigned_abs())
+        };
+        self.pdf_goto_page(target, cx);
+    }
+
+    pub fn pdf_goto_page(&mut self, target_page: u32, cx: &mut Context<Self>) {
+        let Some(location) = self.preview_location.clone() else {
+            return;
+        };
+        let (page_count, already_showing) = match &self.preview_payload {
+            PreviewPayload::Pdf {
+                page_index,
+                page_count,
+                loading_page,
+                ..
+            } => (
+                *page_count,
+                *page_index == target_page && loading_page.is_none(),
+            ),
+            _ => return,
+        };
+        if page_count == 0 || target_page >= page_count || already_showing {
+            return;
+        }
+
+        if let Some((cached_img, w, h)) = self.pdf_page_cache.get(&target_page).cloned() {
+            self.preview_payload = PreviewPayload::Pdf {
+                image: cached_img,
+                page_index: target_page,
+                page_count,
+                page_width: w,
+                page_height: h,
+                loading_page: None,
+            };
+            cx.notify();
+            return;
+        }
+
+        if let PreviewPayload::Pdf {
+            ref mut loading_page,
+            ..
+        } = self.preview_payload
+        {
+            if *loading_page == Some(target_page) {
+                return;
+            }
+            *loading_page = Some(target_page);
+        }
+        cx.notify();
+
+        let generation = self.preview_generation;
+        let tx = self.bg_tx.clone();
+        match location.clone() {
+            Location::Local(path) => {
+                tokio_runtime().spawn(async move {
+                    let result = tokio::task::spawn_blocking(move || {
+                        decode_pdf_page_from_path(&path, target_page, PDF_PREVIEW_MAX_DIM)
+                    })
+                    .await
+                    .unwrap_or_else(|e| Err(format!("PDF render task failed: {e}")));
+                    let _ = tx.unbounded_send(BgEvent::PdfPageReady {
+                        generation,
+                        location,
+                        page_index: target_page,
+                        result,
+                    });
+                });
+            }
+            Location::Archive {
+                archive_path,
+                inner_path,
+            } => {
+                tokio_runtime().spawn(async move {
+                    let result = tokio::task::spawn_blocking(move || {
+                        let (bytes, truncated) = texplorer_vfs::archive::read_archive_entry_bytes(
+                            &archive_path,
+                            &inner_path,
+                            16 * 1024 * 1024,
+                        )?;
+                        if truncated {
+                            return Err("Archived PDF exceeds 16 MiB inline limit.".to_string());
+                        }
+                        decode_pdf_page_from_bytes(&bytes, target_page, PDF_PREVIEW_MAX_DIM)
+                    })
+                    .await
+                    .unwrap_or_else(|e| Err(format!("PDF render task failed: {e}")));
+                    let _ = tx.unbounded_send(BgEvent::PdfPageReady {
+                        generation,
+                        location,
+                        page_index: target_page,
+                        result,
+                    });
+                });
+            }
+            Location::Remote {
+                connection_id,
+                remote_path,
+                ..
+            } => {
+                let Some(conn) = self.settings.network_connection(connection_id).cloned() else {
+                    return;
+                };
+                let creds = self.resolve_remote_credentials(connection_id);
+                let pool = self.remote_pool.clone();
+                tokio_runtime().spawn(async move {
+                    let result = match pool
+                        .read_file_bytes(&conn, &creds, &remote_path, 12 * 1024 * 1024)
+                        .await
+                    {
+                        Ok((bytes, false)) => tokio::task::spawn_blocking(move || {
+                            decode_pdf_page_from_bytes(&bytes, target_page, PDF_PREVIEW_MAX_DIM)
+                        })
+                        .await
+                        .unwrap_or_else(|e| Err(format!("PDF render task failed: {e}"))),
+                        Ok((_, true)) => Err("Remote PDF exceeds 12 MiB inline limit.".to_string()),
+                        Err(err) => Err(err),
+                    };
+                    let _ = tx.unbounded_send(BgEvent::PdfPageReady {
+                        generation,
+                        location,
+                        page_index: target_page,
+                        result,
+                    });
+                });
+            }
+            _ => {}
+        }
+    }
+
+    pub fn pdf_set_zoom(&mut self, zoom: f32, cx: &mut Context<Self>) {
+        let clamped = zoom.clamp(1.0, 2.0);
+        if (self.pdf_zoom - clamped).abs() > 0.001 {
+            self.pdf_zoom = clamped;
+            cx.notify();
+        }
+    }
+
+    pub fn pdf_adjust_zoom(&mut self, delta: f32, cx: &mut Context<Self>) {
+        self.pdf_set_zoom(self.pdf_zoom + delta, cx);
     }
 
     pub fn toggle_quicklook(&mut self, cx: &mut Context<Self>) {
@@ -6316,13 +6614,52 @@ impl Workspace {
         }
         let key = ev.keystroke.key.as_str();
         let mods = ev.keystroke.modifiers;
-        if mods.control || mods.alt || mods.platform {
-            return;
-        }
 
         let Some(side) = self.active_tab().map(|t| t.model.active_pane) else {
             return;
         };
+
+        // Ctrl+Shift+Up / Ctrl+Shift+Down: select all items from current selection to top/bottom.
+        if mods.control
+            && mods.shift
+            && !mods.alt
+            && !mods.platform
+            && !self.quicklook_open
+            && matches!(key, "up" | "down")
+        {
+            let to_end = key == "down";
+            let moved = if let Some(tab) = self.active_tab_mut() {
+                let pane = tab.model.pane_mut(side);
+                let total = pane.filtered_indices.len();
+                if let Some(idx) = pane.selection.select_to_boundary(to_end, total, true) {
+                    pane.recompute_selection_bytes();
+                    let scroll_idx = match pane.view_mode {
+                        ViewMode::Grid => {
+                            let cols = if tab.model.split_enabled { 4 } else { 6 };
+                            idx / cols
+                        }
+                        _ => idx,
+                    };
+                    tab.pane_ui(side)
+                        .scroll_handle
+                        .scroll_to_item(scroll_idx, ScrollStrategy::Nearest);
+                    true
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+            if moved {
+                self.sync_preview_for_selection(cx);
+                cx.notify();
+            }
+            return;
+        }
+
+        if mods.control || mods.alt || mods.platform {
+            return;
+        }
 
         // Space toggles QuickLook when the file list has focus (never while editing inputs).
         if key == "space" {
@@ -6361,6 +6698,78 @@ impl Workspace {
                     cx.notify();
                 }
             }
+            "home" | "end" if !self.quicklook_open => {
+                let to_end = key == "end";
+                let extend = mods.shift;
+                let moved = if let Some(tab) = self.active_tab_mut() {
+                    let pane = tab.model.pane_mut(side);
+                    let total = pane.filtered_indices.len();
+                    if let Some(idx) = pane.selection.select_to_boundary(to_end, total, extend) {
+                        pane.recompute_selection_bytes();
+                        let scroll_idx = match pane.view_mode {
+                            ViewMode::Grid => {
+                                let cols = if tab.model.split_enabled { 4 } else { 6 };
+                                idx / cols
+                            }
+                            _ => idx,
+                        };
+                        tab.pane_ui(side)
+                            .scroll_handle
+                            .scroll_to_item(scroll_idx, ScrollStrategy::Nearest);
+                        true
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                };
+                if moved {
+                    self.sync_preview_for_selection(cx);
+                    cx.notify();
+                }
+            }
+            "pageup" | "pagedown" => {
+                let delta = if key == "pageup" { -1 } else { 1 };
+                if self.quicklook_open {
+                    if matches!(
+                        self.preview_payload,
+                        PreviewPayload::Pdf { page_count, .. } if page_count > 1
+                    ) {
+                        self.pdf_step_page(delta, cx);
+                    }
+                } else {
+                    let extend = mods.shift;
+                    let moved = if let Some(tab) = self.active_tab_mut() {
+                        let pane = tab.model.pane_mut(side);
+                        let total = pane.filtered_indices.len();
+                        if let Some(idx) =
+                            pane.selection
+                                .move_cursor((delta as isize) * 15, total, extend)
+                        {
+                            pane.recompute_selection_bytes();
+                            let scroll_idx = match pane.view_mode {
+                                ViewMode::Grid => {
+                                    let cols = if tab.model.split_enabled { 4 } else { 6 };
+                                    idx / cols
+                                }
+                                _ => idx,
+                            };
+                            tab.pane_ui(side)
+                                .scroll_handle
+                                .scroll_to_item(scroll_idx, ScrollStrategy::Nearest);
+                            true
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    };
+                    if moved {
+                        self.sync_preview_for_selection(cx);
+                        cx.notify();
+                    }
+                }
+            }
             "enter" => {
                 let target = self.active_tab().and_then(|t| {
                     t.model
@@ -6380,11 +6789,61 @@ impl Workspace {
             "m" if self.quicklook_open && self.video_playback.is_some() => {
                 self.video_toggle_mute(cx);
             }
-            "left" if self.quicklook_open && self.video_playback.is_some() => {
-                self.video_seek_relative(-5.0, cx);
+            "left" if self.quicklook_open => {
+                if self.video_playback.is_some() {
+                    self.video_seek_relative(-5.0, cx);
+                } else if matches!(
+                    self.preview_payload,
+                    PreviewPayload::Pdf { page_count, .. } if page_count > 1
+                ) {
+                    self.pdf_step_page(-1, cx);
+                }
             }
-            "right" if self.quicklook_open && self.video_playback.is_some() => {
-                self.video_seek_relative(5.0, cx);
+            "right" if self.quicklook_open => {
+                if self.video_playback.is_some() {
+                    self.video_seek_relative(5.0, cx);
+                } else if matches!(
+                    self.preview_payload,
+                    PreviewPayload::Pdf { page_count, .. } if page_count > 1
+                ) {
+                    self.pdf_step_page(1, cx);
+                }
+            }
+            "left" if !self.quicklook_open => {
+                let can_back = self
+                    .active_tab()
+                    .is_some_and(|t| t.model.pane(side).can_go_back());
+                if can_back {
+                    self.go_back(side, window, cx);
+                } else {
+                    self.go_up(side, window, cx);
+                }
+            }
+            "right" if !self.quicklook_open => {
+                let target = self.active_tab().and_then(|t| {
+                    let pane = t.model.pane(side);
+                    pane.primary_selected_entry().map(|e| {
+                        let is_navigable = e.is_dir()
+                            || e.location
+                                .as_local_path()
+                                .is_some_and(is_supported_archive);
+                        (e.location.clone(), e.is_dir(), is_navigable)
+                    })
+                });
+                match target {
+                    Some((loc, is_dir, true)) => {
+                        self.open_location_or_file(loc, is_dir, window, cx);
+                    }
+                    None => {
+                        let can_fwd = self
+                            .active_tab()
+                            .is_some_and(|t| t.model.pane(side).can_go_forward());
+                        if can_fwd {
+                            self.go_forward(side, window, cx);
+                        }
+                    }
+                    _ => {}
+                }
             }
             "backspace" if !self.quicklook_open => {
                 self.go_up(side, window, cx);

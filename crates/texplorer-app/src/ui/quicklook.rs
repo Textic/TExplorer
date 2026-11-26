@@ -5,7 +5,7 @@ use gpui_kit::{
     base::TextView,
     canvas,
     component::{
-        Icon, Sizable as _, Size, StyledExt as _,
+        Disableable as _, Icon, Sizable as _, Size, StyledExt as _,
         button::{Button, ButtonVariants as _},
         h_flex,
         scroll::ScrollableElement as _,
@@ -96,6 +96,18 @@ pub fn render_quicklook_modal(
                     format!("{orig_width}×{orig_height}  •  {size_str}").into()
                 }
             }
+            PreviewPayload::Pdf {
+                page_index,
+                page_count,
+                ..
+            } => {
+                let page_num = page_index.saturating_add(1);
+                if *page_count <= 1 {
+                    "PDF  •  1 page".into()
+                } else {
+                    format!("PDF  •  Page {page_num} of {page_count}").into()
+                }
+            }
             PreviewPayload::Code {
                 language,
                 lines,
@@ -158,6 +170,27 @@ pub fn render_quicklook_modal(
                         .object_fit(ObjectFit::Contain),
                 )
                 .into_any_element(),
+            PreviewPayload::Pdf {
+                image,
+                page_index,
+                page_count,
+                page_width,
+                page_height,
+                loading_page,
+            } => render_pdf_preview_body(
+                ws,
+                PdfViewData {
+                    image: image.clone(),
+                    page_index: *page_index,
+                    page_count: *page_count,
+                    page_width: *page_width,
+                    page_height: *page_height,
+                    loading_page: *loading_page,
+                },
+                p,
+                cx,
+            )
+            .into_any_element(),
             PreviewPayload::ShellThumbnail { image, .. } => v_flex()
                 .flex_1()
                 .size_full()
@@ -318,8 +351,14 @@ pub fn render_quicklook_modal(
         }
     };
 
+    let is_multipage_pdf = matches!(
+        payload,
+        PreviewPayload::Pdf { page_count, .. } if *page_count > 1
+    );
     let footer_hint = if video_playable {
         "K Play/Pause   •   ← / → Seek 5s   •   M Mute   •   ↑ / ↓ Files   •   Space / Esc Close"
+    } else if is_multipage_pdf {
+        "← / → or PgUp / PgDn Pages   •   Scroll Flip pages   •   ↑ / ↓ Files   •   Enter Open   •   Space / Esc Close"
     } else {
         "↑ / ↓ Navigate files   •   Enter Open   •   Space / Esc Close"
     };
@@ -457,6 +496,235 @@ pub fn render_quicklook_modal(
                                 .text_size(px(13.))
                                 .text_color(solid(p.text_muted))
                                 .child(footer_hint),
+                        ),
+                ),
+        )
+}
+
+struct PdfViewData {
+    image: std::sync::Arc<gpui_kit::RenderImage>,
+    page_index: u32,
+    page_count: u32,
+    page_width: u32,
+    page_height: u32,
+    loading_page: Option<u32>,
+}
+
+fn render_pdf_preview_body(
+    ws: &Workspace,
+    pdf: PdfViewData,
+    p: Palette,
+    cx: &mut Context<Workspace>,
+) -> impl IntoElement {
+    let PdfViewData {
+        image,
+        page_index,
+        page_count,
+        page_width,
+        page_height,
+        loading_page,
+    } = pdf;
+    let can_prev = page_index > 0;
+    let can_next = page_index.saturating_add(1) < page_count;
+    let zoom = ws.pdf_zoom;
+    let is_fit = (zoom - 1.0).abs() < 0.01;
+    let page_label: SharedString = if let Some(target) = loading_page {
+        format!("Loading page {} / {}...", target + 1, page_count).into()
+    } else {
+        format!("Page {} / {}", page_index + 1, page_count).into()
+    };
+    let zoom_label: SharedString = if is_fit {
+        "Fit".into()
+    } else {
+        format!("{}%", (zoom * 100.0).round() as u32).into()
+    };
+    let img_id = ("ql-preview-pdf", ws.preview_generation ^ ((page_index as u64) << 32));
+
+    let stage = if is_fit {
+        div()
+            .id("ql-pdf-stage-fit")
+            .flex_1()
+            .min_h_0()
+            .w_full()
+            .p_4()
+            .flex()
+            .items_center()
+            .justify_center()
+            .bg(solid(p.bg_base))
+            .on_scroll(cx.listener(move |this, ev: &ScrollEvent, _, cx| {
+                cx.stop_propagation();
+                if page_count <= 1 {
+                    return;
+                }
+                let dy = match ev.delta {
+                    ScrollDelta::Lines(pt) => pt.y,
+                    ScrollDelta::Pixels(pt) => f32::from(pt.y) / 40.0,
+                };
+                if dy < -0.15 {
+                    this.pdf_step_page(1, cx);
+                } else if dy > 0.15 {
+                    this.pdf_step_page(-1, cx);
+                }
+            }))
+            .child(
+                div()
+                    .max_w_full()
+                    .max_h_full()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(RADIUS_CONTROL))
+                    .border_1()
+                    .border_color(solid(p.border))
+                    .overflow_hidden()
+                    .child(
+                        img(image)
+                            .id(img_id)
+                            .max_w_full()
+                            .max_h_full()
+                            .object_fit(ObjectFit::Contain),
+                    ),
+            )
+            .into_any_element()
+    } else {
+        let base_w = 780.0_f32;
+        let aspect = if page_width > 0 {
+            page_height as f32 / page_width as f32
+        } else {
+            1.294
+        };
+        let render_w = (base_w * zoom).clamp(320.0, 2200.0);
+        let render_h = (render_w * aspect).max(200.0);
+        v_flex()
+            .id("ql-pdf-stage-zoom")
+            .flex_1()
+            .min_h_0()
+            .w_full()
+            .overflow_y_scrollbar()
+            .p_4()
+            .items_center()
+            .bg(solid(p.bg_base))
+            .child(
+                div()
+                    .w(px(render_w))
+                    .h(px(render_h))
+                    .flex_shrink_0()
+                    .rounded(px(RADIUS_CONTROL))
+                    .border_1()
+                    .border_color(solid(p.border))
+                    .overflow_hidden()
+                    .child(
+                        img(image)
+                            .id(img_id)
+                            .w_full()
+                            .h_full()
+                            .object_fit(ObjectFit::Contain),
+                    ),
+            )
+            .into_any_element()
+    };
+
+    v_flex()
+        .flex_1()
+        .size_full()
+        .bg(solid(p.bg_base))
+        .child(stage)
+        .child(
+            h_flex()
+                .w_full()
+                .h(px(40.))
+                .px_3p5()
+                .flex_shrink_0()
+                .items_center()
+                .justify_between()
+                .gap_3()
+                .bg(solid(p.bg_elevated))
+                .border_t_1()
+                .border_color(solid(p.border_subtle))
+                .child(
+                    h_flex()
+                        .items_center()
+                        .gap_1p5()
+                        .child(
+                            Button::new("ql-pdf-prev")
+                                .with_size(Size::XSmall)
+                                .ghost()
+                                .icon(LucideIcon::ChevronLeft)
+                                .disabled(!can_prev)
+                                .tooltip("Previous Page (← / PgUp)")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.pdf_step_page(-1, cx);
+                                })),
+                        )
+                        .child(
+                            div()
+                                .min_w(px(110.))
+                                .text_center()
+                                .font_family("Consolas")
+                                .text_size(px(12.5))
+                                .text_color(solid(if loading_page.is_some() {
+                                    p.accent_primary
+                                } else {
+                                    p.text_primary
+                                }))
+                                .child(page_label),
+                        )
+                        .child(
+                            Button::new("ql-pdf-next")
+                                .with_size(Size::XSmall)
+                                .ghost()
+                                .icon(LucideIcon::ChevronRight)
+                                .disabled(!can_next)
+                                .tooltip("Next Page (→ / PgDn)")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.pdf_step_page(1, cx);
+                                })),
+                        ),
+                )
+                .child(
+                    h_flex()
+                        .items_center()
+                        .gap_1()
+                        .child(
+                            Button::new("ql-pdf-zoom-fit")
+                                .with_size(Size::XSmall)
+                                .ghost()
+                                .label("Fit")
+                                .disabled(is_fit)
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.pdf_set_zoom(1.0, cx);
+                                })),
+                        )
+                        .child(
+                            Button::new("ql-pdf-zoom-out")
+                                .with_size(Size::XSmall)
+                                .ghost()
+                                .label("−")
+                                .disabled(zoom <= 1.0)
+                                .tooltip("Zoom Out")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.pdf_adjust_zoom(-0.25, cx);
+                                })),
+                        )
+                        .child(
+                            div()
+                                .w(px(44.))
+                                .text_center()
+                                .font_family("Consolas")
+                                .text_size(px(12.))
+                                .text_color(solid(p.text_secondary))
+                                .child(zoom_label),
+                        )
+                        .child(
+                            Button::new("ql-pdf-zoom-in")
+                                .with_size(Size::XSmall)
+                                .ghost()
+                                .label("+")
+                                .disabled(zoom >= 2.0)
+                                .tooltip("Zoom In")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.pdf_adjust_zoom(0.25, cx);
+                                })),
                         ),
                 ),
         )

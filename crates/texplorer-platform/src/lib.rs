@@ -9,7 +9,9 @@ pub mod elevation;
 pub mod launch;
 pub mod locks;
 pub mod network_share;
+pub mod ole_drag;
 pub mod ole_drop;
+pub mod pdf_render;
 pub mod single_instance;
 pub mod theme_detect;
 pub mod video_player;
@@ -33,7 +35,11 @@ pub use launch::{
 };
 pub use locks::{FileLockStatus, LockingProcess, inspect_file_lock};
 pub use network_share::{connect_smb_share, disconnect_smb_share};
+pub use ole_drag::{NativeDragOutcome, start_native_file_drag};
 pub use ole_drop::{NativeDropEvent, install_native_drop_target};
+pub use pdf_render::{
+    RenderedPdfPage, fit_pdf_dimensions, render_pdf_page_from_bytes, render_pdf_page_from_path,
+};
 pub use single_instance::{
     LaunchIntent, SingleInstanceGuard, is_app_instance_running, parse_cli_args,
     start_single_instance_server, try_forward_to_running_instance,

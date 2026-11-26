@@ -69,6 +69,7 @@ impl UpdateState {
 #[derive(Debug, Clone)]
 pub struct StagedUpdate {
     pub kind: InstallTargetKind,
+    pub version_label: String,
     pub target_exe: PathBuf,
     pub source_path: PathBuf,
     pub stage_dir: PathBuf,
@@ -291,6 +292,7 @@ where
 
     Ok(StagedUpdate {
         kind: info.install_kind,
+        version_label: info.tag_name.clone(),
         target_exe,
         source_path: download_path,
         stage_dir,
@@ -471,14 +473,14 @@ fn verify_windows_pe_header(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
-pub fn spawn_detached_updater(staged: &StagedUpdate) -> Result<(), String> {
+pub fn spawn_detached_updater(staged: &StagedUpdate, dark_mode: bool) -> Result<(), String> {
     #[cfg(target_os = "windows")]
     {
-        spawn_windows_updater(staged)
+        spawn_windows_updater(staged, dark_mode)
     }
     #[cfg(not(target_os = "windows"))]
     {
-        let _ = staged;
+        let _ = (staged, dark_mode);
         Err("In-app self-update is currently supported on Windows only.".to_string())
     }
 }
@@ -489,7 +491,7 @@ const WIN_CREATE_NO_WINDOW: u32 = 0x0800_0000;
 const WIN_CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
 
 #[cfg(target_os = "windows")]
-fn spawn_windows_updater(staged: &StagedUpdate) -> Result<(), String> {
+fn spawn_windows_updater(staged: &StagedUpdate, dark_mode: bool) -> Result<(), String> {
     use std::os::windows::process::CommandExt;
 
     let script_path = staged.stage_dir.join("apply-update.ps1");
@@ -532,36 +534,156 @@ $mode = $env:TEXPLORER_MODE
 $allUsers = $env:TEXPLORER_ALL_USERS
 $needsElevation = $env:TEXPLORER_NEEDS_ELEVATION
 $logFile = $env:TEXPLORER_LOG_FILE
+$newVersion = if ($env:TEXPLORER_NEW_VERSION) { $env:TEXPLORER_NEW_VERSION } else { 'latest' }
+$isDark = ($env:TEXPLORER_DARK_MODE -ne '0')
+
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+[System.Windows.Forms.Application]::EnableVisualStyles()
+
+$bgColor      = if ($isDark) { [System.Drawing.Color]::FromArgb(24, 24, 27) } else { [System.Drawing.Color]::FromArgb(250, 250, 250) }
+$borderColor  = if ($isDark) { [System.Drawing.Color]::FromArgb(46, 46, 52) } else { [System.Drawing.Color]::FromArgb(220, 220, 226) }
+$fgPrimary    = if ($isDark) { [System.Drawing.Color]::FromArgb(244, 244, 246) } else { [System.Drawing.Color]::FromArgb(24, 24, 27) }
+$fgSecondary  = if ($isDark) { [System.Drawing.Color]::FromArgb(161, 161, 170) } else { [System.Drawing.Color]::FromArgb(100, 100, 110) }
+$trackColor   = if ($isDark) { [System.Drawing.Color]::FromArgb(42, 42, 48) } else { [System.Drawing.Color]::FromArgb(228, 228, 232) }
+$accentColor  = if ($isDark) { [System.Drawing.Color]::FromArgb(80, 192, 255) } else { [System.Drawing.Color]::FromArgb(0, 112, 203) }
+$errorColor   = [System.Drawing.Color]::FromArgb(239, 68, 68)
+
+$form = New-Object System.Windows.Forms.Form
+$form.Text = "Updating TExplorer"
+$form.FormBorderStyle = [System.Windows.Forms.FormBorderStyle]::None
+$form.StartPosition = [System.Windows.Forms.FormStartPosition]::CenterScreen
+$form.ClientSize = New-Object System.Drawing.Size(430, 152)
+$form.BackColor = $bgColor
+$form.TopMost = $true
+$form.ShowInTaskbar = $true
+
+$form.Add_Paint({
+    param($s, $e)
+    $pen = New-Object System.Drawing.Pen($borderColor, 1)
+    $e.Graphics.DrawRectangle($pen, 0, 0, $s.ClientSize.Width - 1, $s.ClientSize.Height - 1)
+    $pen.Dispose()
+})
+
+$titleLbl = New-Object System.Windows.Forms.Label
+$titleLbl.Text = "Updating TExplorer to $newVersion"
+$titleLbl.Font = New-Object System.Drawing.Font("Segoe UI Semibold", 11.5)
+$titleLbl.ForeColor = $fgPrimary
+$titleLbl.Location = New-Object System.Drawing.Point(22, 20)
+$titleLbl.Size = New-Object System.Drawing.Size(386, 26)
+$form.Controls.Add($titleLbl)
+
+$statusLbl = New-Object System.Windows.Forms.Label
+$statusLbl.Text = "Closing TExplorer..."
+$statusLbl.Font = New-Object System.Drawing.Font("Segoe UI", 9.5)
+$statusLbl.ForeColor = $fgSecondary
+$statusLbl.Location = New-Object System.Drawing.Point(22, 50)
+$statusLbl.Size = New-Object System.Drawing.Size(386, 22)
+$form.Controls.Add($statusLbl)
+
+$trackPanel = New-Object System.Windows.Forms.Panel
+$trackPanel.Location = New-Object System.Drawing.Point(22, 86)
+$trackPanel.Size = New-Object System.Drawing.Size(386, 8)
+$trackPanel.BackColor = $trackColor
+$form.Controls.Add($trackPanel)
+
+$fillPanel = New-Object System.Windows.Forms.Panel
+$fillPanel.Location = New-Object System.Drawing.Point(0, 0)
+$fillPanel.Size = New-Object System.Drawing.Size(24, 8)
+$fillPanel.BackColor = $accentColor
+$trackPanel.Controls.Add($fillPanel)
+
+$detailLbl = New-Object System.Windows.Forms.Label
+$detailLbl.Text = "TExplorer will reopen automatically once the update finishes."
+$detailLbl.Font = New-Object System.Drawing.Font("Segoe UI", 8.5)
+$detailLbl.ForeColor = $fgSecondary
+$detailLbl.Location = New-Object System.Drawing.Point(22, 108)
+$detailLbl.Size = New-Object System.Drawing.Size(386, 28)
+$form.Controls.Add($detailLbl)
+
+$closeBtn = New-Object System.Windows.Forms.Button
+$closeBtn.Text = "Close"
+$closeBtn.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
+$closeBtn.FlatAppearance.BorderColor = $borderColor
+$closeBtn.BackColor = $trackColor
+$closeBtn.ForeColor = $fgPrimary
+$closeBtn.Font = New-Object System.Drawing.Font("Segoe UI", 9)
+$closeBtn.Size = New-Object System.Drawing.Size(80, 28)
+$closeBtn.Location = New-Object System.Drawing.Point(328, 110)
+$closeBtn.Visible = $false
+$closeBtn.Add_Click({ $form.Close() })
+$form.Controls.Add($closeBtn)
+
+function Set-ProgressUi([string]$msg, [int]$pct) {
+    if ($pct -lt 0) { $pct = 0 }
+    if ($pct -gt 100) { $pct = 100 }
+    $statusLbl.Text = $msg
+    $fillPanel.Width = [int]([Math]::Round(386.0 * ($pct / 100.0)))
+    [System.Windows.Forms.Application]::DoEvents()
+}
+
+function Pump-Sleep([int]$ms) {
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    while ($sw.ElapsedMilliseconds -lt $ms) {
+        [System.Windows.Forms.Application]::DoEvents()
+        Start-Sleep -Milliseconds 30
+    }
+}
+
+$form.Show()
+$form.Activate()
+[System.Windows.Forms.Application]::DoEvents()
 
 try {
+    Set-ProgressUi "Closing TExplorer..." 12
     for ($i = 0; $i -lt 150; $i++) {
         if (-not (Get-Process -Id $pidToWait -ErrorAction SilentlyContinue)) {
             break
         }
-        Start-Sleep -Milliseconds 200
+        Pump-Sleep 150
     }
-    Start-Sleep -Milliseconds 300
+    Pump-Sleep 250
 
     if ($mode -eq 'setup') {
+        Set-ProgressUi "Installing TExplorer $newVersion..." 30
         $scopeArg = if ($allUsers -eq '1') { '/ALLUSERS' } else { '/CURRENTUSER' }
-        $argsLine = '/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /SP- ' + $scopeArg + ' /DIR="' + $installDir + '"'
+        $argsLine = '/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /CLOSEAPPLICATIONS /SP- ' + $scopeArg + ' /DIR="' + $installDir + '"'
         if ($needsElevation -eq '1') {
-            $proc = Start-Process -FilePath $sourceFile -Verb RunAs -ArgumentList $argsLine -Wait -PassThru
+            $detailLbl.Text = "Waiting for administrator approval (UAC) and installer..."
+            [System.Windows.Forms.Application]::DoEvents()
+            $proc = Start-Process -FilePath $sourceFile -Verb RunAs -ArgumentList $argsLine -PassThru
         } else {
-            $proc = Start-Process -FilePath $sourceFile -ArgumentList $argsLine -Wait -PassThru
+            $proc = Start-Process -FilePath $sourceFile -ArgumentList $argsLine -PassThru
         }
-        if ($proc.ExitCode -ne 0) {
-            throw "Installer exited with code $($proc.ExitCode)"
+        # Touch Handle immediately so PowerShell 5.1 populates ExitCode reliably after exit.
+        try { $null = $proc.Handle } catch {}
+
+        $pct = 32.0
+        while (-not $proc.HasExited) {
+            if ($pct -lt 88.0) {
+                $pct = [Math]::Min(88.0, $pct + 1.2)
+                Set-ProgressUi "Installing TExplorer $newVersion..." ([int]$pct)
+            } else {
+                [System.Windows.Forms.Application]::DoEvents()
+            }
+            Start-Sleep -Milliseconds 120
+        }
+        try { $proc.Refresh() } catch {}
+        $exitCode = $proc.ExitCode
+        if ($null -ne $exitCode -and $exitCode -ne 0) {
+            throw "Installer exited with code $exitCode"
         }
     } else {
+        Set-ProgressUi "Replacing TExplorer executable..." 45
         $copied = $false
-        for ($attempt = 0; $attempt -lt 25; $attempt++) {
+        for ($attempt = 0; $attempt -lt 30; $attempt++) {
             try {
                 Copy-Item -LiteralPath $sourceFile -Destination $targetExe -Force
                 $copied = $true
                 break
             } catch {
-                Start-Sleep -Milliseconds 200
+                Set-ProgressUi "Waiting for file lock to release..." ([Math]::Min(82, 45 + $attempt))
+                Pump-Sleep 180
             }
         }
         if (-not $copied) {
@@ -569,18 +691,58 @@ try {
         }
     }
 
+    Set-ProgressUi "Launching TExplorer $newVersion..." 95
+    $detailLbl.Text = "Update complete - opening TExplorer..."
+    [System.Windows.Forms.Application]::DoEvents()
+
+    $launched = $null
     if (Test-Path -LiteralPath $targetExe) {
-        Start-Process -FilePath $targetExe -WorkingDirectory $installDir
+        $launched = Start-Process -FilePath $targetExe -WorkingDirectory $installDir -PassThru
+    } else {
+        $fallbackExe = Join-Path $installDir 'texplorer.exe'
+        if (Test-Path -LiteralPath $fallbackExe) {
+            $launched = Start-Process -FilePath $fallbackExe -WorkingDirectory $installDir -PassThru
+        }
     }
 
-    Start-Sleep -Milliseconds 500
+    Set-ProgressUi "TExplorer $newVersion is ready!" 100
+    if ($launched) {
+        for ($w = 0; $w -lt 40; $w++) {
+            try {
+                $launched.Refresh()
+                if ($launched.HasExited -or $launched.MainWindowHandle -ne [IntPtr]::Zero) {
+                    break
+                }
+            } catch {
+                break
+            }
+            Pump-Sleep 120
+        }
+    } else {
+        Pump-Sleep 600
+    }
+
+    $form.TopMost = $false
+    $form.Close()
+    $form.Dispose()
+
     if ($stageDir -and (Test-Path -LiteralPath $stageDir)) {
         Remove-Item -LiteralPath $stageDir -Recurse -Force -ErrorAction SilentlyContinue
     }
 } catch {
+    $errMsg = $_.ToString()
     try {
-        "$(Get-Date -Format o) UPDATE FAILED: $_" | Out-File -LiteralPath $logFile -Encoding utf8
+        "$(Get-Date -Format o) UPDATE FAILED: $errMsg" | Out-File -LiteralPath $logFile -Encoding utf8
     } catch {}
+    $titleLbl.Text = "TExplorer update could not complete"
+    $statusLbl.Text = $errMsg
+    $statusLbl.ForeColor = $errorColor
+    $fillPanel.BackColor = $errorColor
+    $fillPanel.Width = 386
+    $detailLbl.Text = "Log saved to: $logFile"
+    $detailLbl.Size = New-Object System.Drawing.Size(296, 32)
+    $closeBtn.Visible = $true
+    [System.Windows.Forms.Application]::Run($form)
     exit 1
 }
 "#;
@@ -589,6 +751,7 @@ try {
 
     Command::new("powershell.exe")
         .args([
+            "-STA",
             "-NoProfile",
             "-NonInteractive",
             "-ExecutionPolicy",
@@ -607,6 +770,8 @@ try {
         .env("TEXPLORER_ALL_USERS", all_users)
         .env("TEXPLORER_NEEDS_ELEVATION", needs_elevation)
         .env("TEXPLORER_LOG_FILE", log_path)
+        .env("TEXPLORER_NEW_VERSION", &staged.version_label)
+        .env("TEXPLORER_DARK_MODE", if dark_mode { "1" } else { "0" })
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
