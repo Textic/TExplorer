@@ -24,7 +24,9 @@ use crate::theme::{
 use crate::ui::network::{
     NetworkConnectModalState, P2pModalState, render_network_connect_modal, render_p2p_modal,
 };
-use crate::ui::sidebar::{DraggedQuickAccessItem, DraggedSidebarSection, SidebarDragGhost};
+use crate::ui::sidebar::{
+    DraggedPinnedFolder, DraggedQuickAccessItem, DraggedSidebarSection, SidebarDragGhost,
+};
 use crate::ui::workspace::Workspace;
 use crate::updater::{CURRENT_VERSION, UpdateState, format_download_bytes};
 
@@ -729,6 +731,44 @@ fn render_settings_card(
                             }),
                         )),
                 )
+                .when(ws.settings.show_tabs, |el| {
+                    el.child(
+                        h_flex()
+                            .p_3()
+                            .items_center()
+                            .justify_between()
+                            .gap_3()
+                            .border_b_1()
+                            .border_color(solid(p.border_subtle))
+                            .child(setting_label(
+                                "Win+E When Already Open",
+                                "Open a separate TExplorer window or add a new tab when pressing Win+E.",
+                                p,
+                            ))
+                            .child(
+                                h_flex()
+                                    .gap_1p5()
+                                    .child(choice_pill(
+                                        "ui-win-e-new-window",
+                                        "New Window",
+                                        ws.settings.win_e_new_window,
+                                        p,
+                                        cx.listener(|this, _, _, cx| {
+                                            this.set_win_e_new_window(true, cx);
+                                        }),
+                                    ))
+                                    .child(choice_pill(
+                                        "ui-win-e-new-tab",
+                                        "New Tab",
+                                        !ws.settings.win_e_new_window,
+                                        p,
+                                        cx.listener(|this, _, _, cx| {
+                                            this.set_win_e_new_window(false, cx);
+                                        }),
+                                    )),
+                            ),
+                    )
+                })
                 .child(
                     h_flex()
                         .p_3()
@@ -1042,7 +1082,138 @@ fn render_settings_card(
                                 },
                             ))
                         }),
-                ),
+                )
+                .child(
+                    h_flex()
+                        .p_3()
+                        .items_center()
+                        .justify_between()
+                        .gap_3()
+                        .border_t_1()
+                        .border_color(solid(p.border_subtle))
+                        .child(setting_label(
+                            "P2P Transfer Row in Network",
+                            "Show the text \"P2P Transfer\" entry inside the Network sidebar section (disabled by default; the Network header button & Home Tools card stay available).",
+                            p,
+                        ))
+                        .child(choice_pill(
+                            "sb-p2p-row-vis",
+                            if ws.settings.show_sidebar_p2p_row {
+                                "Visible"
+                            } else {
+                                "Hidden"
+                            },
+                            ws.settings.show_sidebar_p2p_row,
+                            p,
+                            cx.listener(|this, _, _, cx| {
+                                this.toggle_sidebar_p2p_row(cx);
+                            }),
+                        )),
+                )
+                .when(!ws.settings.pinned_folders.is_empty(), |el| {
+                    el.child(
+                        v_flex()
+                            .p_3()
+                            .gap_2()
+                            .border_t_1()
+                            .border_color(solid(p.border_subtle))
+                            .child(setting_label(
+                                "Pinned Folders",
+                                "Drag pinned folders to reorder them (you can also drag them directly inside the left sidebar).",
+                                p,
+                            ))
+                            .child(v_flex().gap_1p5().children(
+                                ws.settings.pinned_folders.iter().enumerate().map(|(idx, path)| {
+                                    let label: SharedString = path
+                                        .file_name()
+                                        .map(|n| n.to_string_lossy().into_owned())
+                                        .unwrap_or_else(|| path.display().to_string())
+                                        .into();
+                                    let path_over = path.clone();
+                                    let path_drop = path.clone();
+                                    let path_unpin = path.clone();
+                                    let drag_payload = DraggedPinnedFolder {
+                                        path: path.clone(),
+                                        label: label.clone(),
+                                    };
+                                    h_flex()
+                                        .id(("pin-set-row", idx))
+                                        .w_full()
+                                        .px_2p5()
+                                        .py_1p5()
+                                        .gap_2()
+                                        .items_center()
+                                        .justify_between()
+                                        .rounded(px(RADIUS_CONTROL))
+                                        .cursor_grab()
+                                        .bg(solid(p.bg_surface))
+                                        .border_1()
+                                        .border_color(solid(p.border_subtle))
+                                        .hover(move |s| s.border_color(solid(p.border)))
+                                        .on_drag(drag_payload, move |drag, cursor_offset, _, cx| {
+                                            cx.new(|_| SidebarDragGhost {
+                                                label: drag.label.clone(),
+                                                palette: p,
+                                                cursor_offset,
+                                            })
+                                        })
+                                        .drag_over::<DraggedPinnedFolder>(
+                                            move |style, drag, _, _| {
+                                                if drag.path != path_over {
+                                                    style
+                                                        .bg(soft_tint(p.accent_primary, 0.14))
+                                                        .border_color(solid(p.accent_primary))
+                                                } else {
+                                                    style
+                                                }
+                                            },
+                                        )
+                                        .on_drop(cx.listener(
+                                            move |this, drag: &DraggedPinnedFolder, _, cx| {
+                                                cx.stop_propagation();
+                                                this.reorder_pinned_folder(
+                                                    drag.path.clone(),
+                                                    path_drop.clone(),
+                                                    cx,
+                                                );
+                                            },
+                                        ))
+                                        .child(
+                                            h_flex()
+                                                .flex_1()
+                                                .min_w_0()
+                                                .items_center()
+                                                .gap_2()
+                                                .child(drag_grip_handle(p))
+                                                .child(
+                                                    Icon::new(LucideIcon::Pin)
+                                                        .xsmall()
+                                                        .text_color(solid(p.accent_primary)),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .flex_1()
+                                                        .min_w_0()
+                                                        .truncate()
+                                                        .text_xs()
+                                                        .font_medium()
+                                                        .text_color(solid(p.text_primary))
+                                                        .child(label),
+                                                ),
+                                        )
+                                        .child(
+                                            Button::new(("pin-set-unpin", idx))
+                                                .with_size(Size::XSmall)
+                                                .ghost()
+                                                .icon(LucideIcon::X)
+                                                .on_click(cx.listener(move |this, _, _, cx| {
+                                                    this.unpin_folder(&path_unpin, cx);
+                                                })),
+                                        )
+                                }),
+                            )),
+                    )
+                }),
         );
 
     let search_section = v_flex()

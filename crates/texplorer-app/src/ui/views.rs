@@ -508,6 +508,92 @@ pub fn render_home_view(
                         })),
                 ),
         )
+        .child(
+            v_flex()
+                .gap_2p5()
+                .child(home_section_header("Tools", p))
+                .child(
+                    div()
+                        .w_full()
+                        .grid()
+                        .grid_cols(qa_cols.clamp(1, 3))
+                        .gap_2()
+                        .child({
+                            let active_count = ws.active_p2p_transfers.len();
+                            let peer_count = ws.p2p_nearby_peers.len();
+                            let subtitle: SharedString = if active_count > 0 {
+                                format!("{active_count} active encrypted transfer(s)").into()
+                            } else if ws.active_p2p_share.is_some() {
+                                "Sharing active • click to view code".into()
+                            } else if peer_count > 0 {
+                                format!("{peer_count} nearby PC(s) on LAN • Internet & LAN").into()
+                            } else {
+                                "Send & receive encrypted files over LAN or Internet".into()
+                            };
+                            h_flex()
+                                .id(match side {
+                                    PaneSide::Left => "home-tool-p2p-l",
+                                    PaneSide::Right => "home-tool-p2p-r",
+                                })
+                                .w_full()
+                                .min_w_0()
+                                .p_2p5()
+                                .gap_2p5()
+                                .items_center()
+                                .rounded(px(RADIUS_ROW))
+                                .cursor_pointer()
+                                .bg(solid(p.bg_surface))
+                                .border_1()
+                                .border_color(solid(p.border_subtle))
+                                .hover(move |s| {
+                                    s.bg(solid(p.bg_elevated)).border_color(solid(p.border))
+                                })
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|this, _: &MouseDownEvent, window, cx| {
+                                        this.open_p2p_modal_from_sidebar(window, cx);
+                                    }),
+                                )
+                                .child(
+                                    div()
+                                        .w(px(32.))
+                                        .h(px(32.))
+                                        .flex()
+                                        .flex_shrink_0()
+                                        .items_center()
+                                        .justify_center()
+                                        .rounded(px(RADIUS_CONTROL))
+                                        .bg(soft_tint(p.accent_primary, 0.12))
+                                        .child(
+                                            Icon::new(LucideIcon::Radio)
+                                                .small()
+                                                .text_color(solid(p.accent_primary)),
+                                        ),
+                                )
+                                .child(
+                                    v_flex()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .gap_0p5()
+                                        .child(
+                                            div()
+                                                .truncate()
+                                                .text_xs()
+                                                .font_semibold()
+                                                .text_color(solid(p.text_primary))
+                                                .child("P2P File Transfer"),
+                                        )
+                                        .child(
+                                            div()
+                                                .truncate()
+                                                .text_size(px(13.))
+                                                .text_color(solid(p.text_muted))
+                                                .child(subtitle),
+                                        ),
+                                )
+                        }),
+                ),
+        )
 }
 
 /// Renders the virtualized tabular Details view (`28px` uniform rows + Drag & Drop).

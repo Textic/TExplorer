@@ -4,6 +4,7 @@ pub mod clipboard;
 pub mod com_shell;
 pub mod credentials;
 pub mod default_explorer;
+pub mod dialogs;
 pub mod elevation;
 pub mod launch;
 pub mod locks;
@@ -24,6 +25,7 @@ pub use default_explorer::{
     query_default_explorer_status, restore_windows_explorer, set_win_e_interception,
     should_delegate_to_windows_explorer,
 };
+pub use dialogs::{pick_files_dialog, pick_folder_dialog};
 pub use elevation::is_elevated;
 pub use launch::{
     delete_permanently, move_to_trash, open_in_editor, open_item, open_terminal_here,
@@ -33,8 +35,8 @@ pub use locks::{FileLockStatus, LockingProcess, inspect_file_lock};
 pub use network_share::{connect_smb_share, disconnect_smb_share};
 pub use ole_drop::{NativeDropEvent, install_native_drop_target};
 pub use single_instance::{
-    LaunchIntent, SingleInstanceGuard, parse_cli_args, start_single_instance_server,
-    try_forward_to_running_instance,
+    LaunchIntent, SingleInstanceGuard, is_app_instance_running, parse_cli_args,
+    start_single_instance_server, try_forward_to_running_instance,
 };
 pub use theme_detect::system_prefers_dark_mode;
 pub use video_player::{

@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use crate::default_explorer::{is_home_or_this_pc_namespace, should_delegate_to_windows_explorer};
 
 pub const SINGLE_INSTANCE_PIPE: &str = r"\\.\pipe\TExplorerSingleInstanceV1";
+const APP_RUNNING_MUTEX: &str = "Local\\TExplorerAppRunningV1";
 
 /// Resolved command-line startup or IPC handoff action.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -142,10 +143,41 @@ pub fn try_forward_to_running_instance(_intent: &LaunchIntent) -> bool {
     false
 }
 
+/// Returns `true` if at least one T Explorer GUI window is currently running.
+/// Uses a named mutex rather than touching the Named Pipe so callers can probe without
+/// waking a waiting `ConnectNamedPipe` server.
+#[cfg(target_os = "windows")]
+pub fn is_app_instance_running() -> bool {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::OpenMutexW;
+
+    const MUTEX_SYNCHRONIZE: u32 = 0x0010_0000;
+    let name: Vec<u16> = APP_RUNNING_MUTEX
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    let handle = unsafe { OpenMutexW(MUTEX_SYNCHRONIZE, 0, name.as_ptr()) };
+    if handle.is_null() {
+        false
+    } else {
+        unsafe {
+            CloseHandle(handle);
+        }
+        true
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn is_app_instance_running() -> bool {
+    false
+}
+
 /// Keeps the single-instance IPC server alive for the lifetime of the application.
 pub struct SingleInstanceGuard {
     stop_flag: Arc<AtomicBool>,
     thread: Option<JoinHandle<()>>,
+    #[cfg(target_os = "windows")]
+    instance_mutex: isize,
 }
 
 impl Drop for SingleInstanceGuard {
@@ -153,11 +185,31 @@ impl Drop for SingleInstanceGuard {
         self.stop_flag.store(true, Ordering::Release);
         #[cfg(target_os = "windows")]
         {
-            // Wake the blocking ConnectNamedPipe loop cleanly with a no-op connection.
-            let _ = std::fs::OpenOptions::new()
-                .write(true)
-                .open(SINGLE_INSTANCE_PIPE);
+            use std::os::windows::io::AsRawHandle;
+            use windows_sys::Win32::Foundation::CloseHandle;
+            use windows_sys::Win32::System::IO::CancelSynchronousIo;
+
+            if self.instance_mutex != 0 {
+                unsafe {
+                    CloseHandle(self.instance_mutex as *mut std::ffi::c_void);
+                }
+                self.instance_mutex = 0;
+            }
+            if let Some(handle) = self.thread.take() {
+                // Cancel this specific thread's blocking ConnectNamedPipe without disturbing
+                // any other running T Explorer window's pipe server.
+                let cancelled = unsafe { CancelSynchronousIo(handle.as_raw_handle()) };
+                if cancelled == 0 && !is_app_instance_running() {
+                    let _ = std::fs::OpenOptions::new()
+                        .write(true)
+                        .open(SINGLE_INSTANCE_PIPE);
+                }
+                if cancelled != 0 || !is_app_instance_running() {
+                    let _ = handle.join();
+                }
+            }
         }
+        #[cfg(not(target_os = "windows"))]
         if let Some(handle) = self.thread.take() {
             let _ = handle.join();
         }
@@ -181,6 +233,13 @@ pub fn start_single_instance_server(
         ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, PIPE_READMODE_BYTE,
         PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_WAIT,
     };
+    use windows_sys::Win32::System::Threading::CreateMutexW;
+
+    let mutex_name: Vec<u16> = APP_RUNNING_MUTEX
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    let instance_mutex = unsafe { CreateMutexW(std::ptr::null(), 0, mutex_name.as_ptr()) } as isize;
 
     let stop_flag = Arc::new(AtomicBool::new(false));
     let stop_bg = stop_flag.clone();
@@ -241,7 +300,11 @@ pub fn start_single_instance_server(
         })
         .ok();
 
-    SingleInstanceGuard { stop_flag, thread }
+    SingleInstanceGuard {
+        stop_flag,
+        thread,
+        instance_mutex,
+    }
 }
 
 #[cfg(not(target_os = "windows"))]

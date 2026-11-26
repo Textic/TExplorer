@@ -15,9 +15,10 @@ use gpui_kit::{
 use texplorer_core::{AppSession, AppSettings};
 use texplorer_platform::{
     DefaultExplorerStatus, LaunchIntent, delegate_to_windows_explorer, enable_default_explorer,
-    ensure_win_e_daemon_running, parse_cli_args, query_default_explorer_status,
-    restore_windows_explorer, run_win_e_daemon, start_single_instance_server, stop_win_e_daemon,
-    system_prefers_dark_mode, try_forward_to_running_instance,
+    ensure_win_e_daemon_running, is_app_instance_running, parse_cli_args,
+    query_default_explorer_status, restore_windows_explorer, run_win_e_daemon,
+    start_single_instance_server, stop_win_e_daemon, system_prefers_dark_mode,
+    try_forward_to_running_instance,
 };
 
 use crate::ui::workspace::{
@@ -173,7 +174,13 @@ fn main() {
         _ => {}
     }
 
-    if !force_new_window && try_forward_to_running_instance(&launch_intent) {
+    let initial_settings = AppSettings::load();
+    let open_new_window_for_default = matches!(launch_intent, LaunchIntent::OpenDefault)
+        && initial_settings.should_win_e_open_new_window()
+        && is_app_instance_running();
+    let effective_new_window = force_new_window || open_new_window_for_default;
+
+    if !effective_new_window && try_forward_to_running_instance(&launch_intent) {
         return;
     }
 
@@ -182,7 +189,6 @@ fn main() {
         let _ = ipc_tx.unbounded_send(intent);
     });
 
-    let initial_settings = AppSettings::load();
     if initial_settings.intercept_win_e
         && (initial_settings.replace_default_explorer
             || query_default_explorer_status() == DefaultExplorerStatus::Enabled)
@@ -190,7 +196,7 @@ fn main() {
     {
         let _ = ensure_win_e_daemon_running(&exe);
     }
-    let initial_session = if initial_settings.restore_tabs_on_startup && !force_new_window {
+    let initial_session = if initial_settings.restore_tabs_on_startup && !effective_new_window {
         AppSession::load()
     } else {
         None
