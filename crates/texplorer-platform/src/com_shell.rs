@@ -28,6 +28,12 @@ enum ShellJob {
         screen_y: i32,
         on_done: MenuCallback,
     },
+    NativeBackgroundContextMenu {
+        directory: PathBuf,
+        screen_x: i32,
+        screen_y: i32,
+        on_done: MenuCallback,
+    },
     ShowProperties {
         path: PathBuf,
         on_done: MenuCallback,
@@ -72,6 +78,17 @@ impl ShellWorker {
                             let res = invoke_native_context_menu(&paths, screen_x, screen_y);
                             on_done(res);
                         }
+                        ShellJob::NativeBackgroundContextMenu {
+                            directory,
+                            screen_x,
+                            screen_y,
+                            on_done,
+                        } => {
+                            let res = invoke_native_background_context_menu(
+                                &directory, screen_x, screen_y,
+                            );
+                            on_done(res);
+                        }
                         ShellJob::ShowProperties { path, on_done } => {
                             let res = crate::launch::show_properties_dialog(&path);
                             on_done(res);
@@ -112,6 +129,23 @@ impl ShellWorker {
     ) {
         let _ = self.tx.send(ShellJob::NativeContextMenu {
             paths,
+            screen_x,
+            screen_y,
+            on_done: Box::new(on_done),
+        });
+    }
+
+    /// Shows the native Win32 Explorer directory background context menu (empty folder space)
+    /// for `directory` at `(screen_x, screen_y)`.
+    pub fn show_native_background_context_menu(
+        &self,
+        directory: PathBuf,
+        screen_x: i32,
+        screen_y: i32,
+        on_done: impl FnOnce(Result<(), String>) + Send + 'static,
+    ) {
+        let _ = self.tx.send(ShellJob::NativeBackgroundContextMenu {
+            directory,
             screen_x,
             screen_y,
             on_done: Box::new(on_done),
@@ -268,25 +302,193 @@ fn extract_shell_thumbnail(_path: &std::path::Path, _size_px: i32) -> Option<Raw
 }
 
 #[cfg(target_os = "windows")]
+mod shell_menu_host {
+    use std::cell::RefCell;
+
+    use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
+    use windows::Win32::UI::Shell::{
+        CMF_EXPLORE, CMF_EXTENDEDVERBS, CMF_NORMAL, CMINVOKECOMMANDINFO, IContextMenu,
+        IContextMenu2, IContextMenu3,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::{
+        CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow,
+        RegisterClassW, SetForegroundWindow, TPM_LEFTALIGN, TPM_RETURNCMD, TPM_RIGHTBUTTON,
+        TrackPopupMenuEx, WINDOW_EX_STYLE, WM_DRAWITEM, WM_INITMENUPOPUP, WM_MEASUREITEM,
+        WM_MENUCHAR, WNDCLASSW, WS_POPUP,
+    };
+    use windows::core::{Interface, PCSTR, PCWSTR};
+
+    thread_local! {
+        static ACTIVE_CTX_MENU2: RefCell<Option<IContextMenu2>> = const { RefCell::new(None) };
+        static ACTIVE_CTX_MENU3: RefCell<Option<IContextMenu3>> = const { RefCell::new(None) };
+    }
+
+    unsafe extern "system" fn menu_host_wnd_proc(
+        hwnd: HWND,
+        msg: u32,
+        wparam: WPARAM,
+        lparam: LPARAM,
+    ) -> LRESULT {
+        let mut handled_res: Option<LRESULT> = None;
+        if msg == WM_MENUCHAR || msg == WM_INITMENUPOPUP || msg == WM_DRAWITEM || msg == WM_MEASUREITEM
+        {
+            ACTIVE_CTX_MENU3.with(|cell| {
+                if let Some(cm3) = cell.borrow().as_ref() {
+                    let mut lres = LRESULT(0);
+                    if unsafe { cm3.HandleMenuMsg2(msg, wparam, lparam, Some(&mut lres)) }.is_ok() {
+                        handled_res = Some(lres);
+                    }
+                }
+            });
+            if handled_res.is_none() && msg != WM_MENUCHAR {
+                ACTIVE_CTX_MENU2.with(|cell| {
+                    if let Some(cm2) = cell.borrow().as_ref()
+                        && unsafe { cm2.HandleMenuMsg(msg, wparam, lparam) }.is_ok()
+                    {
+                        handled_res = Some(LRESULT(0));
+                    }
+                });
+            }
+        }
+        handled_res.unwrap_or_else(|| unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) })
+    }
+
+    pub struct HostWindowGuard(pub HWND);
+    impl Drop for HostWindowGuard {
+        fn drop(&mut self) {
+            unsafe {
+                let _ = DestroyWindow(self.0);
+            }
+        }
+    }
+
+    pub fn create_menu_host_window(screen_x: i32, screen_y: i32) -> Result<HostWindowGuard, String> {
+        let class_name: Vec<u16> = "TExplorerShellMenuHostV1\0".encode_utf16().collect();
+        let wc = WNDCLASSW {
+            lpfnWndProc: Some(menu_host_wnd_proc),
+            lpszClassName: PCWSTR(class_name.as_ptr()),
+            ..Default::default()
+        };
+        unsafe {
+            let _ = RegisterClassW(&wc);
+        }
+        let hwnd = unsafe {
+            CreateWindowExW(
+                WINDOW_EX_STYLE(0),
+                PCWSTR(class_name.as_ptr()),
+                PCWSTR(class_name.as_ptr()),
+                WS_POPUP,
+                screen_x,
+                screen_y,
+                1,
+                1,
+                None,
+                None,
+                None,
+                None,
+            )
+            .map_err(|e| format!("Failed creating Win32 menu host window: {e}"))?
+        };
+        Ok(HostWindowGuard(hwnd))
+    }
+
+    pub fn run_context_menu_popup(
+        hwnd: HWND,
+        ctx_menu: &IContextMenu,
+        screen_x: i32,
+        screen_y: i32,
+    ) -> Result<(), String> {
+        let hmenu = unsafe {
+            CreatePopupMenu().map_err(|e| format!("Failed creating native popup menu: {e}"))?
+        };
+        struct MenuGuard(windows::Win32::UI::WindowsAndMessaging::HMENU);
+        impl Drop for MenuGuard {
+            fn drop(&mut self) {
+                unsafe {
+                    let _ = DestroyMenu(self.0);
+                }
+            }
+        }
+        let _menu_guard = MenuGuard(hmenu);
+
+        // Bind IContextMenu2/3 on this STA thread so dynamic submenus (e.g. "New ->") render properly.
+        ACTIVE_CTX_MENU3.with(|c| *c.borrow_mut() = ctx_menu.cast::<IContextMenu3>().ok());
+        ACTIVE_CTX_MENU2.with(|c| *c.borrow_mut() = ctx_menu.cast::<IContextMenu2>().ok());
+        struct ActiveMenuReset;
+        impl Drop for ActiveMenuReset {
+            fn drop(&mut self) {
+                ACTIVE_CTX_MENU3.with(|c| *c.borrow_mut() = None);
+                ACTIVE_CTX_MENU2.with(|c| *c.borrow_mut() = None);
+            }
+        }
+        let _reset = ActiveMenuReset;
+
+        const ID_CMD_FIRST: u32 = 1;
+        const ID_CMD_LAST: u32 = 0x7FFF;
+        unsafe {
+            ctx_menu
+                .QueryContextMenu(
+                    hmenu,
+                    0,
+                    ID_CMD_FIRST,
+                    ID_CMD_LAST,
+                    CMF_NORMAL | CMF_EXPLORE | CMF_EXTENDEDVERBS,
+                )
+                .map_err(|e| format!("Failed populating Windows context menu: {e}"))?;
+            let _ = SetForegroundWindow(hwnd);
+        }
+
+        let cmd = unsafe {
+            TrackPopupMenuEx(
+                hmenu,
+                (TPM_LEFTALIGN | TPM_RETURNCMD | TPM_RIGHTBUTTON).0,
+                screen_x,
+                screen_y,
+                hwnd,
+                None,
+            )
+        };
+
+        if cmd.as_bool() {
+            let cmd_id = cmd.0 as u32;
+            if cmd_id >= ID_CMD_FIRST {
+                let offset = (cmd_id - ID_CMD_FIRST) as usize;
+                let info = CMINVOKECOMMANDINFO {
+                    cbSize: std::mem::size_of::<CMINVOKECOMMANDINFO>() as u32,
+                    fMask: 0,
+                    hwnd,
+                    lpVerb: PCSTR(offset as *const u8),
+                    lpParameters: PCSTR::null(),
+                    lpDirectory: PCSTR::null(),
+                    nShow: 1, // SW_SHOWNORMAL
+                    dwHotKey: 0,
+                    hIcon: Default::default(),
+                };
+                unsafe {
+                    ctx_menu
+                        .InvokeCommand(&info)
+                        .map_err(|e| format!("Windows shell command failed: {e}"))?;
+                }
+            }
+        }
+
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "windows")]
 fn invoke_native_context_menu(
     paths: &[PathBuf],
     screen_x: i32,
     screen_y: i32,
 ) -> Result<(), String> {
     use std::os::windows::ffi::OsStrExt;
-    use windows::Win32::Foundation::HWND;
     use windows::Win32::System::Com::CoTaskMemFree;
     use windows::Win32::UI::Shell::Common::ITEMIDLIST;
     use windows::Win32::UI::Shell::{
-        CMF_EXPLORE, CMF_NORMAL, CMINVOKECOMMANDINFO, IContextMenu, IShellFolder, SHBindToParent,
-        SHParseDisplayName,
+        IContextMenu, IShellFolder, SHBindToParent, SHParseDisplayName,
     };
-    use windows::Win32::UI::WindowsAndMessaging::{
-        CreatePopupMenu, CreateWindowExW, DestroyMenu, DestroyWindow, SetForegroundWindow,
-        TPM_LEFTALIGN, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenuEx, WINDOW_EX_STYLE,
-        WS_POPUP,
-    };
-    use windows::core::{PCSTR, PCWSTR};
+    use windows::core::PCWSTR;
 
     if paths.is_empty() {
         return Ok(());
@@ -314,7 +516,8 @@ fn invoke_native_context_menu(
             .chain(std::iter::once(0))
             .collect();
         let mut pidl: *mut ITEMIDLIST = std::ptr::null_mut();
-        let parse_res = unsafe { SHParseDisplayName(PCWSTR(wide.as_ptr()), None, &mut pidl, 0, None) };
+        let parse_res =
+            unsafe { SHParseDisplayName(PCWSTR(wide.as_ptr()), None, &mut pidl, 0, None) };
         if parse_res.is_err() || pidl.is_null() {
             continue;
         }
@@ -341,105 +544,81 @@ fn invoke_native_context_menu(
         return Err("No valid Windows Shell items selected.".to_string());
     }
 
-    let class_name: Vec<u16> = "STATIC\0".encode_utf16().collect();
-    let title: Vec<u16> = "TExplorerShellMenuHost\0".encode_utf16().collect();
-    let hwnd: HWND = unsafe {
-        CreateWindowExW(
-            WINDOW_EX_STYLE(0),
-            PCWSTR(class_name.as_ptr()),
-            PCWSTR(title.as_ptr()),
-            WS_POPUP,
-            screen_x,
-            screen_y,
-            1,
-            1,
-            None,
-            None,
-            None,
-            None,
-        )
-        .map_err(|e| format!("Failed creating Win32 menu host window: {e}"))?
-    };
-
-    struct WindowGuard(HWND);
-    impl Drop for WindowGuard {
-        fn drop(&mut self) {
-            unsafe {
-                let _ = DestroyWindow(self.0);
-            }
-        }
-    }
-    let _win_guard = WindowGuard(hwnd);
-
+    let host = shell_menu_host::create_menu_host_window(screen_x, screen_y)?;
     let ctx_menu: IContextMenu = unsafe {
         folder
-            .GetUIObjectOf(hwnd, &child_pidls, None)
+            .GetUIObjectOf(host.0, &child_pidls, None)
             .map_err(|e| format!("Failed acquiring Windows IContextMenu: {e}"))?
     };
 
-    let hmenu = unsafe {
-        CreatePopupMenu().map_err(|e| format!("Failed creating native popup menu: {e}"))?
-    };
+    shell_menu_host::run_context_menu_popup(host.0, &ctx_menu, screen_x, screen_y)
+}
 
-    struct MenuGuard(windows::Win32::UI::WindowsAndMessaging::HMENU);
-    impl Drop for MenuGuard {
+#[cfg(target_os = "windows")]
+fn invoke_native_background_context_menu(
+    directory: &std::path::Path,
+    screen_x: i32,
+    screen_y: i32,
+) -> Result<(), String> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::Win32::System::Com::{CoTaskMemFree, IBindCtx};
+    use windows::Win32::UI::Shell::Common::ITEMIDLIST;
+    use windows::Win32::UI::Shell::{
+        IContextMenu, IShellFolder, SHBindToObject, SHParseDisplayName,
+    };
+    use windows::core::PCWSTR;
+
+    let wide: Vec<u16> = directory
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let mut pidl: *mut ITEMIDLIST = std::ptr::null_mut();
+    unsafe {
+        SHParseDisplayName(PCWSTR(wide.as_ptr()), None, &mut pidl, 0, None)
+            .map_err(|e| format!("Failed parsing folder path for Windows menu: {e}"))?;
+    }
+    if pidl.is_null() {
+        return Err("Failed resolving Windows Shell folder PIDL.".to_string());
+    }
+
+    struct SinglePidlGuard(*mut ITEMIDLIST);
+    impl Drop for SinglePidlGuard {
         fn drop(&mut self) {
             unsafe {
-                let _ = DestroyMenu(self.0);
+                CoTaskMemFree(Some(self.0 as *const core::ffi::c_void));
             }
         }
     }
-    let _menu_guard = MenuGuard(hmenu);
+    let _pidl_guard = SinglePidlGuard(pidl);
 
-    const ID_CMD_FIRST: u32 = 1;
-    const ID_CMD_LAST: u32 = 0x7FFF;
-    unsafe {
-        ctx_menu
-            .QueryContextMenu(hmenu, 0, ID_CMD_FIRST, ID_CMD_LAST, CMF_NORMAL | CMF_EXPLORE)
-            .map_err(|e| format!("Failed populating Windows context menu: {e}"))?;
-        let _ = SetForegroundWindow(hwnd);
-    }
-
-    let cmd = unsafe {
-        TrackPopupMenuEx(
-            hmenu,
-            (TPM_LEFTALIGN | TPM_RETURNCMD | TPM_RIGHTBUTTON).0,
-            screen_x,
-            screen_y,
-            hwnd,
-            None,
-        )
+    let folder: IShellFolder = unsafe {
+        SHBindToObject::<Option<&IShellFolder>, Option<&IBindCtx>, IShellFolder>(None, pidl, None)
+            .map_err(|e| format!("Failed binding Windows Shell folder: {e}"))?
     };
 
-    if cmd.as_bool() {
-        let cmd_id = cmd.0 as u32;
-        if cmd_id >= ID_CMD_FIRST {
-            let offset = (cmd_id - ID_CMD_FIRST) as usize;
-            let info = CMINVOKECOMMANDINFO {
-                cbSize: std::mem::size_of::<CMINVOKECOMMANDINFO>() as u32,
-                fMask: 0,
-                hwnd,
-                lpVerb: PCSTR(offset as *const u8),
-                lpParameters: PCSTR::null(),
-                lpDirectory: PCSTR::null(),
-                nShow: 1, // SW_SHOWNORMAL
-                dwHotKey: 0,
-                hIcon: Default::default(),
-            };
-            unsafe {
-                ctx_menu
-                    .InvokeCommand(&info)
-                    .map_err(|e| format!("Windows shell command failed: {e}"))?;
-            }
-        }
-    }
+    let host = shell_menu_host::create_menu_host_window(screen_x, screen_y)?;
+    let ctx_menu: IContextMenu = unsafe {
+        folder
+            .CreateViewObject(host.0)
+            .map_err(|e| format!("Failed acquiring Windows folder background menu: {e}"))?
+    };
 
-    Ok(())
+    shell_menu_host::run_context_menu_popup(host.0, &ctx_menu, screen_x, screen_y)
 }
 
 #[cfg(not(target_os = "windows"))]
 fn invoke_native_context_menu(
     _paths: &[PathBuf],
+    _screen_x: i32,
+    _screen_y: i32,
+) -> Result<(), String> {
+    Err("Native Windows context menu is only supported on Windows.".to_string())
+}
+
+#[cfg(not(target_os = "windows"))]
+fn invoke_native_background_context_menu(
+    _directory: &std::path::Path,
     _screen_x: i32,
     _screen_y: i32,
 ) -> Result<(), String> {

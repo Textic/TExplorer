@@ -8,6 +8,7 @@ pub mod launch;
 pub mod locks;
 pub mod single_instance;
 pub mod theme_detect;
+pub mod video_player;
 pub mod volumes;
 pub mod watcher;
 pub mod win_e_hook;
@@ -30,6 +31,10 @@ pub use single_instance::{
     try_forward_to_running_instance,
 };
 pub use theme_detect::system_prefers_dark_mode;
+pub use video_player::{
+    VideoFrameSnapshot, VideoNotify, VideoPlaybackStatus, VideoPlayerHandle, VideoStartOptions,
+    fit_video_dimensions, spawn_video_player,
+};
 pub use volumes::{list_known_folders, list_volumes, list_wsl_distros};
 pub use watcher::{DirectoryWatcher, WatchEvent};
 pub use win_e_hook::{

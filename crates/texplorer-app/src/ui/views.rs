@@ -16,7 +16,9 @@ use crate::theme::{
     format_timestamp, known_folder_icon, soft_tint, solid, usage_bar_color,
 };
 use crate::ui::context_menu::ContextMenuTarget;
-use crate::ui::workspace::{Workspace, is_valid_internal_drop_target};
+use crate::ui::workspace::{ColumnDivider, Workspace, is_valid_internal_drop_target};
+
+const LIST_MARQUEE_GUTTER_PX: f32 = 44.0;
 
 /// Drag payload for internal file/folder drag & drop (into folders or across Dual-Pane).
 #[derive(Clone)]
@@ -397,6 +399,8 @@ pub fn render_details_view(
     let sort = model.sort;
     let is_loading = model.loading;
     let error = model.error.clone();
+    let (col_mod_w, col_type_w, col_size_w) = ws.details_column_widths();
+    let active_divider = ws.column_resize.as_ref().map(|r| r.divider);
     let pane_dir = model.location.as_local_path().map(|path| path.to_path_buf());
     let list_id = match side {
         PaneSide::Left => "details-list-left",
@@ -462,60 +466,91 @@ pub fn render_details_view(
             MouseButton::Right,
             cx.listener(move |this, ev: &MouseDownEvent, window, cx| {
                 if !window.default_prevented() {
-                    this.open_pane_bg_context_menu(side, ev.position, cx);
+                    this.open_pane_bg_context_menu(side, ev, cx);
                 }
             }),
         )
         .child(
-            h_flex()
+            div()
                 .w_full()
                 .h(px(34.))
-                .px_2p5()
+                .pl(px(6.))
+                .pr(px(LIST_MARQUEE_GUTTER_PX))
                 .flex_shrink_0()
-                .items_center()
                 .bg(solid(p.bg_elevated))
                 .border_b_1()
                 .border_color(solid(p.border_subtle))
-                .child(sort_header_cell(
-                    side,
-                    "Name",
-                    SortColumn::Name,
-                    sort,
-                    None,
-                    false,
-                    p,
-                    cx,
-                ))
-                .child(sort_header_cell(
-                    side,
-                    "Date Modified",
-                    SortColumn::Modified,
-                    sort,
-                    Some(164.),
-                    false,
-                    p,
-                    cx,
-                ))
-                .child(sort_header_cell(
-                    side,
-                    "Type",
-                    SortColumn::Type,
-                    sort,
-                    Some(144.),
-                    false,
-                    p,
-                    cx,
-                ))
-                .child(sort_header_cell(
-                    side,
-                    "Size",
-                    SortColumn::Size,
-                    sort,
-                    Some(106.),
-                    true,
-                    p,
-                    cx,
-                )),
+                .child(
+                    h_flex()
+                        .w_full()
+                        .h_full()
+                        .px_2p5()
+                        .items_center()
+                        .child(sort_header_cell(
+                            side,
+                            "Name",
+                            SortColumn::Name,
+                            sort,
+                            None,
+                            false,
+                            p,
+                            cx,
+                        ))
+                        .child(resizable_header_column(
+                            side,
+                            ColumnDivider::NameModified,
+                            active_divider == Some(ColumnDivider::NameModified),
+                            col_mod_w,
+                            sort_header_cell(
+                                side,
+                                "Date Modified",
+                                SortColumn::Modified,
+                                sort,
+                                None,
+                                false,
+                                p,
+                                cx,
+                            ),
+                            p,
+                            cx,
+                        ))
+                        .child(resizable_header_column(
+                            side,
+                            ColumnDivider::ModifiedType,
+                            active_divider == Some(ColumnDivider::ModifiedType),
+                            col_type_w,
+                            sort_header_cell(
+                                side,
+                                "Type",
+                                SortColumn::Type,
+                                sort,
+                                None,
+                                false,
+                                p,
+                                cx,
+                            ),
+                            p,
+                            cx,
+                        ))
+                        .child(resizable_header_column(
+                            side,
+                            ColumnDivider::TypeSize,
+                            active_divider == Some(ColumnDivider::TypeSize),
+                            col_size_w,
+                            sort_header_cell(
+                                side,
+                                "Size",
+                                SortColumn::Size,
+                                sort,
+                                None,
+                                true,
+                                p,
+                                cx,
+                            ),
+                            p,
+                            cx,
+                        )),
+                ),
         )
         .child(if row_count == 0 {
             render_empty_state(
@@ -564,6 +599,7 @@ fn render_details_rows(
 ) -> Vec<gpui_kit::AnyElement> {
     let p = ws.palette();
     let unit = ws.settings.size_unit;
+    let (col_mod_w, col_type_w, col_size_w) = ws.details_column_widths();
 
     let Some(tab) = ws.active_tab() else {
         return Vec::new();
@@ -611,9 +647,10 @@ fn render_details_rows(
                     vis_idx,
                 ))
                 .w_full()
-                .h(px(32.))
+                .h_full()
                 .px_2p5()
                 .items_center()
+                .rounded(px(RADIUS_CONTROL))
                 .cursor_pointer()
                 .bg(row_bg)
                 .border_b_1()
@@ -753,8 +790,9 @@ fn render_details_rows(
                 )
                 .child(
                     div()
-                        .w(px(164.))
+                        .w(px(col_mod_w))
                         .flex_shrink_0()
+                        .pl_2()
                         .truncate()
                         .text_xs()
                         .text_color(solid(p.text_secondary))
@@ -762,8 +800,9 @@ fn render_details_rows(
                 )
                 .child(
                     div()
-                        .w(px(144.))
+                        .w(px(col_type_w))
                         .flex_shrink_0()
+                        .pl_2()
                         .truncate()
                         .text_xs()
                         .text_color(solid(p.text_muted))
@@ -771,8 +810,9 @@ fn render_details_rows(
                 )
                 .child(
                     div()
-                        .w(px(106.))
+                        .w(px(col_size_w))
                         .flex_shrink_0()
+                        .pl_2()
                         .text_right()
                         .truncate()
                         .text_xs()
@@ -780,7 +820,16 @@ fn render_details_rows(
                         .child(size_label),
                 );
 
-            Some(row.into_any_element())
+            Some(
+                div()
+                    .w_full()
+                    .h(px(32.))
+                    .pl(px(6.))
+                    .pr(px(LIST_MARQUEE_GUTTER_PX))
+                    .bg(solid(p.bg_base))
+                    .child(row)
+                    .into_any_element(),
+            )
         })
         .collect()
 }
@@ -866,7 +915,7 @@ pub fn render_grid_view(
             MouseButton::Right,
             cx.listener(move |this, ev: &MouseDownEvent, window, cx| {
                 if !window.default_prevented() {
-                    this.open_pane_bg_context_menu(side, ev.position, cx);
+                    this.open_pane_bg_context_menu(side, ev, cx);
                 }
             }),
         )
@@ -1261,7 +1310,7 @@ pub fn render_compact_view(
             MouseButton::Right,
             cx.listener(move |this, ev: &MouseDownEvent, window, cx| {
                 if !window.default_prevented() {
-                    this.open_pane_bg_context_menu(side, ev.position, cx);
+                    this.open_pane_bg_context_menu(side, ev, cx);
                 }
             }),
         )
@@ -1353,86 +1402,95 @@ fn render_compact_rows(
             let drag_payload = build_drag_payload(ws, side, local_path.as_ref(), &entry.name);
             let archive_drag_payload = build_archive_drag_payload(ws, side, entry);
 
+            let row = h_flex()
+                .id((
+                    match side {
+                        PaneSide::Left => "cmp-row-l",
+                        PaneSide::Right => "cmp-row-r",
+                    },
+                    vis_idx,
+                ))
+                .w_full()
+                .h_full()
+                .px_2p5()
+                .gap_2()
+                .items_center()
+                .rounded(px(RADIUS_CONTROL))
+                .cursor_pointer()
+                .bg(if selected {
+                    soft_tint(p.accent_primary, if p.is_dark { 0.16 } else { 0.12 })
+                } else {
+                    solid(p.bg_base)
+                })
+                .hover(move |s| {
+                    if selected {
+                        s
+                    } else {
+                        s.bg(solid(p.bg_hover))
+                    }
+                })
+                .when_some(drag_payload, |el, payload| {
+                    el.on_drag(payload, move |drag, _, _, cx| {
+                        cx.new(|_| DragBadgeView {
+                            label: drag.label.clone(),
+                            palette: p,
+                        })
+                    })
+                })
+                .when_some(archive_drag_payload, |el, payload| {
+                    el.on_drag(payload, move |drag, _, _, cx| {
+                        cx.new(|_| DragBadgeView {
+                            label: drag.label.clone(),
+                            palette: p,
+                        })
+                    })
+                })
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, ev: &MouseDownEvent, window, cx| {
+                        this.handle_entry_left_click(side, vis_idx, ev, window, cx);
+                    }),
+                )
+                .on_mouse_down(
+                    MouseButton::Right,
+                    cx.listener(move |this, ev: &MouseDownEvent, window, cx| {
+                        window.prevent_default();
+                        this.handle_entry_right_click(side, vis_idx, ev, cx);
+                    }),
+                )
+                .child(Icon::new(icon).xsmall().text_color(if is_cut {
+                    solid(p.text_muted)
+                } else {
+                    solid(icon_hex)
+                }))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .text_xs()
+                        .text_color(if is_cut {
+                            solid(p.text_muted)
+                        } else {
+                            solid(p.text_primary)
+                        })
+                        .child(name),
+                )
+                .child(
+                    div()
+                        .text_size(px(13.))
+                        .text_color(solid(p.text_muted))
+                        .child(size),
+                );
+
             Some(
-                h_flex()
-                    .id((
-                        match side {
-                            PaneSide::Left => "cmp-row-l",
-                            PaneSide::Right => "cmp-row-r",
-                        },
-                        vis_idx,
-                    ))
+                div()
                     .w_full()
                     .h(px(28.))
-                    .px_2p5()
-                    .gap_2()
-                    .items_center()
-                    .cursor_pointer()
-                    .bg(if selected {
-                        soft_tint(p.accent_primary, if p.is_dark { 0.16 } else { 0.12 })
-                    } else {
-                        solid(p.bg_base)
-                    })
-                    .hover(move |s| {
-                        if selected {
-                            s
-                        } else {
-                            s.bg(solid(p.bg_hover))
-                        }
-                    })
-                    .when_some(drag_payload, |el, payload| {
-                        el.on_drag(payload, move |drag, _, _, cx| {
-                            cx.new(|_| DragBadgeView {
-                                label: drag.label.clone(),
-                                palette: p,
-                            })
-                        })
-                    })
-                    .when_some(archive_drag_payload, |el, payload| {
-                        el.on_drag(payload, move |drag, _, _, cx| {
-                            cx.new(|_| DragBadgeView {
-                                label: drag.label.clone(),
-                                palette: p,
-                            })
-                        })
-                    })
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(move |this, ev: &MouseDownEvent, window, cx| {
-                            this.handle_entry_left_click(side, vis_idx, ev, window, cx);
-                        }),
-                    )
-                    .on_mouse_down(
-                        MouseButton::Right,
-                        cx.listener(move |this, ev: &MouseDownEvent, window, cx| {
-                            window.prevent_default();
-                            this.handle_entry_right_click(side, vis_idx, ev, cx);
-                        }),
-                    )
-                    .child(Icon::new(icon).xsmall().text_color(if is_cut {
-                        solid(p.text_muted)
-                    } else {
-                        solid(icon_hex)
-                    }))
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .truncate()
-                            .text_xs()
-                            .text_color(if is_cut {
-                                solid(p.text_muted)
-                            } else {
-                                solid(p.text_primary)
-                            })
-                            .child(name),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(13.))
-                            .text_color(solid(p.text_muted))
-                            .child(size),
-                    )
+                    .pl(px(6.))
+                    .pr(px(LIST_MARQUEE_GUTTER_PX))
+                    .bg(solid(p.bg_base))
+                    .child(row)
                     .into_any_element(),
             )
         })
@@ -1490,6 +1548,70 @@ fn build_archive_drag_payload(
     })
 }
 
+/// Wraps a fixed-width Details header cell with a draggable left-edge column resize handle
+/// (double-click any divider to reset default widths).
+#[allow(clippy::too_many_arguments)]
+fn resizable_header_column(
+    side: PaneSide,
+    divider: ColumnDivider,
+    active: bool,
+    width_px: f32,
+    header_cell: impl IntoElement,
+    p: Palette,
+    cx: &mut Context<Workspace>,
+) -> impl IntoElement {
+    let div_id = match (side, divider) {
+        (PaneSide::Left, ColumnDivider::NameModified) => "col-div-l-nm",
+        (PaneSide::Left, ColumnDivider::ModifiedType) => "col-div-l-mt",
+        (PaneSide::Left, ColumnDivider::TypeSize) => "col-div-l-ts",
+        (PaneSide::Right, ColumnDivider::NameModified) => "col-div-r-nm",
+        (PaneSide::Right, ColumnDivider::ModifiedType) => "col-div-r-mt",
+        (PaneSide::Right, ColumnDivider::TypeSize) => "col-div-r-ts",
+    };
+
+    h_flex()
+        .relative()
+        .w(px(width_px))
+        .h_full()
+        .flex_shrink_0()
+        .pl_2()
+        .items_center()
+        .child(header_cell)
+        .child(
+            div()
+                .id(div_id)
+                .absolute()
+                .left(px(-4.))
+                .top_0()
+                .bottom_0()
+                .w(px(9.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .cursor_col_resize()
+                .hover(move |s| s.bg(soft_tint(p.accent_primary, 0.2)))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, ev: &MouseDownEvent, window, cx| {
+                        cx.stop_propagation();
+                        window.prevent_default();
+                        this.begin_column_resize(divider, ev, cx);
+                    }),
+                )
+                .child(
+                    div()
+                        .w(if active { px(2.) } else { px(1.) })
+                        .h(px(16.))
+                        .rounded(px(1.))
+                        .bg(if active {
+                            solid(p.accent_primary)
+                        } else {
+                            solid(p.border_subtle)
+                        }),
+                ),
+        )
+}
+
 #[allow(clippy::too_many_arguments)]
 fn sort_header_cell(
     side: PaneSide,
@@ -1500,7 +1622,7 @@ fn sort_header_cell(
     align_right: bool,
     p: Palette,
     cx: &mut Context<Workspace>,
-) -> impl IntoElement {
+) -> impl IntoElement + use<> {
     let is_active = sort.column == column;
     let descending = sort.descending;
     let id = match (side, column) {

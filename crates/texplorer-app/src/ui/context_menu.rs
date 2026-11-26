@@ -76,6 +76,7 @@ enum MenuAction {
     OpenEditor(PathBuf),
     PinFolder(PathBuf),
     ShowWindowsMenu(Vec<PathBuf>),
+    ShowWindowsBgMenu(PathBuf),
     RevealInWindowsExplorer(PathBuf),
     ShowProperties(PathBuf),
     TrashSelected(PaneSide),
@@ -577,10 +578,10 @@ fn build_rows(ws: &Workspace, target: &ContextMenuTarget) -> Vec<MenuRow> {
             MenuRow::Item {
                 id: "ctx-bg-win-menu",
                 label: "Show Windows Menu".into(),
-                shortcut: None,
+                shortcut: Some("Shift+RClick"),
                 icon: MenuIcon::Lucide(LucideIcon::ExternalLink),
                 danger: false,
-                action: MenuAction::ShowWindowsMenu(vec![directory.clone()]),
+                action: MenuAction::ShowWindowsBgMenu(directory.clone()),
             },
             MenuRow::Item {
                 id: "ctx-bg-props",
@@ -802,6 +803,7 @@ fn execute_action(
         MenuAction::OpenEditor(path) => ws.open_editor_at(&path, cx),
         MenuAction::PinFolder(path) => ws.pin_folder(path, cx),
         MenuAction::ShowWindowsMenu(paths) => ws.show_native_windows_menu(paths, cx),
+        MenuAction::ShowWindowsBgMenu(dir) => ws.show_native_windows_bg_menu(dir, cx),
         MenuAction::RevealInWindowsExplorer(path) => ws.reveal_in_windows_explorer(&path, cx),
         MenuAction::ShowProperties(path) => ws.show_properties_for(&path, cx),
         MenuAction::TrashSelected(side) => ws.trash_selected(side, window, cx),

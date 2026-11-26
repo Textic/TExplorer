@@ -244,6 +244,11 @@ pub struct AppSettings {
     pub quick_access_order: Vec<KnownFolderKind>,
     pub hidden_quick_access: Vec<KnownFolderKind>,
     pub pinned_folders: Vec<PathBuf>,
+    pub details_col_modified: u16,
+    pub details_col_type: u16,
+    pub details_col_size: u16,
+    pub quicklook_video_muted: bool,
+    pub quicklook_video_volume: u8,
     pub terminal_command: String,
     pub editor_command: String,
 }
@@ -273,6 +278,11 @@ impl Default for AppSettings {
             quick_access_order: Vec::new(),
             hidden_quick_access: Vec::new(),
             pinned_folders: Vec::new(),
+            details_col_modified: 164,
+            details_col_type: 144,
+            details_col_size: 106,
+            quicklook_video_muted: true,
+            quicklook_video_volume: 70,
             terminal_command: "wt.exe".to_string(),
             editor_command: "code".to_string(),
         }
@@ -672,6 +682,10 @@ mod tests {
             show_hidden_files: true,
             ..Default::default()
         };
+        assert!(settings.quicklook_video_muted);
+        assert_eq!(settings.quicklook_video_volume, 70);
+        settings.quicklook_video_muted = false;
+        settings.quicklook_video_volume = 45;
         settings.pin_folder(PathBuf::from(r"X:\TExplorer"));
 
         let json = serde_json::to_string(&settings).unwrap();

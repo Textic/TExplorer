@@ -84,6 +84,9 @@ icon_assets!(
         TriangleAlert,
         Undo2,
         Usb,
+        Volume1,
+        Volume2,
+        VolumeX,
         X,
     ]
 );

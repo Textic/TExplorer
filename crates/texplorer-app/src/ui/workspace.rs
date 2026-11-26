@@ -1,5 +1,7 @@
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
@@ -7,7 +9,7 @@ use std::time::{Duration, Instant};
 use futures_channel::mpsc::{UnboundedReceiver, UnboundedSender, unbounded};
 use futures_util::StreamExt as _;
 use gpui_kit::{
-    ClipboardItem, Context, Entity, FocusHandle, Focusable, KeyDownEvent, MouseButton,
+    Bounds, ClipboardItem, Context, Entity, FocusHandle, Focusable, KeyDownEvent, MouseButton,
     MouseDownEvent, MouseMoveEvent, MouseUpEvent, NavigationDirection, Pixels, Point, RenderImage,
     ScrollStrategy, SharedString, Subscription, UniformListScrollHandle, Window, WindowBounds,
     component::{
@@ -19,9 +21,10 @@ use gpui_kit::{
     div, prelude::*, px,
 };
 use texplorer_core::{
-    AccentPreset, AppSession, AppSettings, FileEntry, KnownFolder, KnownFolderKind, Location,
-    PaneSide, SavedPaneState, SavedTabState, SearchScope, SidebarSection, SizeUnit, SortColumn,
-    SortSpec, TabModel, ThemePreset, ViewMode, VolumeInfo, WindowGeometry, sort_entries,
+    AccentPreset, AppSession, AppSettings, FileEntry, FileKind, KnownFolder, KnownFolderKind,
+    Location, PaneSide, SavedPaneState, SavedTabState, SearchScope, SidebarSection, SizeUnit,
+    SortColumn, SortSpec, TabModel, ThemePreset, ViewMode, VolumeInfo, WindowGeometry,
+    sort_entries,
 };
 use texplorer_mft::{
     IndexServiceInstallState, IndexServiceStatus, install_service_elevated,
@@ -36,11 +39,12 @@ use texplorer_ops::{
 };
 use texplorer_platform::{
     DefaultExplorerStatus, DirectoryWatcher, FileLockStatus, LaunchIntent, ShellWorker,
-    bring_current_process_window_to_front, cursor_screen_pos, delete_permanently,
-    enable_default_explorer, get_clipboard_files, inspect_file_lock, list_known_folders,
-    list_volumes, list_wsl_distros, move_to_trash, open_in_editor, open_item, open_terminal_here,
-    query_default_explorer_status, restore_windows_explorer, reveal_in_windows_explorer,
-    set_clipboard_files, set_win_e_interception, system_prefers_dark_mode,
+    VideoNotify, VideoPlayerHandle, VideoStartOptions, bring_current_process_window_to_front,
+    cursor_screen_pos, delete_permanently, enable_default_explorer, get_clipboard_files,
+    inspect_file_lock, list_known_folders, list_volumes, list_wsl_distros, move_to_trash,
+    open_in_editor, open_item, open_terminal_here, query_default_explorer_status,
+    restore_windows_explorer, reveal_in_windows_explorer, set_clipboard_files,
+    set_win_e_interception, spawn_video_player, system_prefers_dark_mode,
 };
 use texplorer_vfs::archive::{
     compress_to_zip, extract_archive_all, extract_archive_entries, is_supported_archive,
@@ -160,6 +164,10 @@ enum BgEvent {
         location: Location,
         payload: PreviewPayload,
     },
+    VideoNotify {
+        generation: u64,
+        notify: VideoNotify,
+    },
     HashesReady {
         generation: u64,
         path: PathBuf,
@@ -215,6 +223,27 @@ struct ToastBanner {
     id: u64,
 }
 
+/// Live video playback session active inside the QuickLook modal.
+pub struct VideoPlaybackState {
+    pub generation: u64,
+    pub path: PathBuf,
+    pub handle: VideoPlayerHandle,
+    pub frame: Option<Arc<RenderImage>>,
+    pub position_secs: f64,
+    pub duration_secs: f64,
+    pub playing: bool,
+    pub muted: bool,
+    pub volume: u8,
+    pub native_width: u32,
+    pub native_height: u32,
+    pub ready: bool,
+    pub error: Option<String>,
+    pub scrubbing: bool,
+    pub dragging_volume: bool,
+    pub seek_bar_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
+    pub volume_bar_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
+}
+
 /// Active or recently finished background transfer job tracked by the UI drawer.
 pub struct TransferJobState {
     pub snapshot: TransferSnapshot,
@@ -252,6 +281,23 @@ impl TabUiState {
             PaneSide::Right => self.right_ui.as_mut().unwrap_or(&mut self.left_ui),
         }
     }
+}
+
+/// Active divider handle when drag-resizing columns in Details view.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ColumnDivider {
+    NameModified,
+    ModifiedType,
+    TypeSize,
+}
+
+#[derive(Debug, Clone)]
+pub struct ColumnResizeState {
+    pub divider: ColumnDivider,
+    pub start_x: f32,
+    pub start_modified: f32,
+    pub start_type: f32,
+    pub start_size: f32,
 }
 
 /// Live rubber-band / marquee drag selection state (click empty pane space + drag).
@@ -299,7 +345,10 @@ pub struct Workspace {
     pub quicklook_open: bool,
     pub preview_location: Option<Location>,
     pub preview_payload: PreviewPayload,
-    preview_generation: u64,
+    pub preview_generation: u64,
+    pub video_playback: Option<VideoPlaybackState>,
+    video_generation: u64,
+    stale_gpu_images: Vec<Arc<RenderImage>>,
     pub hash_target: Option<PathBuf>,
     pub hash_state: HashInspectState,
     hash_generation: u64,
@@ -323,6 +372,7 @@ pub struct Workspace {
     type_ahead_at: Instant,
     last_window_geometry: Option<WindowGeometry>,
     pub marquee: Option<MarqueeSelection>,
+    pub column_resize: Option<ColumnResizeState>,
     entry_claimed_mouse_down: bool,
     bg_tx: UnboundedSender<BgEvent>,
 }
@@ -413,6 +463,9 @@ impl Workspace {
             preview_location: None,
             preview_payload: PreviewPayload::Loading,
             preview_generation: 0,
+            video_playback: None,
+            video_generation: 0,
+            stale_gpu_images: Vec::new(),
             hash_target: None,
             hash_state: HashInspectState::Idle,
             hash_generation: 0,
@@ -436,6 +489,7 @@ impl Workspace {
             type_ahead_at: Instant::now() - Duration::from_secs(5),
             last_window_geometry: initial_window_geom,
             marquee: None,
+            column_resize: None,
             entry_claimed_mouse_down: false,
             bg_tx,
         };
@@ -788,6 +842,55 @@ impl Workspace {
                     cx.notify();
                 }
             }
+            BgEvent::VideoNotify { generation, notify } => {
+                let Some(video) = self.video_playback.as_mut() else {
+                    return;
+                };
+                if video.generation != generation {
+                    return;
+                }
+                match notify {
+                    VideoNotify::Ready => {
+                        video.ready = true;
+                        cx.notify();
+                    }
+                    VideoNotify::FrameReady => {
+                        if let Some(snap) = video.handle.take_latest_frame() {
+                            if let Some(new_img) = raw_bgra_to_render_image(snap.image)
+                                && let Some(old) = video.frame.replace(new_img)
+                            {
+                                let _ = window.drop_image(old);
+                            }
+                            if !video.scrubbing {
+                                video.position_secs = snap.position_secs;
+                            }
+                            video.duration_secs = snap.duration_secs;
+                            video.playing = snap.playing;
+                            video.native_width = snap.native_width;
+                            video.native_height = snap.native_height;
+                            video.ready = true;
+                            cx.notify();
+                        }
+                    }
+                    VideoNotify::StatusChanged(st) => {
+                        if !video.scrubbing {
+                            video.position_secs = st.position_secs;
+                        }
+                        video.duration_secs = st.duration_secs;
+                        video.playing = st.playing;
+                        if st.native_width > 0 {
+                            video.native_width = st.native_width;
+                            video.native_height = st.native_height;
+                        }
+                        cx.notify();
+                    }
+                    VideoNotify::Error(err) => {
+                        video.error = Some(err);
+                        video.playing = false;
+                        cx.notify();
+                    }
+                }
+            }
             BgEvent::HashesReady {
                 generation,
                 path,
@@ -1028,6 +1131,8 @@ impl Workspace {
     /// Triggers an asynchronous preview load whenever Inspector or QuickLook is visible
     /// (supporting both local filesystem items and virtual archive entries).
     fn sync_preview_for_selection(&mut self, cx: &mut Context<Self>) {
+        self.sync_video_playback_for_quicklook();
+
         if !self.settings.show_inspector && !self.quicklook_open {
             return;
         }
@@ -1838,13 +1943,112 @@ impl Workspace {
         cx.notify();
     }
 
-    /// Tracks rubber-band drag motion and live-updates selected items.
+    /// Returns the clamped `(modified, type, size)` column widths for Details view.
+    pub fn details_column_widths(&self) -> (f32, f32, f32) {
+        (
+            f32::from(self.settings.details_col_modified).clamp(96.0, 360.0),
+            f32::from(self.settings.details_col_type).clamp(76.0, 360.0),
+            f32::from(self.settings.details_col_size).clamp(68.0, 260.0),
+        )
+    }
+
+    /// Starts drag-resizing a Details view column divider (double-click resets all widths).
+    pub fn begin_column_resize(
+        &mut self,
+        divider: ColumnDivider,
+        ev: &MouseDownEvent,
+        cx: &mut Context<Self>,
+    ) {
+        if ev.click_count >= 2 {
+            self.column_resize = None;
+            self.settings.details_col_modified = 164;
+            self.settings.details_col_type = 144;
+            self.settings.details_col_size = 106;
+            let _ = self.settings.save();
+            cx.notify();
+            return;
+        }
+        let (start_modified, start_type, start_size) = self.details_column_widths();
+        self.column_resize = Some(ColumnResizeState {
+            divider,
+            start_x: ev.position.x.into(),
+            start_modified,
+            start_type,
+            start_size,
+        });
+        cx.notify();
+    }
+
+    /// Tracks rubber-band drag motion and Details column resize drag.
     fn handle_mouse_move(
         &mut self,
         ev: &MouseMoveEvent,
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self
+            .video_playback
+            .as_ref()
+            .is_some_and(|v| v.dragging_volume)
+        {
+            if !ev.dragging() {
+                if let Some(video) = self.video_playback.as_mut() {
+                    video.dragging_volume = false;
+                }
+                let _ = self.settings.save();
+                cx.notify();
+                return;
+            }
+            self.video_set_volume_from_position(ev.position.x, false, cx);
+            return;
+        }
+
+        if self.video_playback.as_ref().is_some_and(|v| v.scrubbing) {
+            if !ev.dragging() {
+                if let Some(video) = self.video_playback.as_mut() {
+                    video.scrubbing = false;
+                }
+                cx.notify();
+                return;
+            }
+            self.video_seek_to_position(ev.position.x, false, cx);
+            return;
+        }
+
+        if let Some(resize) = self.column_resize.clone() {
+            if !ev.dragging() {
+                self.finish_column_resize(cx);
+                return;
+            }
+            let curr_x: f32 = ev.position.x.into();
+            let dx = curr_x - resize.start_x;
+            match resize.divider {
+                ColumnDivider::NameModified => {
+                    let next_mod = (resize.start_modified - dx).clamp(96.0, 360.0);
+                    self.settings.details_col_modified = next_mod.round() as u16;
+                }
+                ColumnDivider::ModifiedType => {
+                    let min_delta = -(resize.start_modified - 96.0);
+                    let max_delta = (resize.start_type - 76.0).min(360.0 - resize.start_modified);
+                    let clamped = dx.clamp(min_delta, max_delta.max(min_delta));
+                    self.settings.details_col_modified =
+                        (resize.start_modified + clamped).clamp(96.0, 360.0).round() as u16;
+                    self.settings.details_col_type =
+                        (resize.start_type - clamped).clamp(76.0, 360.0).round() as u16;
+                }
+                ColumnDivider::TypeSize => {
+                    let min_delta = -(resize.start_type - 76.0);
+                    let max_delta = (resize.start_size - 68.0).min(360.0 - resize.start_type);
+                    let clamped = dx.clamp(min_delta, max_delta.max(min_delta));
+                    self.settings.details_col_type =
+                        (resize.start_type + clamped).clamp(76.0, 360.0).round() as u16;
+                    self.settings.details_col_size =
+                        (resize.start_size - clamped).clamp(68.0, 260.0).round() as u16;
+                }
+            }
+            cx.notify();
+            return;
+        }
         if self.marquee.is_none() {
             return;
         }
@@ -1893,7 +2097,7 @@ impl Workspace {
         let view_mode = tab.model.pane(side).view_mode;
         let total = tab.model.pane(side).filtered_indices.len();
 
-        let (bounds_x, bounds_y, bounds_w, bounds_h, mut scroll_y, measured_row_h) = {
+        let (bounds_x, bounds_y, bounds_w, bounds_h, mut scroll_y) = {
             let state = tab.pane_ui(side).scroll_handle.0.borrow();
             let b = state.base_handle.bounds();
             let bx: f32 = b.origin.x.into();
@@ -1901,15 +2105,16 @@ impl Workspace {
             let bw: f32 = b.size.width.into();
             let bh: f32 = b.size.height.into();
             let sy: f32 = state.base_handle.offset().y.into();
-            let rh: Option<f32> = state.last_item_size.map(|s| s.item.height.into());
-            (bx, by, bw, bh, sy, rh)
+            (bx, by, bw, bh, sy)
         };
 
-        let row_h = measured_row_h.filter(|&h| h > 4.0).unwrap_or(match view_mode {
+        // Note: `UniformListScrollState::last_item_size.item` is the viewport size, NOT a single
+        // row's height. Use the exact fixed `px(...)` row heights rendered by `views.rs`.
+        let row_h = match view_mode {
             ViewMode::Details => 32.0,
             ViewMode::Compact => 28.0,
             ViewMode::Grid => 136.0,
-        });
+        };
 
         // Smooth edge auto-scroll when dragging above or below the list viewport.
         let total_rows = match view_mode {
@@ -1989,7 +2194,30 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         self.entry_claimed_mouse_down = false;
+        let mut save_video_prefs = false;
+        if let Some(video) = self.video_playback.as_mut() {
+            if video.scrubbing {
+                video.scrubbing = false;
+                cx.notify();
+            }
+            if video.dragging_volume {
+                video.dragging_volume = false;
+                save_video_prefs = true;
+                cx.notify();
+            }
+        }
+        if save_video_prefs {
+            let _ = self.settings.save();
+        }
+        self.finish_column_resize(cx);
         self.finish_marquee_selection(cx);
+    }
+
+    fn finish_column_resize(&mut self, cx: &mut Context<Self>) {
+        if self.column_resize.take().is_some() {
+            let _ = self.settings.save();
+            cx.notify();
+        }
     }
 
     fn finish_marquee_selection(&mut self, cx: &mut Context<Self>) {
@@ -2075,7 +2303,7 @@ impl Workspace {
     pub fn open_pane_bg_context_menu(
         &mut self,
         side: PaneSide,
-        position: Point<Pixels>,
+        ev: &MouseDownEvent,
         cx: &mut Context<Self>,
     ) {
         let dir_opt = self.active_tab().and_then(|t| {
@@ -2087,8 +2315,13 @@ impl Workspace {
         });
         if let Some(directory) = dir_opt {
             self.set_active_pane(side, cx);
+            if ev.modifiers.shift {
+                self.context_menu = None;
+                self.show_native_windows_bg_menu(directory, cx);
+                return;
+            }
             self.open_context_menu(
-                position,
+                ev.position,
                 ContextMenuTarget::PaneBackground { side, directory },
                 cx,
             );
@@ -2358,9 +2591,231 @@ impl Workspace {
             });
     }
 
+    pub fn show_native_windows_bg_menu(&mut self, directory: PathBuf, _cx: &mut Context<Self>) {
+        let (x, y) = cursor_screen_pos();
+        let tx = self.bg_tx.clone();
+        self.shell_worker
+            .show_native_background_context_menu(directory, x, y, move |res| {
+                let _ = tx.unbounded_send(BgEvent::NativeShellMenuDone(res));
+            });
+    }
+
+    fn stop_video_playback(&mut self) {
+        self.video_generation = self.video_generation.wrapping_add(1);
+        if let Some(mut video) = self.video_playback.take() {
+            video.handle.stop();
+            if let Some(frame) = video.frame.take() {
+                self.stale_gpu_images.push(frame);
+            }
+        }
+    }
+
+    fn sync_video_playback_for_quicklook(&mut self) {
+        if !self.quicklook_open {
+            self.stop_video_playback();
+            return;
+        }
+        let target_video = self
+            .active_tab()
+            .and_then(|t| t.model.active_pane_ref().primary_selected_entry())
+            .filter(|e| e.kind == FileKind::Video)
+            .and_then(|e| e.location.as_local_path())
+            .map(|p| p.to_path_buf());
+
+        let Some(path) = target_video else {
+            self.stop_video_playback();
+            return;
+        };
+
+        if self
+            .video_playback
+            .as_ref()
+            .is_some_and(|v| v.path == path)
+        {
+            return;
+        }
+
+        self.stop_video_playback();
+        let generation = self.video_generation;
+        let initial_vol = self.settings.quicklook_video_volume.min(100);
+        let initial_muted = self.settings.quicklook_video_muted || initial_vol == 0;
+        let options = VideoStartOptions {
+            initial_muted,
+            initial_volume: initial_vol as f64 / 100.0,
+            loop_playback: true,
+        };
+        let tx = self.bg_tx.clone();
+        match spawn_video_player(path.clone(), options, move |notify| {
+            let _ = tx.unbounded_send(BgEvent::VideoNotify { generation, notify });
+        }) {
+            Ok(handle) => {
+                self.video_playback = Some(VideoPlaybackState {
+                    generation,
+                    path,
+                    handle,
+                    frame: None,
+                    position_secs: 0.0,
+                    duration_secs: 0.0,
+                    playing: false,
+                    muted: initial_muted,
+                    volume: initial_vol,
+                    native_width: 0,
+                    native_height: 0,
+                    ready: false,
+                    error: None,
+                    scrubbing: false,
+                    dragging_volume: false,
+                    seek_bar_bounds: Rc::new(Cell::new(None)),
+                    volume_bar_bounds: Rc::new(Cell::new(None)),
+                });
+            }
+            Err(err) => {
+                let _ = err;
+            }
+        }
+    }
+
+    pub fn video_toggle_play(&mut self, cx: &mut Context<Self>) {
+        if let Some(video) = self.video_playback.as_mut() {
+            video.handle.toggle_play();
+            cx.notify();
+        }
+    }
+
+    pub fn video_toggle_mute(&mut self, cx: &mut Context<Self>) {
+        let Some(video) = self.video_playback.as_mut() else {
+            return;
+        };
+        if video.muted {
+            let restored = if video.volume > 0 {
+                video.volume.min(100)
+            } else if self.settings.quicklook_video_volume > 0 {
+                self.settings.quicklook_video_volume.min(100)
+            } else {
+                70
+            };
+            video.volume = restored;
+            video.muted = false;
+            video.handle.set_volume(restored as f64 / 100.0);
+            video.handle.set_muted(false);
+            self.settings.quicklook_video_volume = restored;
+            self.settings.quicklook_video_muted = false;
+        } else {
+            video.muted = true;
+            video.handle.set_muted(true);
+            self.settings.quicklook_video_muted = true;
+        }
+        let _ = self.settings.save();
+        cx.notify();
+    }
+
+    pub fn video_set_volume_percent(
+        &mut self,
+        percent: u8,
+        persist: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let vol = percent.min(100);
+        let muted = vol == 0;
+        if let Some(video) = self.video_playback.as_mut() {
+            video.volume = vol;
+            video.muted = muted;
+            video.handle.set_volume(vol as f64 / 100.0);
+            video.handle.set_muted(muted);
+        }
+        self.settings.quicklook_video_muted = muted;
+        if vol > 0 {
+            self.settings.quicklook_video_volume = vol;
+        }
+        if persist {
+            let _ = self.settings.save();
+        }
+        cx.notify();
+    }
+
+    pub fn video_set_volume_from_position(
+        &mut self,
+        mouse_x: Pixels,
+        start_drag: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let bounds = {
+            let Some(video) = self.video_playback.as_mut() else {
+                return;
+            };
+            if start_drag {
+                video.dragging_volume = true;
+            }
+            video.volume_bar_bounds.get()
+        };
+        let Some(bounds) = bounds else {
+            return;
+        };
+        let width: f32 = bounds.size.width.into();
+        if width <= 1.0 {
+            return;
+        }
+        let left: f32 = bounds.origin.x.into();
+        let curr: f32 = mouse_x.into();
+        let frac = ((curr - left) / width).clamp(0.0, 1.0);
+        let percent = (frac * 100.0).round() as u8;
+        self.video_set_volume_percent(percent, false, cx);
+    }
+
+    pub fn video_adjust_volume_step(&mut self, delta: i16, cx: &mut Context<Self>) {
+        let Some(video) = self.video_playback.as_ref() else {
+            return;
+        };
+        let effective = if video.muted { 0 } else { video.volume.min(100) };
+        let next = (effective as i16 + delta).clamp(0, 100) as u8;
+        self.video_set_volume_percent(next, true, cx);
+    }
+
+    pub fn video_seek_relative(&mut self, delta_secs: f64, cx: &mut Context<Self>) {
+        if let Some(video) = self.video_playback.as_mut() {
+            let max_t = video.duration_secs.max(0.0);
+            let next = if max_t > 0.0 {
+                (video.position_secs + delta_secs).clamp(0.0, max_t)
+            } else {
+                (video.position_secs + delta_secs).max(0.0)
+            };
+            video.position_secs = next;
+            video.handle.seek(next);
+            cx.notify();
+        }
+    }
+
+    pub fn video_seek_to_position(
+        &mut self,
+        mouse_x: Pixels,
+        start_scrub: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(video) = self.video_playback.as_mut() {
+            if start_scrub {
+                video.scrubbing = true;
+            }
+            let Some(bounds) = video.seek_bar_bounds.get() else {
+                return;
+            };
+            let width: f32 = bounds.size.width.into();
+            if width <= 1.0 || video.duration_secs <= 0.0 {
+                return;
+            }
+            let left: f32 = bounds.origin.x.into();
+            let curr: f32 = mouse_x.into();
+            let frac = ((curr - left) / width).clamp(0.0, 1.0) as f64;
+            let target = frac * video.duration_secs;
+            video.position_secs = target;
+            video.handle.seek(target);
+            cx.notify();
+        }
+    }
+
     pub fn toggle_quicklook(&mut self, cx: &mut Context<Self>) {
         if self.quicklook_open {
             self.quicklook_open = false;
+            self.stop_video_playback();
             cx.notify();
             return;
         }
@@ -2379,6 +2834,7 @@ impl Workspace {
     pub fn close_quicklook(&mut self, cx: &mut Context<Self>) {
         if self.quicklook_open {
             self.quicklook_open = false;
+            self.stop_video_playback();
             cx.notify();
         }
     }
@@ -2510,6 +2966,7 @@ impl Workspace {
         self.refresh_service_status(cx);
         self.context_menu = None;
         self.quicklook_open = false;
+        self.stop_video_playback();
         self.global_search = None;
         self.global_search_subs.clear();
         self.bulk_rename = None;
@@ -2525,6 +2982,7 @@ impl Workspace {
     pub fn open_global_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.context_menu = None;
         self.quicklook_open = false;
+        self.stop_video_playback();
         self.active_modal = None;
         self.modal_subs.clear();
         self.bulk_rename = None;
@@ -2919,6 +3377,7 @@ impl Workspace {
 
         self.context_menu = None;
         self.quicklook_open = false;
+        self.stop_video_playback();
         self.active_modal = None;
         self.modal_subs.clear();
         self.global_search = None;
@@ -3073,6 +3532,7 @@ impl Workspace {
     pub fn open_command_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.context_menu = None;
         self.quicklook_open = false;
+        self.stop_video_playback();
         self.active_modal = None;
         self.modal_subs.clear();
         self.global_search = None;
@@ -3994,8 +4454,21 @@ impl Workspace {
                 });
                 if let Some((loc, is_dir)) = target {
                     self.quicklook_open = false;
+                    self.stop_video_playback();
                     self.open_location_or_file(loc, is_dir, window, cx);
                 }
+            }
+            "k" | "p" if self.quicklook_open && self.video_playback.is_some() => {
+                self.video_toggle_play(cx);
+            }
+            "m" if self.quicklook_open && self.video_playback.is_some() => {
+                self.video_toggle_mute(cx);
+            }
+            "left" if self.quicklook_open && self.video_playback.is_some() => {
+                self.video_seek_relative(-5.0, cx);
+            }
+            "right" if self.quicklook_open && self.video_playback.is_some() => {
+                self.video_seek_relative(5.0, cx);
             }
             "backspace" if !self.quicklook_open => {
                 self.go_up(side, window, cx);
@@ -4184,6 +4657,9 @@ impl Focusable for Workspace {
 
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        for stale in self.stale_gpu_images.drain(..) {
+            let _ = window.drop_image(stale);
+        }
         self.capture_window_geometry(window);
         let p = self.palette();
         let is_split = self.active_tab().is_some_and(|t| t.model.split_enabled);
@@ -4754,6 +5230,20 @@ mod transfer_drop_tests {
             280.0,
         );
         assert_eq!(hits, vec![2, 3, 4]);
+
+        // Dragging strictly in empty space below all rows must select nothing.
+        let empty_hits = compute_marquee_hits(
+            ViewMode::Details,
+            5,
+            4,
+            32.0,
+            600.0,
+            100.0,
+            200.0,
+            300.0,
+            360.0,
+        );
+        assert!(empty_hits.is_empty());
 
         // Grid 2D intersection across 3 columns (6 items, 2 rows of 136px).
         let grid_hits = compute_marquee_hits(
