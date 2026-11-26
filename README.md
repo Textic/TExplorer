@@ -2,10 +2,11 @@
 
 Fast, minimalist, GPU-accelerated Windows file explorer built with **Rust (edition 2024)** and **GPUI (`gpui-kit`)**.
 
-## Features (v0.5.0)
+## Features (v0.6.0)
 
-- **GPU-Accelerated Flat UI & Dynamic Themes:** Matte-black **Files Dark**, **Files Light**, automatic **System** mode (tracks Windows Dark/Light theme), and classic **Obsidian Dark** palettes with selectable accents (*Files Blue* default, *Files Cobalt*, *Files Mint*, *Obsidian Emerald*, *Obsidian Violet*, *Obsidian Mono*), `1px` panel cuts, zero shadows, crisp typography, and a custom frameless titlebar.
-- **Tabs, Dual-Pane Split View & Session Persistence:** Scrollable top tabs (`Ctrl+T` / `Ctrl+W`), independent per-tab Dual-Pane split (`Ctrl+\` or `F3`), virtualized **Details / Grid / Compact** views engineered for **100,000+ items** (off-thread sorting, zero-allocation filters, `O(1)` status bar), and automatic restoration of tabs, splits, and window bounds on startup.
+- **GPU-Accelerated Flat UI & Dynamic Themes:** Matte-black **Files Dark**, **Files Light**, automatic **System** mode (tracks Windows Dark/Light theme), and classic **Obsidian Dark** palettes with selectable accents (*Files Blue* default, *Files Cobalt*, *Files Mint*, *Obsidian Emerald*, *Obsidian Violet*, *Obsidian Mono*), `1px` panel cuts, zero shadows, crisp typography, categorized Settings, and a custom frameless titlebar.
+- **Customizable Sidebar:** Collapsible, reorderable, and toggleable sidebar categories (*Quick Access*, *Pinned*, *Drives*, *Linux / WSL*), plus reorderable and toggleable *Quick Access* folders and flat compact drive rows.
+- **Tabs, Dual-Pane Split View & Session Persistence:** Scrollable top tabs (`Ctrl+T` / `Ctrl+W`), independent per-tab Dual-Pane split (`Ctrl+\` or `F3`), mouse Back/Forward side-button navigation, auto-selecting address bar, virtualized **Details / Grid / Compact** views engineered for **100,000+ items** (off-thread sorting, zero-allocation filters, `O(1)` status bar), and automatic restoration of tabs, splits, and window bounds on startup.
 - **Instant Global Search (`Ctrl+K`) & Live Folder Sizes (`texplorer-mft` / `texplorer-service`):** Optional read-only Windows service indexing NTFS `$MFT` in RAM and streaming real-time **USN Change Journal** deltas for `<10 ms` Everything-style queries (`ext:rs;toml`, `size:>10mb`, `dir:`, `file:`, `!exclude`, `/regex/`) and instant recursive folder sizes — with automatic multi-threaded `rayon` fallback when uninstalled or on non-NTFS drives.
 - **Transparent Archive VFS (`.zip`, `.7z`, `.tar`, `.tar.gz`/`.tgz`):** Double-click archives to browse them like normal folders, preview images/Markdown/code live in Inspector or QuickLook without extracting, drag & drop items directly out of an archive into local folders or the opposite split pane, and compress local selections to `.zip`.
 - **Power-User Arsenal:**

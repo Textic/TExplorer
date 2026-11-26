@@ -8,8 +8,8 @@ use futures_channel::mpsc::{UnboundedReceiver, UnboundedSender, unbounded};
 use futures_util::StreamExt as _;
 use gpui_kit::{
     ClipboardItem, Context, Entity, FocusHandle, Focusable, KeyDownEvent, MouseButton,
-    MouseDownEvent, NavigationDirection, Pixels, Point, RenderImage, ScrollStrategy, SharedString,
-    Subscription, UniformListScrollHandle, Window, WindowBounds,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, NavigationDirection, Pixels, Point, RenderImage,
+    ScrollStrategy, SharedString, Subscription, UniformListScrollHandle, Window, WindowBounds,
     component::{
         h_flex,
         input::{InputEvent, InputState},
@@ -20,8 +20,8 @@ use gpui_kit::{
 };
 use texplorer_core::{
     AccentPreset, AppSession, AppSettings, FileEntry, KnownFolder, KnownFolderKind, Location,
-    PaneSide, SavedPaneState, SavedTabState, SearchScope, SizeUnit, SortColumn, SortSpec,
-    TabModel, ThemePreset, ViewMode, VolumeInfo, WindowGeometry, sort_entries,
+    PaneSide, SavedPaneState, SavedTabState, SearchScope, SidebarSection, SizeUnit, SortColumn,
+    SortSpec, TabModel, ThemePreset, ViewMode, VolumeInfo, WindowGeometry, sort_entries,
 };
 use texplorer_mft::{
     IndexServiceInstallState, IndexServiceStatus, install_service_elevated,
@@ -253,6 +253,21 @@ impl TabUiState {
     }
 }
 
+/// Live rubber-band / marquee drag selection state (click empty pane space + drag).
+#[derive(Debug, Clone)]
+pub struct MarqueeSelection {
+    pub tab_id: Uuid,
+    pub side: PaneSide,
+    pub origin_x: f32,
+    pub origin_y: f32,
+    pub origin_content_y: f32,
+    pub current_x: f32,
+    pub current_y: f32,
+    pub active: bool,
+    pub additive: bool,
+    pub initial_selection: Vec<usize>,
+}
+
 /// Root GPUI view coordinating tabs, dual-pane splits, transfers, preview/QuickLook, and OS shell.
 pub struct Workspace {
     focus_handle: FocusHandle,
@@ -306,6 +321,8 @@ pub struct Workspace {
     type_ahead_buf: String,
     type_ahead_at: Instant,
     last_window_geometry: Option<WindowGeometry>,
+    pub marquee: Option<MarqueeSelection>,
+    entry_claimed_mouse_down: bool,
     bg_tx: UnboundedSender<BgEvent>,
 }
 
@@ -417,6 +434,8 @@ impl Workspace {
             type_ahead_buf: String::new(),
             type_ahead_at: Instant::now() - Duration::from_secs(5),
             last_window_geometry: initial_window_geom,
+            marquee: None,
+            entry_claimed_mouse_down: false,
             bg_tx,
         };
 
@@ -1692,6 +1711,8 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.entry_claimed_mouse_down = true;
+        self.marquee = None;
         self.context_menu = None;
         let open_target = {
             let Some(tab) = self.active_tab_mut() else {
@@ -1724,6 +1745,288 @@ impl Workspace {
             self.sync_preview_for_selection(cx);
             cx.notify();
         }
+    }
+
+    /// Estimates the available inner width (in logical px) of a single explorer pane for
+    /// responsive Home and Grid column counts.
+    pub fn estimated_pane_width(&self, split_enabled: bool) -> f32 {
+        let mut width = self
+            .last_window_geometry
+            .as_ref()
+            .map(|g| g.width)
+            .unwrap_or(1280.0)
+            .max(640.0);
+        if self.settings.show_sidebar {
+            width -= 256.0;
+        }
+        if self.settings.show_inspector {
+            width -= 320.0;
+        }
+        if split_enabled {
+            width *= 0.5;
+        }
+        width.max(260.0)
+    }
+
+    /// Computes responsive column count for Grid view based on window & split layout.
+    pub fn grid_view_columns(&self, split_enabled: bool) -> usize {
+        let inner = (self.estimated_pane_width(split_enabled) - 24.0).max(160.0);
+        ((inner / 150.0).floor() as usize).clamp(2, 10)
+    }
+
+    /// Starts rubber-band drag selection when left-clicking empty background inside a file list.
+    pub fn begin_marquee_selection(
+        &mut self,
+        side: PaneSide,
+        ev: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if std::mem::take(&mut self.entry_claimed_mouse_down) {
+            return;
+        }
+        self.context_menu = None;
+        self.focus_handle.focus(window, cx);
+
+        let Some(tab) = self.active_tab_mut() else {
+            return;
+        };
+        tab.model.active_pane = side;
+        let tab_id = tab.model.id;
+        let additive = ev.modifiers.control;
+
+        let (bounds_y, scroll_y) = {
+            let state = tab.pane_ui(side).scroll_handle.0.borrow();
+            let by: f32 = state.base_handle.bounds().origin.y.into();
+            let sy: f32 = state.base_handle.offset().y.into();
+            (by, sy)
+        };
+
+        let pane = tab.model.pane_mut(side);
+        let initial_selection: Vec<usize> = if additive {
+            pane.selection.selected.iter().copied().collect()
+        } else {
+            pane.selection.clear();
+            pane.recompute_selection_bytes();
+            Vec::new()
+        };
+
+        let origin_x: f32 = ev.position.x.into();
+        let origin_y: f32 = ev.position.y.into();
+
+        self.marquee = Some(MarqueeSelection {
+            tab_id,
+            side,
+            origin_x,
+            origin_y,
+            origin_content_y: origin_y - bounds_y - scroll_y,
+            current_x: origin_x,
+            current_y: origin_y,
+            active: false,
+            additive,
+            initial_selection,
+        });
+
+        self.sync_preview_for_selection(cx);
+        cx.notify();
+    }
+
+    /// Tracks rubber-band drag motion and live-updates selected items.
+    fn handle_mouse_move(
+        &mut self,
+        ev: &MouseMoveEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.marquee.is_none() {
+            return;
+        }
+        if !ev.dragging() {
+            self.finish_marquee_selection(cx);
+            return;
+        }
+
+        let curr_x: f32 = ev.position.x.into();
+        let curr_y: f32 = ev.position.y.into();
+
+        let (tab_id, side, origin_x, origin_content_y, additive, initial_selection) = {
+            let Some(m) = self.marquee.as_mut() else {
+                return;
+            };
+            m.current_x = curr_x;
+            m.current_y = curr_y;
+            if !m.active {
+                if (curr_x - m.origin_x).abs() < 4.0 && (curr_y - m.origin_y).abs() < 4.0 {
+                    return;
+                }
+                m.active = true;
+            }
+            (
+                m.tab_id,
+                m.side,
+                m.origin_x,
+                m.origin_content_y,
+                m.additive,
+                m.initial_selection.clone(),
+            )
+        };
+
+        let split_enabled = self.active_tab().is_some_and(|t| t.model.split_enabled);
+        let grid_cols = self.grid_view_columns(split_enabled);
+
+        let Some(tab) = self.active_tab_mut() else {
+            self.marquee = None;
+            return;
+        };
+        if tab.model.id != tab_id {
+            self.marquee = None;
+            return;
+        }
+
+        let view_mode = tab.model.pane(side).view_mode;
+        let total = tab.model.pane(side).filtered_indices.len();
+
+        let (bounds_x, bounds_y, bounds_w, bounds_h, mut scroll_y, measured_row_h) = {
+            let state = tab.pane_ui(side).scroll_handle.0.borrow();
+            let b = state.base_handle.bounds();
+            let bx: f32 = b.origin.x.into();
+            let by: f32 = b.origin.y.into();
+            let bw: f32 = b.size.width.into();
+            let bh: f32 = b.size.height.into();
+            let sy: f32 = state.base_handle.offset().y.into();
+            let rh: Option<f32> = state.last_item_size.map(|s| s.item.height.into());
+            (bx, by, bw, bh, sy, rh)
+        };
+
+        let row_h = measured_row_h.filter(|&h| h > 4.0).unwrap_or(match view_mode {
+            ViewMode::Details => 32.0,
+            ViewMode::Compact => 28.0,
+            ViewMode::Grid => 136.0,
+        });
+
+        // Smooth edge auto-scroll when dragging above or below the list viewport.
+        let total_rows = match view_mode {
+            ViewMode::Grid => total.div_ceil(grid_cols.max(1)),
+            _ => total,
+        };
+        let max_scroll = ((total_rows as f32) * row_h - bounds_h).max(0.0);
+        if curr_y < bounds_y && scroll_y < 0.0 {
+            scroll_y = (scroll_y + 18.0).min(0.0);
+            let off = tab.pane_ui(side).scroll_handle.0.borrow().base_handle.offset();
+            tab.pane_ui(side)
+                .scroll_handle
+                .0
+                .borrow()
+                .base_handle
+                .set_offset(Point {
+                    x: off.x,
+                    y: px(scroll_y),
+                });
+        } else if curr_y > bounds_y + bounds_h && -scroll_y < max_scroll {
+            scroll_y = (scroll_y - 18.0).max(-max_scroll);
+            let off = tab.pane_ui(side).scroll_handle.0.borrow().base_handle.offset();
+            tab.pane_ui(side)
+                .scroll_handle
+                .0
+                .borrow()
+                .base_handle
+                .set_offset(Point {
+                    x: off.x,
+                    y: px(scroll_y),
+                });
+        }
+
+        let start_local_x = origin_x - bounds_x;
+        let curr_local_x = curr_x - bounds_x;
+        let curr_content_y = curr_y - bounds_y - scroll_y;
+
+        let rect_left = start_local_x.min(curr_local_x);
+        let rect_right = start_local_x.max(curr_local_x);
+        let rect_top = origin_content_y.min(curr_content_y);
+        let rect_bottom = origin_content_y.max(curr_content_y);
+
+        let hits = compute_marquee_hits(
+            view_mode,
+            total,
+            grid_cols,
+            row_h,
+            bounds_w,
+            rect_left,
+            rect_top,
+            rect_right,
+            rect_bottom,
+        );
+
+        let pane = tab.model.pane_mut(side);
+        pane.selection.selected.clear();
+        if additive {
+            for idx in initial_selection {
+                if idx < total {
+                    pane.selection.selected.insert(idx);
+                }
+            }
+        }
+        for idx in &hits {
+            pane.selection.selected.insert(*idx);
+        }
+        pane.selection.anchor = pane.selection.selected.iter().next().copied();
+        pane.selection.cursor = hits.last().copied().or(pane.selection.anchor);
+        pane.recompute_selection_bytes();
+        cx.notify();
+    }
+
+    fn handle_mouse_up(
+        &mut self,
+        _ev: &MouseUpEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.entry_claimed_mouse_down = false;
+        self.finish_marquee_selection(cx);
+    }
+
+    fn finish_marquee_selection(&mut self, cx: &mut Context<Self>) {
+        if self.marquee.take().is_some() {
+            self.sync_preview_for_selection(cx);
+            cx.notify();
+        }
+    }
+
+    /// Returns `(left, top, width, height)` in viewport-local pixels when a rubber-band selection
+    /// box is actively being dragged inside `side`.
+    pub fn active_marquee_rect(&self, side: PaneSide) -> Option<(f32, f32, f32, f32)> {
+        let m = self.marquee.as_ref()?;
+        if !m.active || m.side != side {
+            return None;
+        }
+        let tab = self.active_tab()?;
+        if tab.model.id != m.tab_id {
+            return None;
+        }
+        let state = tab.pane_ui(side).scroll_handle.0.borrow();
+        let b = state.base_handle.bounds();
+        let bx: f32 = b.origin.x.into();
+        let by: f32 = b.origin.y.into();
+        let bw: f32 = b.size.width.into();
+        let bh: f32 = b.size.height.into();
+        if bw <= 0.0 || bh <= 0.0 {
+            return None;
+        }
+        let scroll_y: f32 = state.base_handle.offset().y.into();
+
+        let x1 = m.origin_x - bx;
+        let x2 = m.current_x - bx;
+        let y1 = m.origin_content_y + scroll_y;
+        let y2 = m.current_y - by;
+
+        let left = x1.min(x2).clamp(0.0, bw);
+        let right = x1.max(x2).clamp(0.0, bw);
+        let top = y1.min(y2).clamp(0.0, bh);
+        let bottom = y1.max(y2).clamp(0.0, bh);
+        if right <= left || bottom <= top {
+            return None;
+        }
+        Some((left, top, right - left, bottom - top))
     }
 
     pub fn handle_entry_right_click(
@@ -3451,6 +3754,65 @@ impl Workspace {
         cx.notify();
     }
 
+    pub fn move_quick_access(
+        &mut self,
+        kind: KnownFolderKind,
+        delta: isize,
+        cx: &mut Context<Self>,
+    ) {
+        if self
+            .settings
+            .move_quick_access(kind, delta, &self.known_folders)
+        {
+            let _ = self.settings.save();
+            cx.notify();
+        }
+    }
+
+    pub fn reset_quick_access(&mut self, cx: &mut Context<Self>) {
+        self.settings.reset_quick_access();
+        let _ = self.settings.save();
+        cx.notify();
+    }
+
+    pub fn toggle_sidebar_section_collapsed(
+        &mut self,
+        section: SidebarSection,
+        cx: &mut Context<Self>,
+    ) {
+        self.settings.toggle_sidebar_section_collapsed(section);
+        let _ = self.settings.save();
+        cx.notify();
+    }
+
+    pub fn toggle_sidebar_section_visible(
+        &mut self,
+        section: SidebarSection,
+        cx: &mut Context<Self>,
+    ) {
+        self.settings.toggle_sidebar_section_visible(section);
+        let _ = self.settings.save();
+        cx.notify();
+    }
+
+    pub fn move_sidebar_section(
+        &mut self,
+        section: SidebarSection,
+        delta: isize,
+        cx: &mut Context<Self>,
+    ) {
+        if self.settings.move_sidebar_section(section, delta) {
+            let _ = self.settings.save();
+            cx.notify();
+        }
+    }
+
+    pub fn reset_sidebar_sections(&mut self, cx: &mut Context<Self>) {
+        self.settings.reset_sidebar_sections();
+        let _ = self.settings.save();
+        cx.notify();
+    }
+
     pub fn check_for_updates(&mut self, manual: bool, cx: &mut Context<Self>) {
         if self.update_state.is_busy() {
             return;
@@ -3876,6 +4238,9 @@ impl Render for Workspace {
             .text_color(solid(p.text_primary))
             .overflow_hidden()
             .on_key_down(cx.listener(Self::handle_key_down))
+            .on_mouse_move(cx.listener(Self::handle_mouse_move))
+            .on_mouse_up(MouseButton::Left, cx.listener(Self::handle_mouse_up))
+            .on_mouse_up_out(MouseButton::Left, cx.listener(Self::handle_mouse_up))
             .on_mouse_down(
                 MouseButton::Navigate(NavigationDirection::Back),
                 cx.listener(|this, _: &MouseDownEvent, window, cx| {
@@ -4287,9 +4652,106 @@ impl Render for Workspace {
     }
 }
 
+/// Computes which visible item indices intersect a marquee selection rectangle in list-content
+/// coordinates (supports dragging in any direction across Details, Compact, and Grid views).
+#[allow(clippy::too_many_arguments)]
+fn compute_marquee_hits(
+    view_mode: ViewMode,
+    total: usize,
+    grid_cols: usize,
+    row_h: f32,
+    bounds_w: f32,
+    rect_left: f32,
+    rect_top: f32,
+    rect_right: f32,
+    rect_bottom: f32,
+) -> Vec<usize> {
+    if total == 0 || row_h <= 0.0 || bounds_w <= 0.0 || rect_right <= 0.0 || rect_left >= bounds_w {
+        return Vec::new();
+    }
+    match view_mode {
+        ViewMode::Details | ViewMode::Compact => {
+            let max_y = (total as f32) * row_h;
+            if rect_bottom <= 0.0 || rect_top >= max_y {
+                return Vec::new();
+            }
+            let first = (rect_top.max(0.0) / row_h).floor() as usize;
+            let last = ((rect_bottom - 0.01).max(0.0) / row_h).floor() as usize;
+            (first..=last.min(total - 1)).collect()
+        }
+        ViewMode::Grid => {
+            let cols = grid_cols.max(1);
+            let total_rows = total.div_ceil(cols);
+            let max_y = (total_rows as f32) * row_h;
+            if rect_bottom <= 0.0 || rect_top >= max_y {
+                return Vec::new();
+            }
+            let pad_x = 12.0_f32.min(bounds_w * 0.1);
+            let inner_w = (bounds_w - pad_x * 2.0).max(1.0);
+            let cell_w = inner_w / (cols as f32);
+            let first_row = (rect_top.max(0.0) / row_h).floor() as usize;
+            let last_row = ((rect_bottom - 0.01).max(0.0) / row_h)
+                .floor()
+                .min((total_rows - 1) as f32) as usize;
+
+            let mut hits = Vec::new();
+            for row in first_row..=last_row {
+                let card_top = (row as f32) * row_h + 4.0;
+                let card_bottom = ((row + 1) as f32) * row_h - 4.0;
+                if rect_bottom <= card_top || rect_top >= card_bottom {
+                    continue;
+                }
+                for col in 0..cols {
+                    let vis_idx = row * cols + col;
+                    if vis_idx >= total {
+                        break;
+                    }
+                    let card_left = pad_x + (col as f32) * cell_w + 4.0;
+                    let card_right = pad_x + ((col + 1) as f32) * cell_w - 4.0;
+                    if rect_right > card_left && rect_left < card_right {
+                        hits.push(vis_idx);
+                    }
+                }
+            }
+            hits
+        }
+    }
+}
+
 #[cfg(test)]
 mod transfer_drop_tests {
     use super::*;
+
+    #[test]
+    fn marquee_selects_items_dragging_upward_in_details_and_grid() {
+        // Dragging upward from empty area below 5 Details rows (32px each, total 160px) up to row 2 (y=70).
+        let hits = compute_marquee_hits(
+            ViewMode::Details,
+            5,
+            4,
+            32.0,
+            600.0,
+            100.0,
+            70.0,
+            300.0,
+            280.0,
+        );
+        assert_eq!(hits, vec![2, 3, 4]);
+
+        // Grid 2D intersection across 3 columns (6 items, 2 rows of 136px).
+        let grid_hits = compute_marquee_hits(
+            ViewMode::Grid,
+            6,
+            3,
+            136.0,
+            624.0,
+            230.0,
+            10.0,
+            580.0,
+            200.0,
+        );
+        assert_eq!(grid_hits, vec![1, 2, 4, 5]);
+    }
 
     #[test]
     fn ignores_dropping_items_back_into_same_directory_or_self() {

@@ -6589,7 +6589,7 @@ dependencies = [
 
 [[package]]
 name = "texplorer-app"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "chrono",
  "dirs 6.0.0",
@@ -6613,7 +6613,7 @@ dependencies = [
 
 [[package]]
 name = "texplorer-core"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "bitflags 2.13.2",
  "dirs 6.0.0",
@@ -6624,7 +6624,7 @@ dependencies = [
 
 [[package]]
 name = "texplorer-mft"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "regex",
  "serde",
@@ -6634,7 +6634,7 @@ dependencies = [
 
 [[package]]
 name = "texplorer-ops"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "chrono",
  "futures-channel",
@@ -6645,7 +6645,7 @@ dependencies = [
 
 [[package]]
 name = "texplorer-platform"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "dirs 6.0.0",
  "serde",
@@ -6658,7 +6658,7 @@ dependencies = [
 
 [[package]]
 name = "texplorer-service"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "rayon",
  "serde_json",
@@ -6668,7 +6668,7 @@ dependencies = [
 
 [[package]]
 name = "texplorer-vfs"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "flate2",
  "md-5",

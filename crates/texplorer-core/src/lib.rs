@@ -12,5 +12,5 @@ pub use entry::{
 };
 pub use location::{BreadcrumbSegment, Location, SearchScope};
 pub use session::{AppSession, SavedPaneState, SavedTabState, WindowGeometry};
-pub use settings::{AccentPreset, AppSettings, SizeUnit, ThemePreset};
+pub use settings::{AccentPreset, AppSettings, SidebarSection, SizeUnit, ThemePreset};
 pub use workspace_model::{PaneModel, PaneSide, SelectionSet, TabModel};

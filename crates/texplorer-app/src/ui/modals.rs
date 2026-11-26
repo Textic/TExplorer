@@ -13,11 +13,13 @@ use gpui_kit::{
     },
     div, prelude::*, px,
 };
-use texplorer_core::{AccentPreset, PaneSide, SizeUnit, ThemePreset, ViewMode};
+use texplorer_core::{AccentPreset, PaneSide, SidebarSection, SizeUnit, ThemePreset, ViewMode};
 use texplorer_mft::IndexServiceInstallState;
 use texplorer_platform::DefaultExplorerStatus;
 
-use crate::theme::{Palette, RADIUS_CONTROL, RADIUS_ROW, full_hit_input, soft_tint, solid};
+use crate::theme::{
+    Palette, RADIUS_CONTROL, RADIUS_ROW, full_hit_input, known_folder_icon, soft_tint, solid,
+};
 use crate::ui::workspace::Workspace;
 use crate::updater::{CURRENT_VERSION, UpdateState, format_download_bytes};
 
@@ -764,55 +766,268 @@ fn render_settings_card(
                     v_flex()
                         .p_3()
                         .gap_2()
-                        .child(setting_label(
-                            "Quick Access Folders",
-                            "Choose which default folders appear in Quick Access. You can also right-click any item to remove it.",
-                            p,
-                        ))
-                        .child(h_flex().flex_wrap().gap_1p5().children(
-                            ws.known_folders.iter().enumerate().map(|(idx, folder)| {
-                                let kind = folder.kind;
-                                let visible = ws.settings.is_quick_access_visible(kind);
-                                let label: SharedString = folder.name.clone().into();
+                        .border_b_1()
+                        .border_color(solid(p.border_subtle))
+                        .child(
+                            h_flex()
+                                .w_full()
+                                .items_center()
+                                .justify_between()
+                                .gap_2()
+                                .child(setting_label(
+                                    "Sidebar Categories",
+                                    "Show, hide, or reorder navigation categories in the left sidebar. Click any category header in the sidebar to collapse or expand it.",
+                                    p,
+                                ))
+                                .when(ws.settings.has_custom_sidebar_sections(), |el| {
+                                    el.child(
+                                        Button::new("sb-sec-reset")
+                                            .with_size(Size::XSmall)
+                                            .ghost()
+                                            .label("Reset")
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.reset_sidebar_sections(cx);
+                                            })),
+                                    )
+                                }),
+                        )
+                        .child({
+                            let ordered = ws.settings.normalized_sidebar_order();
+                            let total = ordered.len();
+                            v_flex().gap_1p5().children(ordered.into_iter().enumerate().map(
+                                |(idx, section)| {
+                                    let visible = ws.settings.is_sidebar_section_visible(section);
+                                    let collapsed =
+                                        ws.settings.is_sidebar_section_collapsed(section);
+                                    let icon = match section {
+                                        SidebarSection::QuickAccess => LucideIcon::Folder,
+                                        SidebarSection::Pinned => LucideIcon::Pin,
+                                        SidebarSection::Drives => LucideIcon::HardDrive,
+                                        SidebarSection::LinuxWsl => LucideIcon::Terminal,
+                                    };
 
-                                div()
-                                    .id(("qa-toggle", idx))
-                                    .px_2p5()
-                                    .py_1()
-                                    .rounded(px(RADIUS_CONTROL))
-                                    .cursor_pointer()
-                                    .bg(if visible {
-                                        soft_tint(p.accent_primary, 0.16)
-                                    } else {
-                                        solid(p.bg_surface)
-                                    })
-                                    .border_1()
-                                    .border_color(if visible {
-                                        solid(p.accent_primary)
-                                    } else {
-                                        solid(p.border_subtle)
-                                    })
-                                    .text_xs()
-                                    .font_medium()
-                                    .text_color(if visible {
-                                        solid(p.accent_primary)
-                                    } else {
-                                        solid(p.text_muted)
-                                    })
-                                    .hover(move |s| {
-                                        if visible {
-                                            s
-                                        } else {
-                                            s.bg(solid(p.bg_hover))
-                                                .text_color(solid(p.text_primary))
-                                        }
-                                    })
-                                    .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.toggle_quick_access(kind, cx);
-                                    }))
-                                    .child(label)
-                            }),
-                        )),
+                                    h_flex()
+                                        .w_full()
+                                        .px_2p5()
+                                        .py_1p5()
+                                        .gap_2()
+                                        .items_center()
+                                        .justify_between()
+                                        .rounded(px(RADIUS_CONTROL))
+                                        .bg(solid(p.bg_surface))
+                                        .border_1()
+                                        .border_color(solid(p.border_subtle))
+                                        .child(
+                                            h_flex()
+                                                .flex_1()
+                                                .min_w_0()
+                                                .items_center()
+                                                .gap_2()
+                                                .child(Icon::new(icon).xsmall().text_color(
+                                                    if visible {
+                                                        solid(p.accent_primary)
+                                                    } else {
+                                                        solid(p.text_muted)
+                                                    },
+                                                ))
+                                                .child(
+                                                    div()
+                                                        .text_xs()
+                                                        .font_medium()
+                                                        .text_color(if visible {
+                                                            solid(p.text_primary)
+                                                        } else {
+                                                            solid(p.text_muted)
+                                                        })
+                                                        .child(section.label()),
+                                                )
+                                                .when(visible && collapsed, |el| {
+                                                    el.child(
+                                                        div()
+                                                            .text_size(px(12.))
+                                                            .text_color(solid(p.text_muted))
+                                                            .child("(Collapsed)"),
+                                                    )
+                                                }),
+                                        )
+                                        .child(
+                                            h_flex()
+                                                .flex_shrink_0()
+                                                .items_center()
+                                                .gap_1()
+                                                .child(
+                                                    Button::new(("sb-sec-up", idx))
+                                                        .with_size(Size::XSmall)
+                                                        .ghost()
+                                                        .disabled(idx == 0)
+                                                        .icon(LucideIcon::ChevronUp)
+                                                        .tooltip("Move Up")
+                                                        .on_click(cx.listener(
+                                                            move |this, _, _, cx| {
+                                                                this.move_sidebar_section(
+                                                                    section, -1, cx,
+                                                                );
+                                                            },
+                                                        )),
+                                                )
+                                                .child(
+                                                    Button::new(("sb-sec-down", idx))
+                                                        .with_size(Size::XSmall)
+                                                        .ghost()
+                                                        .disabled(idx + 1 >= total)
+                                                        .icon(LucideIcon::ChevronDown)
+                                                        .tooltip("Move Down")
+                                                        .on_click(cx.listener(
+                                                            move |this, _, _, cx| {
+                                                                this.move_sidebar_section(
+                                                                    section, 1, cx,
+                                                                );
+                                                            },
+                                                        )),
+                                                )
+                                                .child(choice_pill(
+                                                    ("sb-sec-vis", idx),
+                                                    if visible { "Visible" } else { "Hidden" },
+                                                    visible,
+                                                    p,
+                                                    cx.listener(move |this, _, _, cx| {
+                                                        this.toggle_sidebar_section_visible(
+                                                            section, cx,
+                                                        );
+                                                    }),
+                                                )),
+                                        )
+                                },
+                            ))
+                        }),
+                )
+                .child(
+                    v_flex()
+                        .p_3()
+                        .gap_2()
+                        .child(
+                            h_flex()
+                                .w_full()
+                                .items_center()
+                                .justify_between()
+                                .gap_2()
+                                .child(setting_label(
+                                    "Quick Access Folders",
+                                    "Reorder or choose which default folders appear in Quick Access. You can also right-click any item to remove it.",
+                                    p,
+                                ))
+                                .when(
+                                    ws.settings.has_custom_quick_access(&ws.known_folders),
+                                    |el| {
+                                        el.child(
+                                            Button::new("qa-reset")
+                                                .with_size(Size::XSmall)
+                                                .ghost()
+                                                .label("Reset")
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    this.reset_quick_access(cx);
+                                                })),
+                                        )
+                                    },
+                                ),
+                        )
+                        .child({
+                            let ordered_qa = ws.settings.ordered_quick_access(&ws.known_folders);
+                            let total = ordered_qa.len();
+                            v_flex().gap_1p5().children(ordered_qa.into_iter().enumerate().map(
+                                |(idx, folder)| {
+                                    let kind = folder.kind;
+                                    let visible = ws.settings.is_quick_access_visible(kind);
+                                    let label: SharedString = folder.name.clone().into();
+                                    let icon = known_folder_icon(kind);
+
+                                    h_flex()
+                                        .w_full()
+                                        .px_2p5()
+                                        .py_1p5()
+                                        .gap_2()
+                                        .items_center()
+                                        .justify_between()
+                                        .rounded(px(RADIUS_CONTROL))
+                                        .bg(solid(p.bg_surface))
+                                        .border_1()
+                                        .border_color(solid(p.border_subtle))
+                                        .child(
+                                            h_flex()
+                                                .flex_1()
+                                                .min_w_0()
+                                                .items_center()
+                                                .gap_2()
+                                                .child(Icon::new(icon).xsmall().text_color(
+                                                    if visible {
+                                                        solid(p.accent_primary)
+                                                    } else {
+                                                        solid(p.text_muted)
+                                                    },
+                                                ))
+                                                .child(
+                                                    div()
+                                                        .flex_1()
+                                                        .min_w_0()
+                                                        .truncate()
+                                                        .text_xs()
+                                                        .font_medium()
+                                                        .text_color(if visible {
+                                                            solid(p.text_primary)
+                                                        } else {
+                                                            solid(p.text_muted)
+                                                        })
+                                                        .child(label),
+                                                ),
+                                        )
+                                        .child(
+                                            h_flex()
+                                                .flex_shrink_0()
+                                                .items_center()
+                                                .gap_1()
+                                                .child(
+                                                    Button::new(("qa-up", idx))
+                                                        .with_size(Size::XSmall)
+                                                        .ghost()
+                                                        .disabled(idx == 0)
+                                                        .icon(LucideIcon::ChevronUp)
+                                                        .tooltip("Move Up")
+                                                        .on_click(cx.listener(
+                                                            move |this, _, _, cx| {
+                                                                this.move_quick_access(
+                                                                    kind, -1, cx,
+                                                                );
+                                                            },
+                                                        )),
+                                                )
+                                                .child(
+                                                    Button::new(("qa-down", idx))
+                                                        .with_size(Size::XSmall)
+                                                        .ghost()
+                                                        .disabled(idx + 1 >= total)
+                                                        .icon(LucideIcon::ChevronDown)
+                                                        .tooltip("Move Down")
+                                                        .on_click(cx.listener(
+                                                            move |this, _, _, cx| {
+                                                                this.move_quick_access(
+                                                                    kind, 1, cx,
+                                                                );
+                                                            },
+                                                        )),
+                                                )
+                                                .child(choice_pill(
+                                                    ("qa-vis", idx),
+                                                    if visible { "Visible" } else { "Hidden" },
+                                                    visible,
+                                                    p,
+                                                    cx.listener(move |this, _, _, cx| {
+                                                        this.toggle_quick_access(kind, cx);
+                                                    }),
+                                                )),
+                                        )
+                                },
+                            ))
+                        }),
                 ),
         );
 
@@ -1248,8 +1463,6 @@ fn render_settings_card(
                         .children(SettingsCategory::ALL.into_iter().map(|cat| {
                             let selected = active_category == cat;
                             let dot_color: Option<u32> = match cat {
-                                SettingsCategory::Search if svc_running => Some(p.status_success),
-                                SettingsCategory::Windows if is_enabled => Some(p.accent_primary),
                                 SettingsCategory::Updates if has_update_badge => {
                                     Some(p.accent_primary)
                                 }
@@ -1380,7 +1593,7 @@ fn setting_label_shared(
 }
 
 fn choice_pill(
-    id: &'static str,
+    id: impl Into<gpui_kit::ElementId>,
     label: &'static str,
     active: bool,
     p: Palette,
