@@ -104,19 +104,19 @@ pub fn resolve_palette(theme: ThemePreset, accent: AccentPreset, system_is_dark:
             danger_active: 0xdc2626,
             danger_fg: 0x09090b,
         },
-        // Fluent / WinUI 3 Files Dark palette (composited solid tokens from files-community/Files)
+        // Fluent / WinUI 3 Files Dark palette (deep matte-black surface hierarchy with Files accents & semantics)
         (_, true) => Palette {
             is_dark: true,
-            bg_base: 0x282828,
-            bg_surface: 0x202020,
-            bg_elevated: 0x2c2c2c,
-            bg_hover: 0x363636,
-            border_subtle: 0x323232,
-            border: 0x424242,
-            resize_hover: 0x525252,
+            bg_base: 0x111111,
+            bg_surface: 0x0b0b0b,
+            bg_elevated: 0x161616,
+            bg_hover: 0x1f1f1f,
+            border_subtle: 0x222222,
+            border: 0x2d2d2d,
+            resize_hover: 0x3f3f3f,
             text_primary: 0xffffff,
             text_secondary: 0xcecece,
-            text_muted: 0x9b9b9b,
+            text_muted: 0x949494,
             accent_primary,
             accent_hover,
             accent_active,
@@ -135,7 +135,7 @@ pub fn resolve_palette(theme: ThemePreset, accent: AccentPreset, system_is_dark:
             syntax_number: 0xfce100,
             danger_hover: 0xf87171,
             danger_active: 0xef4444,
-            danger_fg: 0x1a1a1a,
+            danger_fg: 0x111111,
         },
         // Fluent / WinUI 3 Files Light palette (composited solid tokens from files-community/Files)
         (_, false) => Palette {

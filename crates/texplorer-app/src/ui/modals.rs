@@ -608,14 +608,14 @@ fn render_settings_card(
                                                     let (swatch_bg, swatch_border) = match preset {
                                                         ThemePreset::FilesSystem => (
                                                             if ws.system_is_dark {
-                                                                0x282828
+                                                                0x111111
                                                             } else {
                                                                 0xfafafa
                                                             },
                                                             p.accent_primary,
                                                         ),
                                                         ThemePreset::FilesDark => {
-                                                            (0x282828, 0x50c0ff)
+                                                            (0x111111, 0x50c0ff)
                                                         }
                                                         ThemePreset::FilesLight => {
                                                             (0xfafafa, 0x0070cb)

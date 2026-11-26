@@ -249,12 +249,33 @@ impl AppSettings {
     }
 
     /// Loads persisted settings from disk, falling back to defaults when missing or invalid.
+    /// Migrates pre-v0.3 configs (which lacked the `theme` field and stored the old `Emerald` default)
+    /// to the new `FilesSystem` + `FilesBlue` defaults once.
     pub fn load() -> Self {
         let path = Self::config_path();
-        let Ok(raw) = std::fs::read_to_string(path) else {
+        let Ok(raw) = std::fs::read_to_string(&path) else {
             return Self::default();
         };
-        serde_json::from_str(&raw).unwrap_or_default()
+        let (parsed, migrated) = Self::parse_with_migration(&raw);
+        if migrated {
+            let _ = parsed.save();
+        }
+        parsed
+    }
+
+    fn parse_with_migration(raw: &str) -> (Self, bool) {
+        let Ok(val) = serde_json::from_str::<serde_json::Value>(raw) else {
+            return (Self::default(), false);
+        };
+        let is_legacy_pre_theme = val.get("theme").is_none();
+        let Ok(mut parsed) = serde_json::from_value::<Self>(val) else {
+            return (Self::default(), false);
+        };
+        if is_legacy_pre_theme && parsed.accent == AccentPreset::Emerald {
+            parsed.accent = AccentPreset::FilesBlue;
+            return (parsed, true);
+        }
+        (parsed, false)
     }
 
     /// Saves settings to disk.
@@ -337,5 +358,21 @@ mod tests {
 
         assert_eq!(AccentPreset::default(), AccentPreset::FilesBlue);
         assert_eq!(AccentPreset::ALL[0], AccentPreset::FilesBlue);
+    }
+
+    #[test]
+    fn migrates_legacy_emerald_default_to_files_blue_without_overwriting_explicit_choice() {
+        let legacy_json = r#"{"accent":"Emerald","show_tabs":true}"#;
+        let (migrated_settings, did_migrate) = AppSettings::parse_with_migration(legacy_json);
+        assert!(did_migrate);
+        assert_eq!(migrated_settings.theme, ThemePreset::FilesSystem);
+        assert_eq!(migrated_settings.accent, AccentPreset::FilesBlue);
+
+        let explicit_json = r#"{"theme":"ObsidianDark","accent":"Emerald"}"#;
+        let (explicit_settings, did_migrate_explicit) =
+            AppSettings::parse_with_migration(explicit_json);
+        assert!(!did_migrate_explicit);
+        assert_eq!(explicit_settings.theme, ThemePreset::ObsidianDark);
+        assert_eq!(explicit_settings.accent, AccentPreset::Emerald);
     }
 }
