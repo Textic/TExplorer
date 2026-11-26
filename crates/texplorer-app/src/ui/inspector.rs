@@ -5,21 +5,35 @@ use gpui_kit::{
         Icon, Sizable as _, Size, StyledExt as _,
         button::{Button, ButtonVariants as _},
         h_flex,
+        input::Input,
         scroll::ScrollableElement as _,
         v_flex,
     },
     div, img, prelude::*, px,
 };
-use texplorer_core::EntryFlags;
+use texplorer_core::{EntryFlags, Location};
+use texplorer_platform::FileLockStatus;
+use texplorer_vfs::hash::{FileHashes, verify_hash_match};
 
 use crate::preview::PreviewPayload;
 use crate::theme::{
     Palette, RADIUS_CONTROL, RADIUS_ROW, file_kind_visual, format_size, format_timestamp,
-    soft_tint, solid,
+    full_hit_input, soft_tint, solid,
 };
 use crate::ui::workspace::Workspace;
 
-/// Renders the collapsible right-hand Preview & Inspector panel (`Alt+P`) with live inline preview.
+/// Async checksum state shown inside the right-hand Inspector.
+#[derive(Debug, Clone, Default)]
+pub enum HashInspectState {
+    #[default]
+    Idle,
+    Computing,
+    Ready(FileHashes),
+    Error(String),
+}
+
+/// Renders the collapsible right-hand Preview & Inspector panel (`Alt+P`) with live inline preview,
+/// streaming SHA-256/MD5 checksums + verification, and Windows Restart Manager file-lock detection.
 pub fn render_inspector(ws: &Workspace, cx: &mut Context<Workspace>) -> impl IntoElement {
     let p = ws.palette();
     let unit = ws.settings.size_unit;
@@ -35,7 +49,7 @@ pub fn render_inspector(ws: &Workspace, cx: &mut Context<Workspace>) -> impl Int
         .child(
             h_flex()
                 .w_full()
-                .h(px(38.))
+                .h(px(40.))
                 .px_3()
                 .flex_shrink_0()
                 .items_center()
@@ -112,10 +126,19 @@ pub fn render_inspector(ws: &Workspace, cx: &mut Context<Workspace>) -> impl Int
                 let created_str: SharedString = format_timestamp(entry.created_secs).into();
                 let local_path = entry.location.as_local_path().map(|path| path.to_path_buf());
                 let is_dir = entry.is_dir();
+                let is_local_file = local_path.is_some() && !is_dir;
+                let archive_entry_info = match &entry.location {
+                    Location::Archive {
+                        archive_path,
+                        inner_path,
+                    } => Some((archive_path.clone(), inner_path.clone())),
+                    _ => None,
+                };
 
-                let matches_preview = local_path.as_ref().is_some_and(|path| {
-                    ws.preview_path.as_ref().is_some_and(|pp| pp == path)
-                });
+                let matches_preview = ws
+                    .preview_location
+                    .as_ref()
+                    .is_some_and(|pl| pl == &entry.location);
                 let preview_visual = if matches_preview {
                     render_inline_preview(&ws.preview_payload, icon, icon_hex, unit, p)
                         .into_any_element()
@@ -124,6 +147,9 @@ pub fn render_inspector(ws: &Workspace, cx: &mut Context<Workspace>) -> impl Int
                 };
 
                 let mut attr_badges: Vec<&'static str> = Vec::new();
+                if entry.flags.contains(EntryFlags::IS_ARCHIVE) {
+                    attr_badges.push("Inside Archive");
+                }
                 if entry.flags.contains(EntryFlags::IS_READONLY) {
                     attr_badges.push("Read-Only");
                 }
@@ -147,7 +173,14 @@ pub fn render_inspector(ws: &Workspace, cx: &mut Context<Workspace>) -> impl Int
                 let copy_path = entry.location.display_path();
                 let term_path = local_path.clone();
                 let props_path = local_path.clone();
-                let pin_path = local_path;
+                let pin_path = local_path.clone();
+
+                let hash_matches = local_path
+                    .as_ref()
+                    .is_some_and(|lp| ws.hash_target.as_ref() == Some(lp));
+                let lock_matches = local_path
+                    .as_ref()
+                    .is_some_and(|lp| ws.lock_target.as_ref() == Some(lp));
 
                 v_flex()
                     .flex_1()
@@ -215,7 +248,7 @@ pub fn render_inspector(ws: &Workspace, cx: &mut Context<Workspace>) -> impl Int
                                     .gap_0p5()
                                     .child(
                                         div()
-                                            .text_size(px(11.))
+                                            .text_size(px(13.))
                                             .text_color(solid(p.text_muted))
                                             .child("Location"),
                                     )
@@ -241,30 +274,57 @@ pub fn render_inspector(ws: &Workspace, cx: &mut Context<Workspace>) -> impl Int
                                         .bg(solid(p.bg_elevated))
                                         .border_1()
                                         .border_color(solid(p.border_subtle))
-                                        .text_size(px(11.))
+                                        .text_size(px(13.))
                                         .text_color(solid(p.text_secondary))
                                         .child(badge)
                                 })),
                         )
                     })
+                    // Phase 4: File Lock Detector card (local files only)
+                    .when(is_local_file, |el| {
+                        el.child(render_lock_section(ws, lock_matches, p, cx))
+                    })
+                    // Phase 4: SHA-256 & MD5 Checksums + Verifier card (local files only)
+                    .when(is_local_file, |el| {
+                        el.child(render_hash_section(ws, hash_matches, p, cx))
+                    })
                     // Quick Actions
                     .child(
                         v_flex()
                             .gap_1p5()
-                            .child(
-                                Button::new("insp-open")
-                                    .with_size(Size::Small)
-                                    .primary()
-                                    .label(if is_dir { "Open Folder" } else { "Open File" })
-                                    .on_click(cx.listener(move |this, _, window, cx| {
-                                        this.open_location_or_file(
-                                            open_loc.clone(),
-                                            is_dir,
-                                            window,
-                                            cx,
-                                        );
-                                    })),
-                            )
+                            .when_some(archive_entry_info, |el, (arch_path, inner)| {
+                                el.child(
+                                    Button::new("insp-extract-entry")
+                                        .with_size(Size::Small)
+                                        .primary()
+                                        .label("Extract Item")
+                                        .icon(LucideIcon::Download)
+                                        .on_click(cx.listener(move |this, _, window, cx| {
+                                            this.extract_archive_item_to_target(
+                                                arch_path.clone(),
+                                                vec![inner.clone()],
+                                                window,
+                                                cx,
+                                            );
+                                        })),
+                                )
+                            })
+                            .when(local_path.is_some(), |el| {
+                                el.child(
+                                    Button::new("insp-open")
+                                        .with_size(Size::Small)
+                                        .primary()
+                                        .label(if is_dir { "Open Folder" } else { "Open File" })
+                                        .on_click(cx.listener(move |this, _, window, cx| {
+                                            this.open_location_or_file(
+                                                open_loc.clone(),
+                                                is_dir,
+                                                window,
+                                                cx,
+                                            );
+                                        })),
+                                )
+                            })
                             .child(
                                 Button::new("insp-copy-path")
                                     .with_size(Size::Small)
@@ -313,6 +373,310 @@ pub fn render_inspector(ws: &Workspace, cx: &mut Context<Workspace>) -> impl Int
         })
 }
 
+fn render_lock_section(
+    ws: &Workspace,
+    matches_target: bool,
+    p: Palette,
+    cx: &mut Context<Workspace>,
+) -> impl IntoElement {
+    let status = if matches_target {
+        &ws.lock_status
+    } else {
+        &FileLockStatus::NotChecked
+    };
+
+    v_flex()
+        .w_full()
+        .p_2p5()
+        .gap_2()
+        .rounded(px(RADIUS_ROW))
+        .bg(solid(p.bg_base))
+        .border_1()
+        .border_color(solid(p.border_subtle))
+        .child(
+            h_flex()
+                .items_center()
+                .justify_between()
+                .gap_2()
+                .child(
+                    div()
+                        .text_size(px(13.))
+                        .font_semibold()
+                        .text_color(solid(p.text_secondary))
+                        .child("FILE LOCKS"),
+                )
+                .child(
+                    Button::new("insp-check-lock")
+                        .with_size(Size::XSmall)
+                        .ghost()
+                        .label("Check")
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.check_locks_for_selection(cx);
+                        })),
+                ),
+        )
+        .child(match status {
+            FileLockStatus::NotChecked => div()
+                .text_size(px(13.))
+                .text_color(solid(p.text_muted))
+                .child("Inspect which Windows processes hold open handles.")
+                .into_any_element(),
+            FileLockStatus::Checking => div()
+                .text_size(px(13.))
+                .text_color(solid(p.status_info))
+                .child("Querying Windows Restart Manager...")
+                .into_any_element(),
+            FileLockStatus::Unlocked => h_flex()
+                .gap_1p5()
+                .items_center()
+                .child(
+                    div()
+                        .w(px(6.))
+                        .h(px(6.))
+                        .rounded(px(999.))
+                        .bg(solid(p.status_success)),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .font_medium()
+                        .text_color(solid(p.status_success))
+                        .child("Unlocked (no active locks)"),
+                )
+                .into_any_element(),
+            FileLockStatus::LockedBy(procs) => v_flex()
+                .gap_1()
+                .child(
+                    div()
+                        .text_xs()
+                        .font_semibold()
+                        .text_color(solid(p.status_error))
+                        .child(format!("Locked by {} process(es):", procs.len())),
+                )
+                .children(procs.iter().take(6).map(|proc_info| {
+                    h_flex()
+                        .px_2()
+                        .py_1()
+                        .items_center()
+                        .justify_between()
+                        .gap_1()
+                        .rounded(px(RADIUS_CONTROL))
+                        .bg(solid(p.bg_elevated))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .truncate()
+                                .text_size(px(13.))
+                                .text_color(solid(p.text_primary))
+                                .child(proc_info.name.clone()),
+                        )
+                        .child(
+                            div()
+                                .flex_shrink_0()
+                                .text_size(px(12.))
+                                .text_color(solid(p.text_muted))
+                                .child(format!("PID {} • {}", proc_info.pid, proc_info.app_type)),
+                        )
+                }))
+                .into_any_element(),
+            FileLockStatus::LockedUnknown => div()
+                .text_xs()
+                .text_color(solid(p.status_warning))
+                .child("Locked by an elevated or system process.")
+                .into_any_element(),
+            FileLockStatus::AccessDenied => div()
+                .text_xs()
+                .text_color(solid(p.status_error))
+                .child("Access denied while probing file lock.")
+                .into_any_element(),
+            FileLockStatus::NotApplicable => div()
+                .text_size(px(13.))
+                .text_color(solid(p.text_muted))
+                .child("Not applicable to directories.")
+                .into_any_element(),
+            FileLockStatus::Error(err) => div()
+                .text_size(px(13.))
+                .text_color(solid(p.status_error))
+                .child(err.clone())
+                .into_any_element(),
+        })
+}
+
+fn render_hash_section(
+    ws: &Workspace,
+    matches_target: bool,
+    p: Palette,
+    cx: &mut Context<Workspace>,
+) -> impl IntoElement {
+    let state = if matches_target {
+        &ws.hash_state
+    } else {
+        &HashInspectState::Idle
+    };
+
+    v_flex()
+        .w_full()
+        .p_2p5()
+        .gap_2()
+        .rounded(px(RADIUS_ROW))
+        .bg(solid(p.bg_base))
+        .border_1()
+        .border_color(solid(p.border_subtle))
+        .child(
+            h_flex()
+                .items_center()
+                .justify_between()
+                .gap_2()
+                .child(
+                    div()
+                        .text_size(px(13.))
+                        .font_semibold()
+                        .text_color(solid(p.text_secondary))
+                        .child("CHECKSUMS"),
+                )
+                .child(
+                    Button::new("insp-compute-hash")
+                        .with_size(Size::XSmall)
+                        .ghost()
+                        .label("Compute")
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.compute_checksums_for_selection(cx);
+                        })),
+                ),
+        )
+        .child(match state {
+            HashInspectState::Idle => div()
+                .text_size(px(13.))
+                .text_color(solid(p.text_muted))
+                .child("Calculate streaming SHA-256 and MD5 digests.")
+                .into_any_element(),
+            HashInspectState::Computing => div()
+                .text_size(px(13.))
+                .text_color(solid(p.status_info))
+                .child("Computing SHA-256 & MD5...")
+                .into_any_element(),
+            HashInspectState::Error(err) => div()
+                .text_size(px(13.))
+                .text_color(solid(p.status_error))
+                .child(err.clone())
+                .into_any_element(),
+            HashInspectState::Ready(hashes) => {
+                let sha_full = hashes.sha256.clone();
+                let md5_full = hashes.md5.clone();
+                let sha_short: SharedString =
+                    format!("{}…{}", &hashes.sha256[..12], &hashes.sha256[56..]).into();
+                let md5_short: SharedString =
+                    format!("{}…{}", &hashes.md5[..10], &hashes.md5[24..]).into();
+                let verify_val = ws.hash_verify_text.trim();
+                let verify_badge: Option<(SharedString, u32)> = if verify_val.is_empty() {
+                    None
+                } else if let Some(algo) = verify_hash_match(hashes, verify_val) {
+                    Some((format!("Match ({algo})").into(), p.status_success))
+                } else {
+                    Some(("Hash Mismatch".into(), p.status_error))
+                };
+
+                v_flex()
+                    .gap_1p5()
+                    .child(hash_digest_row(
+                        "SHA-256",
+                        sha_short,
+                        "insp-copy-sha256",
+                        sha_full,
+                        p,
+                        cx,
+                    ))
+                    .child(hash_digest_row(
+                        "MD5",
+                        md5_short,
+                        "insp-copy-md5",
+                        md5_full,
+                        p,
+                        cx,
+                    ))
+                    .child(
+                        div()
+                            .w_full()
+                            .h(px(30.))
+                            .px_2()
+                            .rounded(px(RADIUS_CONTROL))
+                            .bg(solid(p.bg_surface))
+                            .border_1()
+                            .border_color(solid(p.border_subtle))
+                            .child(full_hit_input(
+                                "insp-hash-verify-hit",
+                                &ws.hash_verify_input,
+                                Input::new(&ws.hash_verify_input)
+                                    .with_size(Size::XSmall)
+                                    .appearance(false),
+                            )),
+                    )
+                    .when_some(verify_badge, |el, (label, color)| {
+                        el.child(
+                            div()
+                                .px_2()
+                                .py_0p5()
+                                .rounded(px(RADIUS_CONTROL))
+                                .bg(soft_tint(color, 0.14))
+                                .text_size(px(13.))
+                                .font_semibold()
+                                .text_color(solid(color))
+                                .child(label),
+                        )
+                    })
+                    .into_any_element()
+            }
+        })
+}
+
+fn hash_digest_row(
+    label: &'static str,
+    preview: SharedString,
+    copy_btn_id: &'static str,
+    full_value: String,
+    p: Palette,
+    cx: &mut Context<Workspace>,
+) -> impl IntoElement {
+    h_flex()
+        .w_full()
+        .px_2()
+        .py_1()
+        .items_center()
+        .justify_between()
+        .gap_1p5()
+        .rounded(px(RADIUS_CONTROL))
+        .bg(solid(p.bg_elevated))
+        .child(
+            div()
+                .flex_shrink_0()
+                .text_size(px(12.))
+                .font_semibold()
+                .text_color(solid(p.text_muted))
+                .child(label),
+        )
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .truncate()
+                .font_family("Consolas")
+                .text_size(px(12.))
+                .text_color(solid(p.text_primary))
+                .child(preview),
+        )
+        .child(
+            Button::new(copy_btn_id)
+                .with_size(Size::XSmall)
+                .ghost()
+                .icon(LucideIcon::Copy)
+                .tooltip(format!("Copy {label}"))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.copy_text_to_clipboard(&full_value, &format!("{label} copied"), cx);
+                })),
+        )
+}
+
 fn render_inline_preview(
     payload: &PreviewPayload,
     fallback_icon: LucideIcon,
@@ -346,7 +710,7 @@ fn render_inline_preview(
             )
             .child(
                 div()
-                    .text_size(px(10.))
+                    .text_size(px(12.))
                     .text_color(solid(p.text_muted))
                     .child(format!("{orig_width} × {orig_height}")),
             )
@@ -378,7 +742,7 @@ fn render_inline_preview(
                 div()
                     .w_full()
                     .truncate()
-                    .text_size(px(10.))
+                    .text_size(px(12.))
                     .text_color(solid(p.text_primary))
                     .child(
                         StyledText::new(line.text.clone()).with_highlights(line.spans.clone()),
@@ -398,7 +762,7 @@ fn render_inline_preview(
                 div()
                     .w_full()
                     .truncate()
-                    .text_size(px(11.))
+                    .text_size(px(13.))
                     .text_color(solid(p.text_secondary))
                     .child(l.to_string())
             }))
@@ -414,7 +778,7 @@ fn render_inline_preview(
             .child(render_icon_box(fallback_icon, fallback_hex))
             .child(
                 div()
-                    .text_size(px(11.))
+                    .text_size(px(13.))
                     .text_color(solid(p.text_secondary))
                     .child(format!(
                         "{total_items} items ({folders} dirs, {files} files • {})",
@@ -450,7 +814,7 @@ fn meta_row(label: &'static str, value: SharedString, p: Palette) -> impl IntoEl
         .border_color(solid(p.border_subtle))
         .child(
             div()
-                .text_size(px(11.))
+                .text_size(px(13.))
                 .text_color(solid(p.text_muted))
                 .child(label),
         )

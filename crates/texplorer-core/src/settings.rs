@@ -204,7 +204,6 @@ pub struct AppSettings {
     pub pinned_folders: Vec<PathBuf>,
     pub terminal_command: String,
     pub editor_command: String,
-    pub textree_path: Option<PathBuf>,
 }
 
 impl Default for AppSettings {
@@ -230,7 +229,6 @@ impl Default for AppSettings {
             pinned_folders: Vec::new(),
             terminal_command: "wt.exe".to_string(),
             editor_command: "code".to_string(),
-            textree_path: None,
         }
     }
 }

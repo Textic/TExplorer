@@ -192,7 +192,7 @@ pub fn render_global_search_modal(
                                         .py_0p5()
                                         .rounded(px(3.))
                                         .cursor_pointer()
-                                        .text_size(px(11.))
+                                        .text_size(px(13.))
                                         .font_medium()
                                         .bg(if is_global {
                                             soft_tint(p.accent_primary, 0.16)
@@ -220,7 +220,7 @@ pub fn render_global_search_modal(
                                             .py_0p5()
                                             .rounded(px(3.))
                                             .cursor_pointer()
-                                            .text_size(px(11.))
+                                            .text_size(px(13.))
                                             .font_medium()
                                             .bg(if !is_global {
                                                 soft_tint(p.accent_primary, 0.16)
@@ -256,7 +256,7 @@ pub fn render_global_search_modal(
                 .child(
                     h_flex()
                         .w_full()
-                        .h(px(30.))
+                        .h(px(34.))
                         .px_3p5()
                         .gap_2()
                         .flex_shrink_0()
@@ -297,7 +297,7 @@ pub fn render_global_search_modal(
                                         )
                                         .child(
                                             div()
-                                                .text_size(px(10.))
+                                                .text_size(px(12.))
                                                 .font_semibold()
                                                 .text_color(solid(if using_mft {
                                                     p.status_success
@@ -316,7 +316,7 @@ pub fn render_global_search_modal(
                                         .flex_1()
                                         .min_w_0()
                                         .truncate()
-                                        .text_size(px(11.))
+                                        .text_size(px(13.))
                                         .text_color(solid(p.text_muted))
                                         .child(status_summary),
                                 ),
@@ -334,7 +334,7 @@ pub fn render_global_search_modal(
                                             .py_0p5()
                                             .rounded(px(RADIUS_CONTROL))
                                             .cursor_pointer()
-                                            .text_size(px(10.))
+                                            .text_size(px(12.))
                                             .font_medium()
                                             .text_color(solid(p.accent_primary))
                                             .hover(move |s| {
@@ -358,7 +358,7 @@ pub fn render_global_search_modal(
                                             .bg(solid(p.bg_elevated))
                                             .border_1()
                                             .border_color(solid(p.border_subtle))
-                                            .text_size(px(10.))
+                                            .text_size(px(12.))
                                             .font_medium()
                                             .text_color(solid(p.text_primary))
                                             .hover(move |s| s.bg(solid(p.bg_hover)))
@@ -435,7 +435,7 @@ pub fn render_global_search_modal(
                 .child(
                     h_flex()
                         .w_full()
-                        .h(px(28.))
+                        .h(px(32.))
                         .px_3p5()
                         .flex_shrink_0()
                         .items_center()
@@ -445,7 +445,7 @@ pub fn render_global_search_modal(
                         .border_color(solid(p.border_subtle))
                         .child(
                             div()
-                                .text_size(px(11.))
+                                .text_size(px(13.))
                                 .text_color(solid(p.text_muted))
                                 .child("↑ / ↓ Navigate   •   Enter Open   •   Shift+Enter Open in Tab   •   Esc Close"),
                         ),
@@ -491,7 +491,7 @@ fn render_search_result_rows(
                 h_flex()
                     .id(("gs-row", idx))
                     .w_full()
-                    .h(px(44.))
+                    .h(px(50.))
                     .px_3()
                     .gap_2p5()
                     .items_center()
@@ -545,7 +545,7 @@ fn render_search_result_rows(
                             .child(
                                 div()
                                     .truncate()
-                                    .text_size(px(10.))
+                                    .text_size(px(12.))
                                     .text_color(solid(p.text_muted))
                                     .child(parent_dir),
                             ),
@@ -557,13 +557,13 @@ fn render_search_result_rows(
                             .gap_0p5()
                             .child(
                                 div()
-                                    .text_size(px(11.))
+                                    .text_size(px(13.))
                                     .text_color(solid(p.text_secondary))
                                     .child(size_label),
                             )
                             .child(
                                 div()
-                                    .text_size(px(10.))
+                                    .text_size(px(12.))
                                     .text_color(solid(p.text_muted))
                                     .child(mod_label),
                             ),

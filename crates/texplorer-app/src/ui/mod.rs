@@ -1,3 +1,5 @@
+pub mod bulk_rename;
+pub mod command_palette;
 pub mod context_menu;
 pub mod global_search;
 pub mod header;

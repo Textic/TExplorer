@@ -12,7 +12,7 @@ members = [
 default-members = ["crates/texplorer-app"]
 
 [workspace.package]
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 authors = ["Textic"]
 license = "MIT"
@@ -21,10 +21,12 @@ license = "MIT"
 bitflags = { version = "2.6", features = ["serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 dirs = "6.0"
+flate2 = "1.0"
 futures-channel = "0.3"
 futures-util = "0.3"
 gpui-kit = "0.10.0"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp", "ico"] }
+md-5 = "0.10"
 rayon = "1.10"
 regex = "1.11"
 reqwest = { version = "0.13", default-features = false, features = [
@@ -40,13 +42,16 @@ reqwest = { version = "0.13", default-features = false, features = [
 ] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+sevenz-rust = "0.6"
 sha2 = "0.10"
 smallvec = "1.15"
+tar = "0.4"
 tokio = { version = "1.48", features = ["rt-multi-thread", "macros", "time", "sync", "fs", "io-util"] }
 trash = "5.2"
 uuid = { version = "1.0", features = ["v4", "serde"] }
 windows = "0.58"
 windows-sys = "0.59"
+zip = { version = "2.2", default-features = false, features = ["deflate"] }
 
 # Optimize dependencies in dev builds so GPUI layout (taffy) and GPU rendering
 # run at full frame rate during `cargo run`, while keeping app rebuilds fast.

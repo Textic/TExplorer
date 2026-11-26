@@ -58,12 +58,17 @@ enum MenuAction {
     CopySelected(PaneSide),
     PasteInto(PathBuf),
     RenameEntry(PaneSide, PathBuf, String),
+    BulkRename(PaneSide),
+    CompressToZip(PaneSide),
+    ExtractArchiveHere(PathBuf),
+    ExtractArchiveSelection(PaneSide, PathBuf, String),
+    ComputeChecksums,
+    CheckFileLocks,
     NewFolder(PaneSide, PathBuf),
     NewFile(PaneSide, PathBuf),
     CopyPath(String),
     OpenTerminal(PathBuf),
     OpenEditor(PathBuf),
-    OpenTexTree(PathBuf),
     PinFolder(PathBuf),
     ShowWindowsMenu(Vec<PathBuf>),
     RevealInWindowsExplorer(PathBuf),
@@ -87,8 +92,8 @@ pub fn render_context_menu(
         return div().into_any_element();
     }
 
-    const MENU_W: f32 = 256.0;
-    const ITEM_H: f32 = 27.0;
+    const MENU_W: f32 = 286.0;
+    const ITEM_H: f32 = 31.0;
     const SEP_H: f32 = 9.0;
     let est_h: f32 = 10.0
         + rows
@@ -226,7 +231,7 @@ pub fn render_context_menu(
                                 el.child(
                                     div()
                                         .flex_shrink_0()
-                                        .text_size(px(10.))
+                                        .text_size(px(12.))
                                         .text_color(solid(p.text_muted))
                                         .child(sc),
                                 )
@@ -239,18 +244,26 @@ pub fn render_context_menu(
 }
 
 fn build_rows(ws: &Workspace, target: &ContextMenuTarget) -> Vec<MenuRow> {
-    let has_textree =
-        texplorer_platform::find_textree_exe(ws.settings.textree_path.as_deref()).is_some();
-
     match target {
         ContextMenuTarget::Entry { side, entry } => {
             let mut rows = Vec::new();
             let is_dir = entry.is_dir();
+            let is_archive_file = !is_dir
+                && entry
+                    .location
+                    .as_local_path()
+                    .is_some_and(texplorer_vfs::archive::is_supported_archive);
             rows.push(MenuRow::Item {
                 id: "ctx-open",
-                label: "Open".into(),
+                label: if is_archive_file {
+                    "Browse Archive".into()
+                } else {
+                    "Open".into()
+                },
                 shortcut: Some("Enter"),
-                icon: MenuIcon::Lucide(if is_dir {
+                icon: MenuIcon::Lucide(if is_archive_file {
+                    LucideIcon::FileArchive
+                } else if is_dir {
                     LucideIcon::FolderOpen
                 } else {
                     LucideIcon::ExternalLink
@@ -267,14 +280,21 @@ fn build_rows(ws: &Workspace, target: &ContextMenuTarget) -> Vec<MenuRow> {
                 action: MenuAction::QuickLook,
             });
 
-            if is_dir {
+            if is_dir || is_archive_file {
+                let nav_target = if is_archive_file
+                    && let Some(path) = entry.location.as_local_path()
+                {
+                    Location::archive(path, "")
+                } else {
+                    entry.location.clone()
+                };
                 rows.push(MenuRow::Item {
                     id: "ctx-open-tab",
                     label: "Open in New Tab".into(),
                     shortcut: None,
                     icon: MenuIcon::Lucide(LucideIcon::Plus),
                     danger: false,
-                    action: MenuAction::OpenNewTab(entry.location.clone()),
+                    action: MenuAction::OpenNewTab(nav_target.clone()),
                 });
                 rows.push(MenuRow::Item {
                     id: "ctx-open-split",
@@ -282,7 +302,7 @@ fn build_rows(ws: &Workspace, target: &ContextMenuTarget) -> Vec<MenuRow> {
                     shortcut: None,
                     icon: MenuIcon::Lucide(LucideIcon::Columns2),
                     danger: false,
-                    action: MenuAction::OpenOppositePane(entry.location.clone()),
+                    action: MenuAction::OpenOppositePane(nav_target),
                 });
             }
 
@@ -291,6 +311,17 @@ fn build_rows(ws: &Workspace, target: &ContextMenuTarget) -> Vec<MenuRow> {
                 let mut selected_paths = ws.selected_local_paths(*side);
                 if selected_paths.is_empty() {
                     selected_paths.push(path_buf.clone());
+                }
+
+                if is_archive_file {
+                    rows.push(MenuRow::Item {
+                        id: "ctx-extract-here",
+                        label: "Extract Archive Here".into(),
+                        shortcut: None,
+                        icon: MenuIcon::Lucide(LucideIcon::Download),
+                        danger: false,
+                        action: MenuAction::ExtractArchiveHere(path_buf.clone()),
+                    });
                 }
 
                 rows.push(MenuRow::Separator);
@@ -329,6 +360,22 @@ fn build_rows(ws: &Workspace, target: &ContextMenuTarget) -> Vec<MenuRow> {
                     action: MenuAction::RenameEntry(*side, path_buf.clone(), entry.name.clone()),
                 });
                 rows.push(MenuRow::Item {
+                    id: "ctx-bulk-rename",
+                    label: "Bulk Rename...".into(),
+                    shortcut: Some("Ctrl+Shift+R"),
+                    icon: MenuIcon::Lucide(LucideIcon::Pencil),
+                    danger: false,
+                    action: MenuAction::BulkRename(*side),
+                });
+                rows.push(MenuRow::Item {
+                    id: "ctx-compress-zip",
+                    label: "Compress to ZIP".into(),
+                    shortcut: None,
+                    icon: MenuIcon::Lucide(LucideIcon::FileArchive),
+                    danger: false,
+                    action: MenuAction::CompressToZip(*side),
+                });
+                rows.push(MenuRow::Item {
                     id: "ctx-copy-path",
                     label: "Copy Path".into(),
                     shortcut: None,
@@ -336,6 +383,26 @@ fn build_rows(ws: &Workspace, target: &ContextMenuTarget) -> Vec<MenuRow> {
                     danger: false,
                     action: MenuAction::CopyPath(entry.location.display_path()),
                 });
+
+                if !is_dir {
+                    rows.push(MenuRow::Separator);
+                    rows.push(MenuRow::Item {
+                        id: "ctx-checksums",
+                        label: "Compute Checksums".into(),
+                        shortcut: None,
+                        icon: MenuIcon::Lucide(LucideIcon::ShieldCheck),
+                        danger: false,
+                        action: MenuAction::ComputeChecksums,
+                    });
+                    rows.push(MenuRow::Item {
+                        id: "ctx-file-locks",
+                        label: "Check File Locks".into(),
+                        shortcut: None,
+                        icon: MenuIcon::Lucide(LucideIcon::TriangleAlert),
+                        danger: false,
+                        action: MenuAction::CheckFileLocks,
+                    });
+                }
 
                 rows.push(MenuRow::Separator);
                 rows.push(MenuRow::Item {
@@ -354,16 +421,6 @@ fn build_rows(ws: &Workspace, target: &ContextMenuTarget) -> Vec<MenuRow> {
                     danger: false,
                     action: MenuAction::OpenEditor(path_buf.clone()),
                 });
-                if is_dir && has_textree {
-                    rows.push(MenuRow::Item {
-                        id: "ctx-textree",
-                        label: "Analyze in TexTree".into(),
-                        shortcut: None,
-                        icon: MenuIcon::Lucide(LucideIcon::HardDrive),
-                        danger: false,
-                        action: MenuAction::OpenTexTree(path_buf.clone()),
-                    });
-                }
                 if is_dir {
                     rows.push(MenuRow::Item {
                         id: "ctx-pin",
@@ -417,6 +474,32 @@ fn build_rows(ws: &Workspace, target: &ContextMenuTarget) -> Vec<MenuRow> {
                     icon: MenuIcon::Kit(IconName::Delete),
                     danger: true,
                     action: MenuAction::PermanentDeleteSelected(*side),
+                });
+            } else if let Location::Archive {
+                archive_path,
+                inner_path,
+            } = &entry.location
+            {
+                rows.push(MenuRow::Separator);
+                rows.push(MenuRow::Item {
+                    id: "ctx-arch-extract",
+                    label: "Extract Item(s)".into(),
+                    shortcut: None,
+                    icon: MenuIcon::Lucide(LucideIcon::Download),
+                    danger: false,
+                    action: MenuAction::ExtractArchiveSelection(
+                        *side,
+                        archive_path.clone(),
+                        inner_path.clone(),
+                    ),
+                });
+                rows.push(MenuRow::Item {
+                    id: "ctx-arch-copy-path",
+                    label: "Copy Path".into(),
+                    shortcut: None,
+                    icon: MenuIcon::Lucide(LucideIcon::Link),
+                    danger: false,
+                    action: MenuAction::CopyPath(entry.location.display_path()),
                 });
             }
             rows
@@ -555,7 +638,7 @@ fn build_rows(ws: &Workspace, target: &ContextMenuTarget) -> Vec<MenuRow> {
         }
         ContextMenuTarget::Volume(vol) => {
             let loc = Location::local(&vol.root_path);
-            let mut rows = vec![
+            vec![
                 MenuRow::Item {
                     id: "ctx-vol-open",
                     label: "Open Drive".into(),
@@ -589,26 +672,15 @@ fn build_rows(ws: &Workspace, target: &ContextMenuTarget) -> Vec<MenuRow> {
                     danger: false,
                     action: MenuAction::OpenTerminal(vol.root_path.clone()),
                 },
-            ];
-            if has_textree {
-                rows.push(MenuRow::Item {
-                    id: "ctx-vol-textree",
-                    label: "Analyze in TexTree".into(),
+                MenuRow::Item {
+                    id: "ctx-vol-props",
+                    label: "Drive Properties".into(),
                     shortcut: None,
-                    icon: MenuIcon::Lucide(LucideIcon::HardDrive),
+                    icon: MenuIcon::Lucide(LucideIcon::Settings),
                     danger: false,
-                    action: MenuAction::OpenTexTree(vol.root_path.clone()),
-                });
-            }
-            rows.push(MenuRow::Item {
-                id: "ctx-vol-props",
-                label: "Drive Properties".into(),
-                shortcut: None,
-                icon: MenuIcon::Lucide(LucideIcon::Settings),
-                danger: false,
-                action: MenuAction::ShowProperties(vol.root_path.clone()),
-            });
-            rows
+                    action: MenuAction::ShowProperties(vol.root_path.clone()),
+                },
+            ]
         }
     }
 }
@@ -630,12 +702,25 @@ fn execute_action(
         MenuAction::RenameEntry(side, path, current) => {
             ws.open_rename_prompt(side, path, current, window, cx);
         }
+        MenuAction::BulkRename(side) => ws.open_bulk_rename_for_pane(side, window, cx),
+        MenuAction::CompressToZip(side) => ws.compress_selected_to_zip(side, window, cx),
+        MenuAction::ExtractArchiveHere(archive_path) => {
+            ws.extract_archive_here(archive_path, window, cx);
+        }
+        MenuAction::ExtractArchiveSelection(side, archive_path, inner_path) => {
+            let mut inner_paths = ws.selected_archive_inner_paths(side, &archive_path);
+            if !inner_paths.iter().any(|p| p == &inner_path) {
+                inner_paths = vec![inner_path];
+            }
+            ws.extract_archive_item_to_target(archive_path, inner_paths, window, cx);
+        }
+        MenuAction::ComputeChecksums => ws.compute_checksums_for_selection(cx),
+        MenuAction::CheckFileLocks => ws.check_locks_for_selection(cx),
         MenuAction::NewFolder(side, dir) => ws.open_new_folder_prompt(side, dir, window, cx),
         MenuAction::NewFile(side, dir) => ws.open_new_file_prompt(side, dir, window, cx),
         MenuAction::CopyPath(text) => ws.copy_text_to_clipboard(&text, "Path copied", cx),
         MenuAction::OpenTerminal(path) => ws.open_terminal_at(&path, cx),
         MenuAction::OpenEditor(path) => ws.open_editor_at(&path, cx),
-        MenuAction::OpenTexTree(path) => ws.open_in_textree(&path, cx),
         MenuAction::PinFolder(path) => ws.pin_folder(path, cx),
         MenuAction::ShowWindowsMenu(paths) => ws.show_native_windows_menu(paths, cx),
         MenuAction::RevealInWindowsExplorer(path) => ws.reveal_in_windows_explorer(&path, cx),

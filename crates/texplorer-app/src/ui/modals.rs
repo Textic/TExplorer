@@ -876,7 +876,7 @@ fn render_settings_card(
                                                         .py_0p5()
                                                         .rounded(px(RADIUS_CONTROL))
                                                         .bg(soft_tint(svc_badge_hex, 0.14))
-                                                        .text_size(px(11.))
+                                                        .text_size(px(13.))
                                                         .font_medium()
                                                         .text_color(solid(svc_badge_hex))
                                                         .child(svc_badge_label),
@@ -1026,7 +1026,7 @@ fn render_settings_card(
                                                         .py_0p5()
                                                         .rounded(px(RADIUS_CONTROL))
                                                         .bg(soft_tint(status_hex, 0.14))
-                                                        .text_size(px(11.))
+                                                        .text_size(px(13.))
                                                         .font_medium()
                                                         .text_color(solid(status_hex))
                                                         .child(status_label),
@@ -1128,7 +1128,7 @@ fn render_settings_card(
                                                 )
                                                 .child(
                                                     div()
-                                                        .text_size(px(11.))
+                                                        .text_size(px(13.))
                                                         .text_color(solid(update_hex))
                                                         .child(update_summary),
                                                 ),
@@ -1204,7 +1204,7 @@ fn render_settings_card(
 
 fn section_heading(text: &'static str, p: Palette) -> impl IntoElement {
     div()
-        .text_size(px(11.))
+        .text_size(px(13.))
         .font_semibold()
         .text_color(solid(p.text_muted))
         .child(text)
@@ -1232,7 +1232,7 @@ fn setting_label_shared(
         )
         .child(
             div()
-                .text_size(px(11.))
+                .text_size(px(13.))
                 .text_color(solid(p.text_muted))
                 .child(subtitle),
         )

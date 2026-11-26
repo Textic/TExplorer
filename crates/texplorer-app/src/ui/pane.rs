@@ -65,7 +65,7 @@ pub fn render_pane(
             .id((side_tag, 100usize))
             .flex_1()
             .min_w(px(140.))
-            .h(px(28.))
+            .h(px(30.))
             .px_2()
             .items_center()
             .rounded(px(RADIUS_ROW))
@@ -92,7 +92,7 @@ pub fn render_pane(
             .id((side_tag, 102usize))
             .flex_1()
             .min_w(px(140.))
-            .h(px(28.))
+            .h(px(30.))
             .px_1p5()
             .gap_0p5()
             .items_center()
@@ -194,11 +194,11 @@ pub fn render_pane(
                 solid(p.border_subtle)
             }))
         })
-        // Pane Navigation Bar (38px flat strip)
+        // Pane Navigation Bar (40px flat strip)
         .child(
             h_flex()
                 .w_full()
-                .h(px(38.))
+                .h(px(40.))
                 .px_2()
                 .gap_1p5()
                 .flex_shrink_0()
@@ -262,8 +262,8 @@ pub fn render_pane(
                 .when(!is_home, |el| {
                     el.child(
                         h_flex()
-                            .w(px(164.))
-                            .h(px(28.))
+                            .w(px(186.))
+                            .h(px(30.))
                             .px_2()
                             .gap_1()
                             .flex_shrink_0()
@@ -420,7 +420,7 @@ pub fn render_pane(
             el.child(
                 h_flex()
                     .w_full()
-                    .h(px(24.))
+                    .h(px(28.))
                     .px_3()
                     .flex_shrink_0()
                     .items_center()
@@ -431,7 +431,7 @@ pub fn render_pane(
                     .child(
                         div()
                             .truncate()
-                            .text_size(px(11.))
+                            .text_size(px(13.))
                             .text_color(if has_err {
                                 solid(p.status_error)
                             } else {
@@ -447,7 +447,7 @@ pub fn render_pane(
                                 .bg(solid(p.bg_elevated))
                                 .border_1()
                                 .border_color(solid(p.border))
-                                .text_size(px(10.))
+                                .text_size(px(12.))
                                 .text_color(solid(p.text_secondary))
                                 .child("Filtered"),
                         )

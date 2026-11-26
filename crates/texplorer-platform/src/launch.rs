@@ -273,26 +273,3 @@ fn remove_dir_readonly(path: &Path) -> Result<(), String> {
         Err(e) => Err(format!("Failed to delete folder \"{}\": {e}", path.display())),
     }
 }
-
-/// Locates `textree.exe` either from user settings or common sibling/install locations.
-pub fn find_textree_exe(configured: Option<&Path>) -> Option<PathBuf> {
-    if let Some(p) = configured
-        && p.is_file()
-    {
-        return Some(p.to_path_buf());
-    }
-
-    let mut candidates = Vec::new();
-    if let Ok(exe) = std::env::current_exe()
-        && let Some(dir) = exe.parent()
-    {
-        candidates.push(dir.join("textree.exe"));
-    }
-    if let Some(local) = dirs::data_local_dir() {
-        candidates.push(local.join("Programs").join("TexTree").join("textree.exe"));
-    }
-    candidates.push(PathBuf::from(r"X:\TexTree\target\release\textree.exe"));
-    candidates.push(PathBuf::from(r"X:\TexTree\target\debug\textree.exe"));
-
-    candidates.into_iter().find(|p| p.is_file())
-}
