@@ -54,8 +54,12 @@ enum MenuIcon {
 #[derive(Clone)]
 enum MenuAction {
     OpenEntry(Location, bool),
+    QuickLook,
     OpenNewTab(Location),
     OpenOppositePane(Location),
+    CutSelected(PaneSide),
+    CopySelected(PaneSide),
+    PasteInto(PathBuf),
     RenameEntry(PaneSide, PathBuf, String),
     NewFolder(PaneSide, PathBuf),
     NewFile(PaneSide, PathBuf),
@@ -64,6 +68,7 @@ enum MenuAction {
     OpenEditor(PathBuf),
     OpenTexTree(PathBuf),
     PinFolder(PathBuf),
+    ShowWindowsMenu(Vec<PathBuf>),
     RevealInWindowsExplorer(PathBuf),
     ShowProperties(PathBuf),
     TrashSelected(PaneSide),
@@ -84,8 +89,8 @@ pub fn render_context_menu(
         return div().into_any_element();
     }
 
-    const MENU_W: f32 = 248.0;
-    const ITEM_H: f32 = 28.0;
+    const MENU_W: f32 = 256.0;
+    const ITEM_H: f32 = 27.0;
     const SEP_H: f32 = 9.0;
     let est_h: f32 = 10.0
         + rows
@@ -106,11 +111,16 @@ pub fn render_context_menu(
         .id("ctx-menu-overlay")
         .absolute()
         .inset_0()
+        .occlude()
         .child(
             div()
                 .id("ctx-menu-backdrop")
                 .absolute()
                 .inset_0()
+                .occlude()
+                .on_scroll(|_, _, cx| {
+                    cx.stop_propagation();
+                })
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(|this, _: &MouseDownEvent, _, cx| {
@@ -119,6 +129,12 @@ pub fn render_context_menu(
                 )
                 .on_mouse_down(
                     MouseButton::Right,
+                    cx.listener(|this, _: &MouseDownEvent, _, cx| {
+                        this.dismiss_context_menu(cx);
+                    }),
+                )
+                .on_mouse_down(
+                    MouseButton::Middle,
                     cx.listener(|this, _: &MouseDownEvent, _, cx| {
                         this.dismiss_context_menu(cx);
                     }),
@@ -136,6 +152,7 @@ pub fn render_context_menu(
                 .border_1()
                 .border_color(solid(BORDER))
                 .rounded(px(RADIUS_ROW))
+                .occlude()
                 .children(rows.into_iter().map(|row| match row {
                     MenuRow::Separator => div()
                         .w_full()
@@ -216,7 +233,8 @@ pub fn render_context_menu(
 }
 
 fn build_rows(ws: &Workspace, target: &ContextMenuTarget) -> Vec<MenuRow> {
-    let has_textree = texplorer_platform::find_textree_exe(ws.settings.textree_path.as_deref()).is_some();
+    let has_textree =
+        texplorer_platform::find_textree_exe(ws.settings.textree_path.as_deref()).is_some();
 
     match target {
         ContextMenuTarget::Entry { side, entry } => {
@@ -233,6 +251,14 @@ fn build_rows(ws: &Workspace, target: &ContextMenuTarget) -> Vec<MenuRow> {
                 }),
                 danger: false,
                 action: MenuAction::OpenEntry(entry.location.clone(), is_dir),
+            });
+            rows.push(MenuRow::Item {
+                id: "ctx-quicklook",
+                label: "QuickLook Preview".into(),
+                shortcut: Some("Space"),
+                icon: MenuIcon::Lucide(LucideIcon::Eye),
+                danger: false,
+                action: MenuAction::QuickLook,
             });
 
             if is_dir {
@@ -256,7 +282,38 @@ fn build_rows(ws: &Workspace, target: &ContextMenuTarget) -> Vec<MenuRow> {
 
             if let Some(path) = entry.location.as_local_path() {
                 let path_buf = path.to_path_buf();
+                let mut selected_paths = ws.selected_local_paths(*side);
+                if selected_paths.is_empty() {
+                    selected_paths.push(path_buf.clone());
+                }
+
                 rows.push(MenuRow::Separator);
+                rows.push(MenuRow::Item {
+                    id: "ctx-cut",
+                    label: "Cut".into(),
+                    shortcut: Some("Ctrl+X"),
+                    icon: MenuIcon::Lucide(LucideIcon::Scissors),
+                    danger: false,
+                    action: MenuAction::CutSelected(*side),
+                });
+                rows.push(MenuRow::Item {
+                    id: "ctx-copy",
+                    label: "Copy".into(),
+                    shortcut: Some("Ctrl+C"),
+                    icon: MenuIcon::Lucide(LucideIcon::Copy),
+                    danger: false,
+                    action: MenuAction::CopySelected(*side),
+                });
+                if is_dir {
+                    rows.push(MenuRow::Item {
+                        id: "ctx-paste-into",
+                        label: "Paste Into Folder".into(),
+                        shortcut: None,
+                        icon: MenuIcon::Lucide(LucideIcon::Clipboard),
+                        danger: false,
+                        action: MenuAction::PasteInto(path_buf.clone()),
+                    });
+                }
                 rows.push(MenuRow::Item {
                     id: "ctx-rename",
                     label: "Rename".into(),
@@ -269,7 +326,7 @@ fn build_rows(ws: &Workspace, target: &ContextMenuTarget) -> Vec<MenuRow> {
                     id: "ctx-copy-path",
                     label: "Copy Path".into(),
                     shortcut: None,
-                    icon: MenuIcon::Lucide(LucideIcon::Copy),
+                    icon: MenuIcon::Lucide(LucideIcon::Link),
                     danger: false,
                     action: MenuAction::CopyPath(entry.location.display_path()),
                 });
@@ -314,10 +371,18 @@ fn build_rows(ws: &Workspace, target: &ContextMenuTarget) -> Vec<MenuRow> {
 
                 rows.push(MenuRow::Separator);
                 rows.push(MenuRow::Item {
+                    id: "ctx-win-shell-menu",
+                    label: "Show Windows Menu".into(),
+                    shortcut: Some("Shift+RClick"),
+                    icon: MenuIcon::Lucide(LucideIcon::ExternalLink),
+                    danger: false,
+                    action: MenuAction::ShowWindowsMenu(selected_paths),
+                });
+                rows.push(MenuRow::Item {
                     id: "ctx-win-explorer",
                     label: "Reveal in Windows Explorer".into(),
                     shortcut: None,
-                    icon: MenuIcon::Lucide(LucideIcon::ExternalLink),
+                    icon: MenuIcon::Lucide(LucideIcon::Folder),
                     danger: false,
                     action: MenuAction::RevealInWindowsExplorer(path_buf.clone()),
                 });
@@ -351,6 +416,15 @@ fn build_rows(ws: &Workspace, target: &ContextMenuTarget) -> Vec<MenuRow> {
             rows
         }
         ContextMenuTarget::PaneBackground { side, directory } => vec![
+            MenuRow::Item {
+                id: "ctx-bg-paste",
+                label: "Paste".into(),
+                shortcut: Some("Ctrl+V"),
+                icon: MenuIcon::Lucide(LucideIcon::Clipboard),
+                danger: false,
+                action: MenuAction::PasteInto(directory.clone()),
+            },
+            MenuRow::Separator,
             MenuRow::Item {
                 id: "ctx-bg-new-folder",
                 label: "New Folder".into(),
@@ -401,6 +475,14 @@ fn build_rows(ws: &Workspace, target: &ContextMenuTarget) -> Vec<MenuRow> {
                 action: MenuAction::PinFolder(directory.clone()),
             },
             MenuRow::Separator,
+            MenuRow::Item {
+                id: "ctx-bg-win-menu",
+                label: "Show Windows Menu".into(),
+                shortcut: None,
+                icon: MenuIcon::Lucide(LucideIcon::ExternalLink),
+                danger: false,
+                action: MenuAction::ShowWindowsMenu(vec![directory.clone()]),
+            },
             MenuRow::Item {
                 id: "ctx-bg-props",
                 label: "Folder Properties".into(),
@@ -533,8 +615,12 @@ fn execute_action(
 ) {
     match action {
         MenuAction::OpenEntry(loc, is_dir) => ws.open_location_or_file(loc, is_dir, window, cx),
+        MenuAction::QuickLook => ws.toggle_quicklook(cx),
         MenuAction::OpenNewTab(loc) => ws.open_new_tab(loc, window, cx),
         MenuAction::OpenOppositePane(loc) => ws.open_in_opposite_pane(loc, window, cx),
+        MenuAction::CutSelected(side) => ws.copy_or_cut_selected(side, true, window, cx),
+        MenuAction::CopySelected(side) => ws.copy_or_cut_selected(side, false, window, cx),
+        MenuAction::PasteInto(dir) => ws.paste_clipboard_into(dir, window, cx),
         MenuAction::RenameEntry(side, path, current) => {
             ws.open_rename_prompt(side, path, current, window, cx);
         }
@@ -545,6 +631,7 @@ fn execute_action(
         MenuAction::OpenEditor(path) => ws.open_editor_at(&path, cx),
         MenuAction::OpenTexTree(path) => ws.open_in_textree(&path, cx),
         MenuAction::PinFolder(path) => ws.pin_folder(path, cx),
+        MenuAction::ShowWindowsMenu(paths) => ws.show_native_windows_menu(paths, cx),
         MenuAction::RevealInWindowsExplorer(path) => ws.reveal_in_windows_explorer(&path, cx),
         MenuAction::ShowProperties(path) => ws.show_properties_for(&path, cx),
         MenuAction::TrashSelected(side) => ws.trash_selected(side, window, cx),

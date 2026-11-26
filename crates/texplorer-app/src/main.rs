@@ -1,5 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod preview;
 mod theme;
 mod ui;
 mod updater;
@@ -18,10 +19,11 @@ use texplorer_platform::{
 };
 
 use crate::ui::workspace::{
-    CancelOrDismiss, CloseTab, CreateNewFolder, DeletePermanent, DeleteToTrash, FocusAddressBar,
-    FocusFilter, GoBack, GoForward, GoUp, NewTab, NextTab, OpenSettings, PrevTab, Quit, RefreshPane,
-    RenameSelected, SelectAllItems, SwitchActivePane, ToggleHiddenFiles, ToggleInspector,
-    ToggleSidebar, ToggleSplitPane, Workspace,
+    CancelOrDismiss, CloseTab, CopySelected, CreateNewFolder, CutSelected, DeletePermanent,
+    DeleteToTrash, FocusAddressBar, FocusFilter, GoBack, GoForward, GoUp, NewTab, NextTab,
+    OpenSettings, PasteItems, PrevTab, Quit, RedoActionCmd, RefreshPane, RenameSelected,
+    SelectAllItems, SwitchActivePane, ToggleHiddenFiles, ToggleInspector, ToggleSidebar,
+    ToggleSplitPane, UndoActionCmd, Workspace,
 };
 
 icon_assets!(
@@ -34,6 +36,7 @@ icon_assets!(
         ChevronDown,
         ChevronRight,
         ChevronUp,
+        Clipboard,
         Code,
         Columns2,
         Copy,
@@ -63,15 +66,21 @@ icon_assets!(
         Music,
         Network,
         Package,
+        Pause,
         Pencil,
         Pin,
         PinOff,
+        Play,
         Plus,
+        Redo2,
         RefreshCw,
+        Scissors,
         Search,
         Settings,
         ShieldCheck,
         Terminal,
+        TriangleAlert,
+        Undo2,
         Usb,
         X,
     ]
@@ -160,6 +169,12 @@ fn main() {
                 KeyBinding::new("alt-p", ToggleInspector, Some("TExplorerWorkspace")),
                 KeyBinding::new("ctrl-h", ToggleHiddenFiles, Some("TExplorerWorkspace")),
                 KeyBinding::new("ctrl-a", SelectAllItems, Some("TExplorerWorkspace")),
+                KeyBinding::new("ctrl-c", CopySelected, Some("TExplorerWorkspace")),
+                KeyBinding::new("ctrl-x", CutSelected, Some("TExplorerWorkspace")),
+                KeyBinding::new("ctrl-v", PasteItems, Some("TExplorerWorkspace")),
+                KeyBinding::new("ctrl-z", UndoActionCmd, Some("TExplorerWorkspace")),
+                KeyBinding::new("ctrl-y", RedoActionCmd, Some("TExplorerWorkspace")),
+                KeyBinding::new("ctrl-shift-z", RedoActionCmd, Some("TExplorerWorkspace")),
                 KeyBinding::new("ctrl-shift-n", CreateNewFolder, Some("TExplorerWorkspace")),
                 KeyBinding::new("f2", RenameSelected, Some("TExplorerWorkspace")),
                 KeyBinding::new("delete", DeleteToTrash, Some("TExplorerWorkspace")),
@@ -189,6 +204,6 @@ fn main() {
                 let rx = ipc_rx_opt.take().expect("single window initialization");
                 cx.new(|cx| Workspace::new(settings_for_window, intent_for_window, rx, window, cx))
             })
-            .expect("failed to open T Explorer window");
+            .expect("failed to open TExplorer window");
         });
 }

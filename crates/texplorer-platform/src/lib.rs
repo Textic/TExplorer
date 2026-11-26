@@ -1,5 +1,7 @@
 //! Platform abstraction and native Windows integration for T Explorer.
 
+pub mod clipboard;
+pub mod com_shell;
 pub mod default_explorer;
 pub mod elevation;
 pub mod launch;
@@ -7,6 +9,8 @@ pub mod single_instance;
 pub mod volumes;
 pub mod watcher;
 
+pub use clipboard::{ClipboardFiles, get_clipboard_files, set_clipboard_files};
+pub use com_shell::{RawBgraImage, ShellWorker, cursor_screen_pos};
 pub use default_explorer::{
     DefaultExplorerStatus, delegate_to_windows_explorer, enable_default_explorer,
     query_default_explorer_status, restore_windows_explorer, should_delegate_to_windows_explorer,
