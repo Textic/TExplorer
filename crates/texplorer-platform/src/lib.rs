@@ -10,12 +10,14 @@ pub mod single_instance;
 pub mod theme_detect;
 pub mod volumes;
 pub mod watcher;
+pub mod win_e_hook;
 
 pub use clipboard::{ClipboardFiles, get_clipboard_files, set_clipboard_files};
 pub use com_shell::{RawBgraImage, ShellWorker, cursor_screen_pos};
 pub use default_explorer::{
     DefaultExplorerStatus, delegate_to_windows_explorer, enable_default_explorer,
-    query_default_explorer_status, restore_windows_explorer, should_delegate_to_windows_explorer,
+    query_default_explorer_status, restore_windows_explorer, set_win_e_interception,
+    should_delegate_to_windows_explorer,
 };
 pub use elevation::is_elevated;
 pub use launch::{
@@ -30,3 +32,7 @@ pub use single_instance::{
 pub use theme_detect::system_prefers_dark_mode;
 pub use volumes::{list_known_folders, list_volumes, list_wsl_distros};
 pub use watcher::{DirectoryWatcher, WatchEvent};
+pub use win_e_hook::{
+    bring_current_process_window_to_front, ensure_win_e_daemon_running, is_win_e_daemon_running,
+    run_win_e_daemon, start_win_e_daemon, stop_win_e_daemon,
+};
