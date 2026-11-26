@@ -16,7 +16,12 @@ use image::{
 };
 use smallvec::{SmallVec, smallvec};
 use texplorer_core::FileKind;
-use texplorer_platform::{RawBgraImage, ShellWorker};
+use texplorer_platform::{
+    RawBgraImage, RenderedPdfPage, ShellWorker, render_pdf_page_from_bytes,
+    render_pdf_page_from_path,
+};
+
+pub const PDF_PREVIEW_MAX_DIM: u32 = 1400;
 
 use crate::theme::{Palette, solid};
 
@@ -239,6 +244,14 @@ pub enum PreviewPayload {
         orig_height: u32,
         frame_count: usize,
     },
+    Pdf {
+        image: Arc<RenderImage>,
+        page_index: u32,
+        page_count: u32,
+        page_width: u32,
+        page_height: u32,
+        loading_page: Option<u32>,
+    },
     ShellThumbnail {
         image: Arc<RenderImage>,
         subtitle: String,
@@ -261,6 +274,47 @@ pub enum PreviewPayload {
     Unsupported {
         reason: String,
     },
+}
+
+fn rendered_pdf_to_payload(rendered: RenderedPdfPage) -> Result<PreviewPayload, String> {
+    let dyn_img = image::load_from_memory(&rendered.png_bytes)
+        .map_err(|e| format!("Failed decoding rendered PDF page: {e}"))?;
+    let mut rgba = dyn_img.to_rgba8();
+    let page_width = rgba.width();
+    let page_height = rgba.height();
+    for px in rgba.pixels_mut() {
+        px.0.swap(0, 2);
+    }
+    let frame = Frame::new(rgba);
+    Ok(PreviewPayload::Pdf {
+        image: Arc::new(RenderImage::new(smallvec![frame])),
+        page_index: rendered.page_index,
+        page_count: rendered.page_count,
+        page_width,
+        page_height,
+        loading_page: None,
+    })
+}
+
+/// Renders a specific zero-based page of a local PDF file into a GPUI `PreviewPayload::Pdf`.
+pub fn decode_pdf_page_from_path(
+    path: &Path,
+    page_index: u32,
+    max_dim: u32,
+) -> Result<PreviewPayload, String> {
+    let rendered = render_pdf_page_from_path(path, page_index, max_dim)?;
+    rendered_pdf_to_payload(rendered)
+}
+
+/// Renders a specific zero-based page of an in-memory PDF buffer (e.g. from an archive or SFTP/FTP)
+/// into a GPUI `PreviewPayload::Pdf`.
+pub fn decode_pdf_page_from_bytes(
+    bytes: &[u8],
+    page_index: u32,
+    max_dim: u32,
+) -> Result<PreviewPayload, String> {
+    let rendered = render_pdf_page_from_bytes(bytes, page_index, max_dim)?;
+    rendered_pdf_to_payload(rendered)
 }
 
 /// Loads a preview payload for `path` on a background worker thread.
@@ -292,6 +346,14 @@ pub fn load_preview_blocking(
             orig_height,
             frame_count,
         };
+    }
+
+    // 1b. Native Windows WinRT PDF rendering (multi-page capable in QuickLook).
+    if ext == "pdf" {
+        match decode_pdf_page_from_path(&path, 0, PDF_PREVIEW_MAX_DIM) {
+            Ok(payload) => return payload,
+            Err(reason) => return PreviewPayload::Unsupported { reason },
+        }
     }
 
     // 2. Markdown documents rendered via GPUI `TextView::markdown`.
@@ -420,6 +482,17 @@ pub fn load_archive_entry_preview_blocking(
         }
     }
 
+    // PDF documents inside archive (up to 16 MiB)
+    if ext == "pdf"
+        && let Ok((bytes, false)) =
+            texplorer_vfs::archive::read_archive_entry_bytes(&archive_path, &inner_path, 16 * 1024 * 1024)
+    {
+        return match decode_pdf_page_from_bytes(&bytes, 0, PDF_PREVIEW_MAX_DIM) {
+            Ok(payload) => payload,
+            Err(reason) => PreviewPayload::Unsupported { reason },
+        };
+    }
+
     // Markdown or source code inside archive (up to 192 KiB)
     if let Ok((bytes, truncated)) =
         texplorer_vfs::archive::read_archive_entry_bytes(&archive_path, &inner_path, 192 * 1024)
@@ -501,6 +574,13 @@ pub fn preview_from_remote_bytes(
                 frame_count: 1,
             };
         }
+    }
+
+    if !truncated && ext == "pdf" {
+        return match decode_pdf_page_from_bytes(&bytes, 0, PDF_PREVIEW_MAX_DIM) {
+            Ok(payload) => payload,
+            Err(reason) => PreviewPayload::Unsupported { reason },
+        };
     }
 
     if !bytes.contains(&0)

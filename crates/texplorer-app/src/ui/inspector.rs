@@ -729,6 +729,41 @@ fn render_inline_preview(
                     }),
             )
             .into_any_element(),
+        PreviewPayload::Pdf {
+            image,
+            page_count,
+            ..
+        } => v_flex()
+            .w_full()
+            .items_center()
+            .gap_1()
+            .child(
+                div()
+                    .w_full()
+                    .h(px(172.))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .overflow_hidden()
+                    .child(
+                        img(image.clone())
+                            .id(("insp-preview-pdf", preview_gen))
+                            .max_w_full()
+                            .max_h_full()
+                            .object_fit(ObjectFit::Contain),
+                    ),
+            )
+            .child(
+                div()
+                    .text_size(px(12.))
+                    .text_color(solid(p.text_muted))
+                    .child(if *page_count == 1 {
+                        "PDF Document  •  1 page".to_string()
+                    } else {
+                        format!("PDF Document  •  {page_count} pages")
+                    }),
+            )
+            .into_any_element(),
         PreviewPayload::ShellThumbnail { image, .. } => div()
             .w_full()
             .h(px(148.))

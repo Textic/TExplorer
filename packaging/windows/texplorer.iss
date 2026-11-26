@@ -1,5 +1,5 @@
 #ifndef MyAppVersion
-  #define MyAppVersion "0.7.1"
+  #define MyAppVersion "0.7.2"
 #endif
 #ifndef BinaryPath
   #define BinaryPath "..\..\target\release\texplorer.exe"
@@ -11,7 +11,7 @@
   #define OutputDir "..\..\dist"
 #endif
 #ifndef OutputBaseFilename
-  #define OutputBaseFilename "texplorer-v0.7.1-windows-x86_64-setup"
+  #define OutputBaseFilename "texplorer-v0.7.2-windows-x86_64-setup"
 #endif
 
 [Setup]

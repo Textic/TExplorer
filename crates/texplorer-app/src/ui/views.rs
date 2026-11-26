@@ -926,7 +926,9 @@ fn render_details_rows(
                     }
                 })
                 .when_some(drag_payload, |el, payload| {
+                    let outbound_slot = ws.active_local_drag_paths.clone();
                     el.on_drag(payload, move |drag, cursor_offset, _, cx| {
+                        *outbound_slot.borrow_mut() = Some(drag.paths.clone());
                         cx.new(|_| DragBadgeView {
                             label: drag.label.clone(),
                             palette: p,
@@ -1398,7 +1400,9 @@ fn render_grid_rows(
                                 }
                             })
                             .when_some(drag_payload, |el, payload| {
+                                let outbound_slot = ws.active_local_drag_paths.clone();
                                 el.on_drag(payload, move |drag, cursor_offset, _, cx| {
+                                    *outbound_slot.borrow_mut() = Some(drag.paths.clone());
                                     cx.new(|_| DragBadgeView {
                                         label: drag.label.clone(),
                                         palette: p,
@@ -1721,7 +1725,9 @@ fn render_compact_rows(
                     }
                 })
                 .when_some(drag_payload, |el, payload| {
+                    let outbound_slot = ws.active_local_drag_paths.clone();
                     el.on_drag(payload, move |drag, cursor_offset, _, cx| {
+                        *outbound_slot.borrow_mut() = Some(drag.paths.clone());
                         cx.new(|_| DragBadgeView {
                             label: drag.label.clone(),
                             palette: p,

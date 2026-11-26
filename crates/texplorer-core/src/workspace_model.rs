@@ -122,6 +122,26 @@ impl SelectionSet {
         Some(next)
     }
 
+    /// Jumps to the first (`to_end = false`) or last (`to_end = true`) item in the list.
+    /// When `extend` is `true` (e.g. `Ctrl+Shift+Down` / `Ctrl+Shift+Up` / `Shift+End` / `Shift+Home`),
+    /// selects every item between the current anchor/cursor and that boundary.
+    pub fn select_to_boundary(&mut self, to_end: bool, total: usize, extend: bool) -> Option<usize> {
+        if total == 0 {
+            self.clear();
+            return None;
+        }
+        let target = if to_end { total - 1 } else { 0 };
+        if extend {
+            if self.anchor.is_none() {
+                self.anchor = self.cursor.or(Some(if to_end { 0 } else { total - 1 }));
+            }
+            self.select_range(target, false);
+        } else {
+            self.select_only(target);
+        }
+        Some(target)
+    }
+
     /// Ensures indices stay valid after the visible list shrinks or reloads.
     pub fn clamp_to(&mut self, total: usize) {
         self.selected.retain(|&idx| idx < total);
@@ -216,11 +236,44 @@ impl PaneModel {
     pub fn go_back(&mut self) -> Option<Location> {
         let prev = self.history_back.pop()?;
         let cur = std::mem::replace(&mut self.location, prev.clone());
+        // If stepping back to the immediate parent folder, highlight the child folder we came from
+        // so keyboard users can seamlessly press Down/Right into sibling folders.
+        let child_name = if cur.parent().as_ref() == Some(&prev) {
+            match &cur {
+                Location::Local(p) => p.file_name().map(|n| n.to_string_lossy().into_owned()),
+                Location::Archive {
+                    archive_path,
+                    inner_path,
+                } => {
+                    if inner_path.is_empty() {
+                        archive_path
+                            .file_name()
+                            .map(|n| n.to_string_lossy().into_owned())
+                    } else {
+                        inner_path
+                            .trim_end_matches('/')
+                            .rsplit('/')
+                            .next()
+                            .map(|s| s.to_string())
+                    }
+                }
+                Location::Remote { remote_path, .. } => remote_path
+                    .trim_end_matches('/')
+                    .rsplit('/')
+                    .next()
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.to_string()),
+                _ => None,
+            }
+        } else {
+            None
+        };
         self.history_forward.push(cur);
         self.quick_filter.clear();
         self.selection.clear();
         self.selected_bytes = 0;
         self.error = None;
+        self.pending_select_name = child_name;
         Some(prev)
     }
 
@@ -512,6 +565,24 @@ mod tests {
 
         sel.move_cursor(1, 5, false);
         assert_eq!(sel.selected.iter().copied().collect::<Vec<_>>(), vec![3]);
+
+        // Ctrl+Shift+Down from index 3 selects 3..=7 (anchor stays at 3).
+        assert_eq!(sel.select_to_boundary(true, 8, true), Some(7));
+        assert_eq!(
+            sel.selected.iter().copied().collect::<Vec<_>>(),
+            vec![3, 4, 5, 6, 7]
+        );
+        assert_eq!(sel.anchor, Some(3));
+        assert_eq!(sel.cursor, Some(7));
+
+        // Flipping immediately to Ctrl+Shift+Up selects 0..=3 around the same anchor.
+        assert_eq!(sel.select_to_boundary(false, 8, true), Some(0));
+        assert_eq!(
+            sel.selected.iter().copied().collect::<Vec<_>>(),
+            vec![0, 1, 2, 3]
+        );
+        assert_eq!(sel.anchor, Some(3));
+        assert_eq!(sel.cursor, Some(0));
     }
 
     #[test]
