@@ -14,24 +14,23 @@ use texplorer_core::EntryFlags;
 
 use crate::preview::PreviewPayload;
 use crate::theme::{
-    BG_BASE, BG_ELEVATED, BG_SURFACE, BORDER_SUBTLE, RADIUS_CONTROL, RADIUS_ROW, TEXT_MUTED,
-    TEXT_PRIMARY, TEXT_SECONDARY, file_kind_visual, format_size, format_timestamp, soft_tint,
-    solid,
+    Palette, RADIUS_CONTROL, RADIUS_ROW, file_kind_visual, format_size, format_timestamp,
+    soft_tint, solid,
 };
 use crate::ui::workspace::Workspace;
 
 /// Renders the collapsible right-hand Preview & Inspector panel (`Alt+P`) with live inline preview.
 pub fn render_inspector(ws: &Workspace, cx: &mut Context<Workspace>) -> impl IntoElement {
-    let accent = ws.settings.accent;
+    let p = ws.palette();
     let unit = ws.settings.size_unit;
     let active_pane = ws.active_tab().map(|t| t.model.active_pane_ref());
-    let primary = active_pane.and_then(|p| p.primary_selected_entry()).cloned();
-    let sel_count = active_pane.map(|p| p.selection.len()).unwrap_or(0);
+    let primary = active_pane.and_then(|pane| pane.primary_selected_entry()).cloned();
+    let sel_count = active_pane.map(|pane| pane.selection.len()).unwrap_or(0);
 
     v_flex()
         .id("inspector-panel")
         .size_full()
-        .bg(solid(BG_SURFACE))
+        .bg(solid(p.bg_surface))
         .overflow_hidden()
         .child(
             h_flex()
@@ -42,12 +41,12 @@ pub fn render_inspector(ws: &Workspace, cx: &mut Context<Workspace>) -> impl Int
                 .items_center()
                 .justify_between()
                 .border_b_1()
-                .border_color(solid(BORDER_SUBTLE))
+                .border_color(solid(p.border_subtle))
                 .child(
                     div()
                         .text_xs()
                         .font_semibold()
-                        .text_color(solid(TEXT_SECONDARY))
+                        .text_color(solid(p.text_secondary))
                         .child("INSPECTOR"),
                 )
                 .child(
@@ -89,18 +88,18 @@ pub fn render_inspector(ws: &Workspace, cx: &mut Context<Workspace>) -> impl Int
                     div()
                         .text_sm()
                         .font_semibold()
-                        .text_color(solid(TEXT_PRIMARY))
+                        .text_color(solid(p.text_primary))
                         .child("No selection"),
                 )
                 .child(
                     div()
                         .text_xs()
-                        .text_color(solid(TEXT_MUTED))
+                        .text_color(solid(p.text_muted))
                         .child("Select a file or folder to inspect or press Space for QuickLook."),
                 )
                 .into_any_element(),
             Some(entry) => {
-                let (icon, icon_hex) = file_kind_visual(entry.kind, accent);
+                let (icon, icon_hex) = file_kind_visual(entry.kind, p);
                 let name: SharedString = entry.name.clone().into();
                 let type_label: SharedString = entry.type_label.clone().into();
                 let path_str: SharedString = entry.location.display_path().into();
@@ -111,14 +110,14 @@ pub fn render_inspector(ws: &Workspace, cx: &mut Context<Workspace>) -> impl Int
                     .into();
                 let modified_str: SharedString = format_timestamp(entry.modified_secs).into();
                 let created_str: SharedString = format_timestamp(entry.created_secs).into();
-                let local_path = entry.location.as_local_path().map(|p| p.to_path_buf());
+                let local_path = entry.location.as_local_path().map(|path| path.to_path_buf());
                 let is_dir = entry.is_dir();
 
-                let matches_preview = local_path.as_ref().is_some_and(|p| {
-                    ws.preview_path.as_ref().is_some_and(|pp| pp == p)
+                let matches_preview = local_path.as_ref().is_some_and(|path| {
+                    ws.preview_path.as_ref().is_some_and(|pp| pp == path)
                 });
                 let preview_visual = if matches_preview {
-                    render_inline_preview(&ws.preview_payload, icon, icon_hex, unit)
+                    render_inline_preview(&ws.preview_payload, icon, icon_hex, unit, p)
                         .into_any_element()
                 } else {
                     render_icon_box(icon, icon_hex).into_any_element()
@@ -148,7 +147,7 @@ pub fn render_inspector(ws: &Workspace, cx: &mut Context<Workspace>) -> impl Int
                 let copy_path = entry.location.display_path();
                 let term_path = local_path.clone();
                 let props_path = local_path.clone();
-                let pin_path = local_path.clone();
+                let pin_path = local_path;
 
                 v_flex()
                     .flex_1()
@@ -166,9 +165,9 @@ pub fn render_inspector(ws: &Workspace, cx: &mut Context<Workspace>) -> impl Int
                             .items_center()
                             .rounded(px(RADIUS_ROW))
                             .cursor_pointer()
-                            .bg(solid(BG_BASE))
+                            .bg(solid(p.bg_base))
                             .border_1()
-                            .border_color(solid(BORDER_SUBTLE))
+                            .border_color(solid(p.border_subtle))
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.toggle_quicklook(cx);
                             }))
@@ -180,13 +179,13 @@ pub fn render_inspector(ws: &Workspace, cx: &mut Context<Workspace>) -> impl Int
                                     .text_center()
                                     .text_sm()
                                     .font_semibold()
-                                    .text_color(solid(TEXT_PRIMARY))
+                                    .text_color(solid(p.text_primary))
                                     .child(name),
                             )
                             .child(
                                 div()
                                     .text_xs()
-                                    .text_color(solid(TEXT_MUTED))
+                                    .text_color(solid(p.text_muted))
                                     .child(if sel_count > 1 {
                                         SharedString::from(format!(
                                             "{} (+{} more selected)",
@@ -203,13 +202,13 @@ pub fn render_inspector(ws: &Workspace, cx: &mut Context<Workspace>) -> impl Int
                         v_flex()
                             .w_full()
                             .rounded(px(RADIUS_ROW))
-                            .bg(solid(BG_BASE))
+                            .bg(solid(p.bg_base))
                             .border_1()
-                            .border_color(solid(BORDER_SUBTLE))
+                            .border_color(solid(p.border_subtle))
                             .overflow_hidden()
-                            .child(meta_row("Size", size_str))
-                            .child(meta_row("Modified", modified_str))
-                            .child(meta_row("Created", created_str))
+                            .child(meta_row("Size", size_str, p))
+                            .child(meta_row("Modified", modified_str, p))
+                            .child(meta_row("Created", created_str, p))
                             .child(
                                 v_flex()
                                     .p_2p5()
@@ -217,13 +216,13 @@ pub fn render_inspector(ws: &Workspace, cx: &mut Context<Workspace>) -> impl Int
                                     .child(
                                         div()
                                             .text_size(px(11.))
-                                            .text_color(solid(TEXT_MUTED))
+                                            .text_color(solid(p.text_muted))
                                             .child("Location"),
                                     )
                                     .child(
                                         div()
                                             .text_xs()
-                                            .text_color(solid(TEXT_SECONDARY))
+                                            .text_color(solid(p.text_secondary))
                                             .child(path_str),
                                     ),
                             ),
@@ -239,11 +238,11 @@ pub fn render_inspector(ws: &Workspace, cx: &mut Context<Workspace>) -> impl Int
                                         .px_2()
                                         .py_0p5()
                                         .rounded(px(RADIUS_CONTROL))
-                                        .bg(solid(BG_ELEVATED))
+                                        .bg(solid(p.bg_elevated))
                                         .border_1()
-                                        .border_color(solid(BORDER_SUBTLE))
+                                        .border_color(solid(p.border_subtle))
                                         .text_size(px(11.))
-                                        .text_color(solid(TEXT_SECONDARY))
+                                        .text_color(solid(p.text_secondary))
                                         .child(badge)
                                 })),
                         )
@@ -275,36 +274,36 @@ pub fn render_inspector(ws: &Workspace, cx: &mut Context<Workspace>) -> impl Int
                                         this.copy_text_to_clipboard(&copy_path, "Path copied", cx);
                                     })),
                             )
-                            .when_some(term_path, |el, p| {
+                            .when_some(term_path, |el, path| {
                                 el.child(
                                     Button::new("insp-terminal")
                                         .with_size(Size::Small)
                                         .label("Open Terminal Here")
                                         .icon(LucideIcon::Terminal)
                                         .on_click(cx.listener(move |this, _, _, cx| {
-                                            this.open_terminal_at(&p, cx);
+                                            this.open_terminal_at(&path, cx);
                                         })),
                                 )
                             })
-                            .when_some(pin_path.filter(|_| is_dir), |el, p| {
+                            .when_some(pin_path.filter(|_| is_dir), |el, path| {
                                 el.child(
                                     Button::new("insp-pin")
                                         .with_size(Size::Small)
                                         .label("Pin to Sidebar")
                                         .icon(LucideIcon::Pin)
                                         .on_click(cx.listener(move |this, _, _, cx| {
-                                            this.pin_folder(p.clone(), cx);
+                                            this.pin_folder(path.clone(), cx);
                                         })),
                                 )
                             })
-                            .when_some(props_path, |el, p| {
+                            .when_some(props_path, |el, path| {
                                 el.child(
                                     Button::new("insp-props")
                                         .with_size(Size::Small)
                                         .label("Properties")
                                         .icon(LucideIcon::ExternalLink)
                                         .on_click(cx.listener(move |this, _, _, cx| {
-                                            this.show_properties_for(&p, cx);
+                                            this.show_properties_for(&path, cx);
                                         })),
                                 )
                             }),
@@ -319,6 +318,7 @@ fn render_inline_preview(
     fallback_icon: LucideIcon,
     fallback_hex: u32,
     unit: texplorer_core::SizeUnit,
+    p: Palette,
 ) -> impl IntoElement {
     match payload {
         PreviewPayload::Image {
@@ -347,7 +347,7 @@ fn render_inline_preview(
             .child(
                 div()
                     .text_size(px(10.))
-                    .text_color(solid(TEXT_MUTED))
+                    .text_color(solid(p.text_muted))
                     .child(format!("{orig_width} × {orig_height}")),
             )
             .into_any_element(),
@@ -370,16 +370,16 @@ fn render_inline_preview(
             .p_2()
             .overflow_hidden()
             .rounded(px(RADIUS_CONTROL))
-            .bg(solid(BG_SURFACE))
+            .bg(solid(p.bg_surface))
             .border_1()
-            .border_color(solid(BORDER_SUBTLE))
+            .border_color(solid(p.border_subtle))
             .font_family("Consolas")
             .children(lines.iter().take(9).map(|line| {
                 div()
                     .w_full()
                     .truncate()
                     .text_size(px(10.))
-                    .text_color(solid(TEXT_PRIMARY))
+                    .text_color(solid(p.text_primary))
                     .child(
                         StyledText::new(line.text.clone()).with_highlights(line.spans.clone()),
                     )
@@ -391,15 +391,15 @@ fn render_inline_preview(
             .p_2()
             .overflow_hidden()
             .rounded(px(RADIUS_CONTROL))
-            .bg(solid(BG_SURFACE))
+            .bg(solid(p.bg_surface))
             .border_1()
-            .border_color(solid(BORDER_SUBTLE))
+            .border_color(solid(p.border_subtle))
             .children(source.lines().take(8).map(|l| {
                 div()
                     .w_full()
                     .truncate()
                     .text_size(px(11.))
-                    .text_color(solid(TEXT_SECONDARY))
+                    .text_color(solid(p.text_secondary))
                     .child(l.to_string())
             }))
             .into_any_element(),
@@ -415,7 +415,7 @@ fn render_inline_preview(
             .child(
                 div()
                     .text_size(px(11.))
-                    .text_color(solid(TEXT_SECONDARY))
+                    .text_color(solid(p.text_secondary))
                     .child(format!(
                         "{total_items} items ({folders} dirs, {files} files • {})",
                         format_size(*immediate_bytes, unit)
@@ -438,7 +438,7 @@ fn render_icon_box(icon: LucideIcon, icon_hex: u32) -> impl IntoElement {
         .child(Icon::new(icon).large().text_color(solid(icon_hex)))
 }
 
-fn meta_row(label: &'static str, value: SharedString) -> impl IntoElement {
+fn meta_row(label: &'static str, value: SharedString, p: Palette) -> impl IntoElement {
     h_flex()
         .w_full()
         .px_2p5()
@@ -447,18 +447,18 @@ fn meta_row(label: &'static str, value: SharedString) -> impl IntoElement {
         .justify_between()
         .gap_2()
         .border_b_1()
-        .border_color(solid(BORDER_SUBTLE))
+        .border_color(solid(p.border_subtle))
         .child(
             div()
                 .text_size(px(11.))
-                .text_color(solid(TEXT_MUTED))
+                .text_color(solid(p.text_muted))
                 .child(label),
         )
         .child(
             div()
                 .truncate()
                 .text_xs()
-                .text_color(solid(TEXT_PRIMARY))
+                .text_color(solid(p.text_primary))
                 .child(value),
         )
 }

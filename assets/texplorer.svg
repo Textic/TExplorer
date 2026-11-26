@@ -1,5 +1,37 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
-  <circle cx="128" cy="128" r="120" fill="#111113" stroke="#34D399" stroke-width="14"/>
-  <path d="M74 88 H182 V112 H140 V184 H116 V112 H74 Z" fill="#F4F4F5"/>
-  <rect x="148" y="156" width="34" height="28" rx="4" fill="#34D399"/>
+  <defs>
+    <linearGradient id="goldRim" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="#F59E0B"/>
+      <stop offset="50%" stop-color="#FBBF24"/>
+      <stop offset="100%" stop-color="#D97706"/>
+    </linearGradient>
+    <linearGradient id="goldChannel" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#FBBF24"/>
+      <stop offset="100%" stop-color="#E5920A"/>
+    </linearGradient>
+    <linearGradient id="panelLeft" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#272A31"/>
+      <stop offset="100%" stop-color="#1B1D22"/>
+    </linearGradient>
+    <linearGradient id="panelRight" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#1D1F25"/>
+      <stop offset="100%" stop-color="#131418"/>
+    </linearGradient>
+  </defs>
+  <!-- Golden rim peeking along top of back folder tab -->
+  <path d="M40 44 H94 C101 44 106 48 111 55 L118 65 H216 C224 65 230 71 230 79 V96 H26 V58 C26 50 32 44 40 44 Z" fill="url(#goldRim)"/>
+  <!-- Matte dark graphite back folder tab -->
+  <path d="M40 48 H93 C99 48 104 51 108 58 L116 68 H216 C224 68 230 74 230 82 V98 H26 V62 C26 54 32 48 40 48 Z" fill="#2A2C32"/>
+  <!-- Front folder outer clip & top header strip -->
+  <rect x="20" y="80" width="216" height="140" rx="14" fill="#18191D"/>
+  <!-- Top dark header bar above T channel -->
+  <path d="M34 80 H222 C229.7 80 236 86.3 236 94 V108 H20 V94 C20 86.3 26.3 80 34 80 Z" fill="#2D3038"/>
+  <!-- Crisp subtle top edge highlight -->
+  <path d="M34 81 H222 C229 81 235 86.5 235 93" fill="none" stroke="#454954" stroke-width="1.5"/>
+  <!-- Left vertical dark panel -->
+  <path d="M20 116 H118 C121.3 116 124 118.7 124 122 V220 H34 C26.3 220 20 213.7 20 206 Z" fill="url(#panelLeft)"/>
+  <!-- Right vertical darker panel -->
+  <path d="M138 116 H236 V206 C236 213.7 229.7 220 222 220 H132 V122 C132 118.7 134.7 116 138 116 Z" fill="url(#panelRight)"/>
+  <!-- Golden-amber T channel dividing header and dual panes -->
+  <path d="M20 108 H236 V116 H138 C134.7 116 132 118.7 132 122 V220 H124 V122 C124 118.7 121.3 116 118 116 H20 Z" fill="url(#goldChannel)"/>
 </svg>

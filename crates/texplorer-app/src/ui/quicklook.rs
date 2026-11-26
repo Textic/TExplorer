@@ -15,22 +15,20 @@ use texplorer_core::FileEntry;
 
 use crate::preview::PreviewPayload;
 use crate::theme::{
-    BG_BASE, BG_ELEVATED, BG_SURFACE, BORDER, BORDER_SUBTLE, RADIUS_CONTROL, RADIUS_ROW,
-    TEXT_MUTED, TEXT_PRIMARY, TEXT_SECONDARY, file_kind_visual, format_size, format_timestamp,
-    soft_tint, solid,
+    RADIUS_CONTROL, RADIUS_ROW, file_kind_visual, format_size, format_timestamp, soft_tint, solid,
 };
 use crate::ui::workspace::Workspace;
 
-/// Renders the centered flat Obsidian Dark QuickLook modal triggered by `Space`.
+/// Renders the centered flat QuickLook modal triggered by `Space`.
 pub fn render_quicklook_modal(
     ws: &Workspace,
     entry: &FileEntry,
     payload: &PreviewPayload,
     cx: &mut Context<Workspace>,
 ) -> impl IntoElement {
-    let accent = ws.settings.accent;
+    let p = ws.palette();
     let unit = ws.settings.size_unit;
-    let (icon, icon_hex) = file_kind_visual(entry.kind, accent);
+    let (icon, icon_hex) = file_kind_visual(entry.kind, p);
     let name: SharedString = entry.name.clone().into();
     let is_dir = entry.is_dir();
     let open_loc = entry.location.clone();
@@ -84,7 +82,7 @@ pub fn render_quicklook_modal(
             .child(
                 div()
                     .text_xs()
-                    .text_color(solid(TEXT_MUTED))
+                    .text_color(solid(p.text_muted))
                     .child("Loading preview..."),
             )
             .into_any_element(),
@@ -95,7 +93,7 @@ pub fn render_quicklook_modal(
             .flex()
             .items_center()
             .justify_center()
-            .bg(solid(BG_BASE))
+            .bg(solid(p.bg_base))
             .child(
                 img(image.clone())
                     .max_w_full()
@@ -110,7 +108,7 @@ pub fn render_quicklook_modal(
             .gap_4()
             .items_center()
             .justify_center()
-            .bg(solid(BG_BASE))
+            .bg(solid(p.bg_base))
             .child(
                 img(image.clone())
                     .w(px(280.))
@@ -120,7 +118,7 @@ pub fn render_quicklook_modal(
             .child(
                 div()
                     .text_xs()
-                    .text_color(solid(TEXT_SECONDARY))
+                    .text_color(solid(p.text_secondary))
                     .child(format!(
                         "{}  •  Modified {}",
                         entry
@@ -137,7 +135,7 @@ pub fn render_quicklook_modal(
             .size_full()
             .overflow_y_scrollbar()
             .p_5()
-            .bg(solid(BG_BASE))
+            .bg(solid(p.bg_base))
             .child(TextView::markdown("quicklook-md-view", source.clone()))
             .into_any_element(),
         PreviewPayload::Code {
@@ -148,12 +146,12 @@ pub fn render_quicklook_modal(
             .size_full()
             .overflow_y_scrollbar()
             .p_3()
-            .bg(solid(BG_BASE))
+            .bg(solid(p.bg_base))
             .font_family("Consolas")
             .children(lines.iter().map(|line| {
                 let ln: SharedString = format!("{:>4}", line.line_number).into();
-                let styled = StyledText::new(line.text.clone())
-                    .with_highlights(line.spans.clone());
+                let styled =
+                    StyledText::new(line.text.clone()).with_highlights(line.spans.clone());
                 h_flex()
                     .w_full()
                     .gap_3()
@@ -164,7 +162,7 @@ pub fn render_quicklook_modal(
                             .flex_shrink_0()
                             .text_right()
                             .text_size(px(11.))
-                            .text_color(solid(TEXT_MUTED))
+                            .text_color(solid(p.text_muted))
                             .child(ln),
                     )
                     .child(
@@ -172,7 +170,7 @@ pub fn render_quicklook_modal(
                             .flex_1()
                             .min_w_0()
                             .text_size(px(12.))
-                            .text_color(solid(TEXT_PRIMARY))
+                            .text_color(solid(p.text_primary))
                             .child(styled),
                     )
             }))
@@ -181,7 +179,7 @@ pub fn render_quicklook_modal(
                     div()
                         .pt_3()
                         .text_xs()
-                        .text_color(solid(TEXT_MUTED))
+                        .text_color(solid(p.text_muted))
                         .child("Preview truncated to first 192 KiB."),
                 )
             })
@@ -197,7 +195,7 @@ pub fn render_quicklook_modal(
             .items_center()
             .justify_center()
             .gap_3()
-            .bg(solid(BG_BASE))
+            .bg(solid(p.bg_base))
             .child(
                 div()
                     .w(px(64.))
@@ -206,24 +204,24 @@ pub fn render_quicklook_modal(
                     .items_center()
                     .justify_center()
                     .rounded(px(RADIUS_ROW))
-                    .bg(soft_tint(accent.primary_hex(), 0.14))
+                    .bg(soft_tint(p.accent_primary, 0.14))
                     .child(
                         Icon::new(LucideIcon::Folder)
                             .large()
-                            .text_color(solid(accent.primary_hex())),
+                            .text_color(solid(p.accent_primary)),
                     ),
             )
             .child(
                 div()
                     .text_sm()
                     .font_semibold()
-                    .text_color(solid(TEXT_PRIMARY))
+                    .text_color(solid(p.text_primary))
                     .child(format!("{total_items} immediate items")),
             )
             .child(
                 div()
                     .text_xs()
-                    .text_color(solid(TEXT_SECONDARY))
+                    .text_color(solid(p.text_secondary))
                     .child(format!(
                         "{folders} folders  •  {files} files ({})",
                         format_size(*immediate_bytes, unit)
@@ -236,19 +234,19 @@ pub fn render_quicklook_modal(
             .items_center()
             .justify_center()
             .gap_2()
-            .bg(solid(BG_BASE))
+            .bg(solid(p.bg_base))
             .child(Icon::new(icon).large().text_color(solid(icon_hex)))
             .child(
                 div()
                     .text_sm()
                     .font_semibold()
-                    .text_color(solid(TEXT_PRIMARY))
+                    .text_color(solid(p.text_primary))
                     .child(entry.type_label.clone()),
             )
             .child(
                 div()
                     .text_xs()
-                    .text_color(solid(TEXT_MUTED))
+                    .text_color(solid(p.text_muted))
                     .child(reason.clone()),
             )
             .into_any_element(),
@@ -267,7 +265,7 @@ pub fn render_quicklook_modal(
                 .id("quicklook-backdrop")
                 .absolute()
                 .inset_0()
-                .bg(gpui_kit::hsla(0.0, 0.0, 0.0, 0.68))
+                .bg(gpui_kit::hsla(0.0, 0.0, 0.0, p.backdrop_alpha()))
                 .occlude()
                 .on_scroll(|_, _, cx| cx.stop_propagation())
                 .on_mouse_down(
@@ -289,9 +287,9 @@ pub fn render_quicklook_modal(
                 .relative()
                 .w(px(860.))
                 .h(px(640.))
-                .bg(solid(BG_SURFACE))
+                .bg(solid(p.bg_surface))
                 .border_1()
-                .border_color(solid(BORDER))
+                .border_color(solid(p.border))
                 .rounded(px(RADIUS_ROW))
                 .overflow_hidden()
                 .occlude()
@@ -305,9 +303,9 @@ pub fn render_quicklook_modal(
                         .items_center()
                         .justify_between()
                         .gap_3()
-                        .bg(solid(BG_ELEVATED))
+                        .bg(solid(p.bg_elevated))
                         .border_b_1()
-                        .border_color(solid(BORDER_SUBTLE))
+                        .border_color(solid(p.border_subtle))
                         .child(
                             h_flex()
                                 .flex_1()
@@ -320,7 +318,7 @@ pub fn render_quicklook_modal(
                                         .truncate()
                                         .text_sm()
                                         .font_semibold()
-                                        .text_color(solid(TEXT_PRIMARY))
+                                        .text_color(solid(p.text_primary))
                                         .child(name),
                                 )
                                 .child(
@@ -329,11 +327,11 @@ pub fn render_quicklook_modal(
                                         .px_2()
                                         .py_0p5()
                                         .rounded(px(RADIUS_CONTROL))
-                                        .bg(solid(BG_BASE))
+                                        .bg(solid(p.bg_base))
                                         .border_1()
-                                        .border_color(solid(BORDER_SUBTLE))
+                                        .border_color(solid(p.border_subtle))
                                         .text_size(px(11.))
-                                        .text_color(solid(TEXT_SECONDARY))
+                                        .text_color(solid(p.text_secondary))
                                         .child(badge_text),
                                 ),
                         )
@@ -379,13 +377,13 @@ pub fn render_quicklook_modal(
                         .flex_shrink_0()
                         .items_center()
                         .justify_between()
-                        .bg(solid(BG_ELEVATED))
+                        .bg(solid(p.bg_elevated))
                         .border_t_1()
-                        .border_color(solid(BORDER_SUBTLE))
+                        .border_color(solid(p.border_subtle))
                         .child(
                             div()
                                 .text_size(px(11.))
-                                .text_color(solid(TEXT_MUTED))
+                                .text_color(solid(p.text_muted))
                                 .child("↑ / ↓ Navigate files   •   Enter Open   •   Space / Esc Close"),
                         ),
                 ),

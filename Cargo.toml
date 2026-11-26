@@ -5,12 +5,14 @@ members = [
     "crates/texplorer-platform",
     "crates/texplorer-vfs",
     "crates/texplorer-ops",
+    "crates/texplorer-mft",
+    "crates/texplorer-service",
     "crates/texplorer-app",
 ]
 default-members = ["crates/texplorer-app"]
 
 [workspace.package]
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 authors = ["Textic"]
 license = "MIT"
@@ -23,6 +25,8 @@ futures-channel = "0.3"
 futures-util = "0.3"
 gpui-kit = "0.10.0"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp", "ico"] }
+rayon = "1.10"
+regex = "1.11"
 reqwest = { version = "0.13", default-features = false, features = [
     "native-tls",
     "charset",

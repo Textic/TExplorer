@@ -1,5 +1,6 @@
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -19,7 +20,12 @@ use gpui_kit::{
 };
 use texplorer_core::{
     AccentPreset, AppSettings, FileEntry, KnownFolder, KnownFolderKind, Location, PaneSide,
-    SizeUnit, SortColumn, TabModel, ViewMode, VolumeInfo,
+    SearchScope, SizeUnit, SortColumn, TabModel, ThemePreset, ViewMode, VolumeInfo,
+};
+use texplorer_mft::{
+    IndexServiceInstallState, IndexServiceStatus, install_service_elevated,
+    query_live_service_status, query_service_install_state, rebuild_index_via_service,
+    start_service_elevated, uninstall_service_elevated,
 };
 use texplorer_ops::{
     ConflictDecision, ConflictPrompt, ConflictResolution, TransferControl, TransferEvent,
@@ -31,17 +37,20 @@ use texplorer_platform::{
     list_known_folders, list_volumes, list_wsl_distros, move_to_trash, open_in_editor, open_item,
     open_terminal_here, query_default_explorer_status, restore_windows_explorer,
     reveal_in_windows_explorer, set_clipboard_files, show_properties_dialog,
+    system_prefers_dark_mode,
 };
+use texplorer_vfs::folder_size::resolve_folder_sizes;
+use texplorer_vfs::search::{SearchOutcome, execute_search};
 use uuid::Uuid;
 
 use crate::preview::{
     PreviewPayload, ThumbnailCache, ThumbnailKey, load_preview_blocking, raw_bgra_to_render_image,
 };
 use crate::theme::{
-    BG_BASE, BG_ELEVATED, BORDER, RADIUS_ROW, STATUS_ERROR, STATUS_INFO, STATUS_SUCCESS,
-    TEXT_PRIMARY, apply_obsidian_theme, crisp_resize_handle_appearance, solid,
+    Palette, RADIUS_ROW, apply_theme, crisp_resize_handle_appearance, resolve_palette, solid,
 };
 use crate::ui::context_menu::{ContextMenuState, ContextMenuTarget, render_context_menu};
+use crate::ui::global_search::{GlobalSearchState, render_global_search_modal};
 use crate::ui::header::render_header;
 use crate::ui::inspector::render_inspector;
 use crate::ui::modals::{ActiveModal, TextPromptKind, render_active_modal};
@@ -69,6 +78,7 @@ gpui_kit::actions!(
         GoUp,
         RefreshPane,
         FocusFilter,
+        OpenGlobalSearch,
         ToggleSidebar,
         ToggleInspector,
         ToggleHiddenFiles,
@@ -136,12 +146,38 @@ enum BgEvent {
     },
     Transfer(TransferEvent),
     NativeShellMenuDone(Result<(), String>),
+    FolderSizesReady {
+        tab_id: Uuid,
+        side: PaneSide,
+        generation: u64,
+        sizes: Vec<(PathBuf, u64)>,
+    },
+    GlobalSearchReady {
+        generation: u64,
+        outcome: Result<SearchOutcome, String>,
+    },
+    ServiceStatusReady {
+        install_state: IndexServiceInstallState,
+        live_status: Option<IndexServiceStatus>,
+    },
+    ServiceActionFinished {
+        result: Result<String, String>,
+        install_state: IndexServiceInstallState,
+        live_status: Option<IndexServiceStatus>,
+    },
+}
+
+#[derive(Clone, Copy)]
+enum ToastKind {
+    Info,
+    Success,
+    Error,
 }
 
 #[derive(Clone)]
 struct ToastBanner {
     message: SharedString,
-    accent_hex: u32,
+    kind: ToastKind,
     id: u64,
 }
 
@@ -188,16 +224,24 @@ impl TabUiState {
 pub struct Workspace {
     focus_handle: FocusHandle,
     pub settings: AppSettings,
+    pub system_is_dark: bool,
     pub volumes: Vec<VolumeInfo>,
     pub known_folders: Vec<KnownFolder>,
     pub wsl_distros: Vec<(String, PathBuf)>,
     pub default_explorer_status: DefaultExplorerStatus,
+    pub service_install_state: IndexServiceInstallState,
+    pub service_live_status: Option<IndexServiceStatus>,
+    pub service_busy: bool,
     pub update_state: UpdateState,
     pub tabs: Vec<TabUiState>,
     pub active_tab_index: usize,
     pub context_menu: Option<ContextMenuState>,
     pub active_modal: Option<ActiveModal>,
     modal_subs: Vec<Subscription>,
+    pub global_search: Option<GlobalSearchState>,
+    global_search_subs: Vec<Subscription>,
+    folder_size_cache: HashMap<PathBuf, u64>,
+    folder_size_cancels: HashMap<(Uuid, PaneSide), Arc<AtomicBool>>,
     pub quicklook_open: bool,
     pub preview_path: Option<PathBuf>,
     pub preview_payload: PreviewPayload,
@@ -219,6 +263,7 @@ pub struct Workspace {
 impl Workspace {
     pub fn new(
         settings: AppSettings,
+        system_is_dark: bool,
         initial_intent: LaunchIntent,
         mut ipc_rx: UnboundedReceiver<LaunchIntent>,
         window: &mut Window,
@@ -237,6 +282,7 @@ impl Workspace {
         let known_folders = list_known_folders();
         let wsl_distros = list_wsl_distros();
         let default_explorer_status = query_default_explorer_status();
+        let service_install_state = query_service_install_state();
         let shell_worker = ShellWorker::spawn();
 
         let (initial_location, pending_select) = match initial_intent {
@@ -257,16 +303,24 @@ impl Workspace {
         let mut ws = Self {
             focus_handle: cx.focus_handle(),
             settings,
+            system_is_dark,
             volumes,
             known_folders,
             wsl_distros,
             default_explorer_status,
+            service_install_state,
+            service_live_status: None,
+            service_busy: false,
             update_state: UpdateState::Idle,
             tabs: Vec::new(),
             active_tab_index: 0,
             context_menu: None,
             active_modal: None,
             modal_subs: Vec::new(),
+            global_search: None,
+            global_search_subs: Vec::new(),
+            folder_size_cache: HashMap::new(),
+            folder_size_cancels: HashMap::new(),
             quicklook_open: false,
             preview_path: None,
             preview_payload: PreviewPayload::Loading,
@@ -298,6 +352,7 @@ impl Workspace {
         .detach();
 
         ws.open_tab_with_selection(initial_location, pending_select, window, cx);
+        ws.refresh_service_status(cx);
         if ws.settings.auto_check_updates {
             ws.check_for_updates(false, cx);
         }
@@ -311,6 +366,15 @@ impl Workspace {
 
     pub fn active_tab_mut(&mut self) -> Option<&mut TabUiState> {
         self.tabs.get_mut(self.active_tab_index)
+    }
+
+    /// Resolves the active dynamic surface, text, accent, and syntax color palette.
+    pub fn palette(&self) -> Palette {
+        resolve_palette(
+            self.settings.theme,
+            self.settings.accent,
+            self.system_is_dark,
+        )
     }
 
     pub fn is_path_cut(&self, path: &Path) -> bool {
@@ -408,13 +472,32 @@ impl Workspace {
                 generation,
                 result,
             } => {
+                let mut uncached_folders: Vec<PathBuf> = Vec::new();
+                let calc_folders = self.settings.calculate_folder_sizes;
                 if let Some(tab) = self.tabs.iter_mut().find(|t| t.model.id == tab_id) {
                     let pane = tab.model.pane_mut(side);
                     if pane.load_generation != generation {
                         return;
                     }
+                    let is_local_dir = matches!(pane.location, Location::Local(_));
                     match result {
-                        Ok(entries) => pane.set_entries(entries),
+                        Ok(mut entries) => {
+                            if calc_folders && is_local_dir {
+                                for entry in &mut entries {
+                                    if entry.is_dir()
+                                        && entry.size.is_none()
+                                        && let Some(local) = entry.location.as_local_path()
+                                    {
+                                        if let Some(&cached) = self.folder_size_cache.get(local) {
+                                            entry.size = Some(cached);
+                                        } else {
+                                            uncached_folders.push(local.to_path_buf());
+                                        }
+                                    }
+                                }
+                            }
+                            pane.set_entries(entries);
+                        }
                         Err(err) => {
                             pane.loading = false;
                             pane.entries.clear();
@@ -424,6 +507,14 @@ impl Workspace {
                         }
                     }
                     self.sync_preview_for_selection(cx);
+                    if !uncached_folders.is_empty() {
+                        self.spawn_folder_size_calculation(
+                            tab_id,
+                            side,
+                            generation,
+                            uncached_folders,
+                        );
+                    }
                     cx.notify();
                 }
             }
@@ -432,6 +523,7 @@ impl Workspace {
                 side,
                 directory,
             } => {
+                self.invalidate_folder_sizes_under(&directory);
                 let should_reload = self
                     .tabs
                     .iter()
@@ -579,13 +671,18 @@ impl Workspace {
                     snapshot,
                     undo_action,
                 } => {
+                    let job_id = snapshot.job_id;
                     let target_dir = snapshot.target_dir.clone();
                     let status = snapshot.status.clone();
                     let kind = snapshot.kind;
+                    let auto_dismiss = matches!(
+                        status,
+                        TransferStatus::Completed | TransferStatus::Cancelled
+                    );
                     if let Some(job) = self
                         .transfers
                         .iter_mut()
-                        .find(|j| j.snapshot.job_id == snapshot.job_id)
+                        .find(|j| j.snapshot.job_id == job_id)
                     {
                         job.snapshot = snapshot;
                     }
@@ -595,19 +692,117 @@ impl Workspace {
                     if kind == TransferKind::Move && matches!(status, TransferStatus::Completed) {
                         self.cut_paths.clear();
                     }
+                    self.invalidate_folder_sizes_under(&target_dir);
                     self.refresh_panes_showing(&target_dir, cx);
                     if let TransferStatus::Failed(err) = status {
-                        self.show_toast(err, STATUS_ERROR, window, cx);
+                        self.show_toast(err, ToastKind::Error, window, cx);
+                    }
+                    if auto_dismiss {
+                        cx.spawn_in(window, async move |weak, cx| {
+                            smol_sleep(Duration::from_secs(3)).await;
+                            let _ = weak.update(cx, |this, cx| {
+                                let before = this.transfers.len();
+                                this.transfers.retain(|j| j.snapshot.job_id != job_id);
+                                if this.transfers.len() != before {
+                                    cx.notify();
+                                }
+                            });
+                        })
+                        .detach();
                     }
                     cx.notify();
                 }
             },
             BgEvent::NativeShellMenuDone(res) => {
                 if let Err(err) = res {
-                    self.show_toast(err, STATUS_ERROR, window, cx);
+                    self.show_toast(err, ToastKind::Error, window, cx);
                 } else {
                     self.refresh_visible_panes(cx);
                 }
+            }
+            BgEvent::FolderSizesReady {
+                tab_id,
+                side,
+                generation,
+                sizes,
+            } => {
+                if self.folder_size_cache.len() > 20_000 {
+                    self.folder_size_cache.clear();
+                }
+                for (path, bytes) in &sizes {
+                    self.folder_size_cache.insert(path.clone(), *bytes);
+                }
+                if let Some(tab) = self.tabs.iter_mut().find(|t| t.model.id == tab_id) {
+                    let pane = tab.model.pane_mut(side);
+                    if pane.load_generation == generation {
+                        let size_map: HashMap<&Path, u64> =
+                            sizes.iter().map(|(p, b)| (p.as_path(), *b)).collect();
+                        let mut changed = false;
+                        for entry in &mut pane.entries {
+                            if entry.is_dir()
+                                && let Some(local) = entry.location.as_local_path()
+                                && let Some(&bytes) = size_map.get(local)
+                            {
+                                entry.size = Some(bytes);
+                                changed = true;
+                            }
+                        }
+                        if changed {
+                            if pane.sort.column == SortColumn::Size {
+                                pane.resort();
+                            }
+                            cx.notify();
+                        }
+                    }
+                }
+            }
+            BgEvent::GlobalSearchReady {
+                generation,
+                outcome,
+            } => {
+                if let Some(gs) = self.global_search.as_mut()
+                    && gs.generation == generation
+                {
+                    gs.searching = false;
+                    match outcome {
+                        Ok(res) => {
+                            gs.results = res.entries;
+                            gs.total_matches = res.total_matches;
+                            gs.elapsed_ms = res.elapsed_ms;
+                            gs.from_mft = res.from_mft;
+                            gs.truncated = res.truncated;
+                            gs.selected_idx = 0;
+                        }
+                        Err(err) => {
+                            gs.results.clear();
+                            gs.total_matches = 0;
+                            self.show_toast(err, ToastKind::Error, window, cx);
+                        }
+                    }
+                    cx.notify();
+                }
+            }
+            BgEvent::ServiceStatusReady {
+                install_state,
+                live_status,
+            } => {
+                self.service_install_state = install_state;
+                self.service_live_status = live_status;
+                cx.notify();
+            }
+            BgEvent::ServiceActionFinished {
+                result,
+                install_state,
+                live_status,
+            } => {
+                self.service_busy = false;
+                self.service_install_state = install_state;
+                self.service_live_status = live_status;
+                match result {
+                    Ok(msg) => self.show_toast(msg, ToastKind::Success, window, cx),
+                    Err(err) => self.show_toast(err, ToastKind::Error, window, cx),
+                }
+                cx.notify();
             }
         }
     }
@@ -669,11 +864,12 @@ impl Workspace {
         self.preview_payload = PreviewPayload::Loading;
 
         let worker = self.shell_worker.clone();
+        let palette = self.palette();
         let tx = self.bg_tx.clone();
         tokio_runtime().spawn(async move {
             let p_clone = path.clone();
             let payload = tokio::task::spawn_blocking(move || {
-                load_preview_blocking(p_clone, kind, worker)
+                load_preview_blocking(p_clone, kind, worker, palette)
             })
             .await
             .unwrap_or_else(|_| PreviewPayload::Unsupported {
@@ -917,6 +1113,10 @@ impl Workspace {
     }
 
     fn reload_pane_by_id(&mut self, tab_id: Uuid, side: PaneSide, cx: &mut Context<Self>) {
+        if let Some(prev_cancel) = self.folder_size_cancels.remove(&(tab_id, side)) {
+            prev_cancel.store(true, Ordering::Relaxed);
+        }
+        let use_mft = self.settings.use_mft_service;
         let Some(tab) = self.tabs.iter_mut().find(|t| t.model.id == tab_id) else {
             return;
         };
@@ -940,10 +1140,15 @@ impl Workspace {
         let tx = self.bg_tx.clone();
         tokio_runtime().spawn(async move {
             let loc_clone = location.clone();
-            let result =
-                tokio::task::spawn_blocking(move || texplorer_vfs::list_location(&loc_clone))
-                    .await
-                    .unwrap_or_else(|e| Err(format!("Directory task panicked: {e}")));
+            let result = tokio::task::spawn_blocking(move || match &loc_clone {
+                Location::Search { query, scope } => {
+                    let cancel = AtomicBool::new(false);
+                    execute_search(query, scope, use_mft, 1_000, &cancel).map(|r| r.entries)
+                }
+                _ => texplorer_vfs::list_location(&loc_clone),
+            })
+            .await
+            .unwrap_or_else(|e| Err(format!("Directory task panicked: {e}")));
             let _ = tx.unbounded_send(BgEvent::DirectoryLoaded {
                 tab_id,
                 side,
@@ -952,6 +1157,44 @@ impl Workspace {
             });
         });
         cx.notify();
+    }
+
+    fn spawn_folder_size_calculation(
+        &mut self,
+        tab_id: Uuid,
+        side: PaneSide,
+        generation: u64,
+        folders: Vec<PathBuf>,
+    ) {
+        if let Some(prev) = self.folder_size_cancels.remove(&(tab_id, side)) {
+            prev.store(true, Ordering::Relaxed);
+        }
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.folder_size_cancels
+            .insert((tab_id, side), Arc::clone(&cancel));
+        let use_mft = self.settings.use_mft_service;
+        let tx = self.bg_tx.clone();
+
+        tokio_runtime().spawn(async move {
+            let sizes = tokio::task::spawn_blocking(move || {
+                resolve_folder_sizes(&folders, use_mft, &cancel)
+            })
+            .await
+            .unwrap_or_default();
+            if !sizes.is_empty() {
+                let _ = tx.unbounded_send(BgEvent::FolderSizesReady {
+                    tab_id,
+                    side,
+                    generation,
+                    sizes,
+                });
+            }
+        });
+    }
+
+    fn invalidate_folder_sizes_under(&mut self, dir: &Path) {
+        self.folder_size_cache
+            .retain(|k, _| !k.starts_with(dir) && !dir.starts_with(k));
     }
 
     fn rebind_watcher(&mut self, tab_id: Uuid, side: PaneSide) {
@@ -1019,7 +1262,7 @@ impl Workspace {
             {
                 self.show_toast(
                     format!("Path not found: {}", local.display()),
-                    STATUS_ERROR,
+                    ToastKind::Error,
                     window,
                     cx,
                 );
@@ -1241,7 +1484,7 @@ impl Workspace {
         } else if let Some(path) = location.as_local_path()
             && let Err(err) = open_item(path)
         {
-            self.show_toast(err, STATUS_ERROR, window, cx);
+            self.show_toast(err, ToastKind::Error, window, cx);
         }
     }
 
@@ -1270,9 +1513,9 @@ impl Workspace {
                 } else {
                     format!("{verb} {} items to clipboard", paths.len())
                 };
-                self.show_toast(msg, STATUS_SUCCESS, window, cx);
+                self.show_toast(msg, ToastKind::Success, window, cx);
             }
-            Err(err) => self.show_toast(err, STATUS_ERROR, window, cx),
+            Err(err) => self.show_toast(err, ToastKind::Error, window, cx),
         }
     }
 
@@ -1292,9 +1535,9 @@ impl Workspace {
                 self.enqueue_transfer(kind, clip.paths, dest_dir, cx);
             }
             Ok(None) => {
-                self.show_toast("Clipboard does not contain files.", STATUS_INFO, window, cx);
+                self.show_toast("Clipboard does not contain files.", ToastKind::Info, window, cx);
             }
-            Err(err) => self.show_toast(err, STATUS_ERROR, window, cx),
+            Err(err) => self.show_toast(err, ToastKind::Error, window, cx),
         }
     }
 
@@ -1414,9 +1657,9 @@ impl Workspace {
         match self.undo_history.undo() {
             Ok(msg) => {
                 self.refresh_visible_panes(cx);
-                self.show_toast(msg, STATUS_INFO, window, cx);
+                self.show_toast(msg, ToastKind::Info, window, cx);
             }
-            Err(err) => self.show_toast(err, STATUS_ERROR, window, cx),
+            Err(err) => self.show_toast(err, ToastKind::Error, window, cx),
         }
     }
 
@@ -1424,9 +1667,9 @@ impl Workspace {
         match self.undo_history.redo() {
             Ok(msg) => {
                 self.refresh_visible_panes(cx);
-                self.show_toast(msg, STATUS_INFO, window, cx);
+                self.show_toast(msg, ToastKind::Info, window, cx);
             }
-            Err(err) => self.show_toast(err, STATUS_ERROR, window, cx),
+            Err(err) => self.show_toast(err, ToastKind::Error, window, cx),
         }
     }
 
@@ -1469,47 +1712,47 @@ impl Workspace {
 
     pub fn copy_text_to_clipboard(&mut self, text: &str, notice: &str, cx: &mut Context<Self>) {
         cx.write_to_clipboard(ClipboardItem::new_string(text.to_string()));
-        self.set_toast_simple(notice, STATUS_SUCCESS, cx);
+        self.set_toast_simple(notice, ToastKind::Success, cx);
     }
 
     pub fn open_terminal_at(&mut self, path: &Path, cx: &mut Context<Self>) {
         if let Err(err) = open_terminal_here(path, &self.settings.terminal_command) {
-            self.set_toast_simple(err, STATUS_ERROR, cx);
+            self.set_toast_simple(err, ToastKind::Error, cx);
         }
     }
 
     pub fn open_editor_at(&mut self, path: &Path, cx: &mut Context<Self>) {
         if let Err(err) = open_in_editor(path, &self.settings.editor_command) {
-            self.set_toast_simple(err, STATUS_ERROR, cx);
+            self.set_toast_simple(err, ToastKind::Error, cx);
         }
     }
 
     pub fn open_in_textree(&mut self, path: &Path, cx: &mut Context<Self>) {
         let Some(exe) = find_textree_exe(self.settings.textree_path.as_deref()) else {
-            self.set_toast_simple("TexTree executable was not found.", STATUS_ERROR, cx);
+            self.set_toast_simple("TexTree executable was not found.", ToastKind::Error, cx);
             return;
         };
         if let Err(err) = std::process::Command::new(exe).arg(path).spawn() {
-            self.set_toast_simple(format!("Failed to launch TexTree: {err}"), STATUS_ERROR, cx);
+            self.set_toast_simple(format!("Failed to launch TexTree: {err}"), ToastKind::Error, cx);
         }
     }
 
     pub fn reveal_in_windows_explorer(&mut self, path: &Path, cx: &mut Context<Self>) {
         if let Err(err) = reveal_in_windows_explorer(path) {
-            self.set_toast_simple(err, STATUS_ERROR, cx);
+            self.set_toast_simple(err, ToastKind::Error, cx);
         }
     }
 
     pub fn show_properties_for(&mut self, path: &Path, cx: &mut Context<Self>) {
         if let Err(err) = show_properties_dialog(path) {
-            self.set_toast_simple(err, STATUS_ERROR, cx);
+            self.set_toast_simple(err, ToastKind::Error, cx);
         }
     }
 
     pub fn pin_folder(&mut self, path: PathBuf, cx: &mut Context<Self>) {
         if self.settings.pin_folder(path) {
             let _ = self.settings.save();
-            self.set_toast_simple("Pinned folder to sidebar", STATUS_SUCCESS, cx);
+            self.set_toast_simple("Pinned folder to sidebar", ToastKind::Success, cx);
         }
     }
 
@@ -1543,10 +1786,375 @@ impl Workspace {
     }
 
     pub fn open_settings_modal(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        self.system_is_dark = system_prefers_dark_mode();
+        if self.settings.theme == ThemePreset::FilesSystem {
+            apply_theme(self.palette(), cx);
+        }
         self.default_explorer_status = query_default_explorer_status();
+        self.refresh_service_status(cx);
         self.context_menu = None;
         self.quicklook_open = false;
+        self.global_search = None;
+        self.global_search_subs.clear();
         self.active_modal = Some(ActiveModal::Settings);
+        cx.notify();
+    }
+
+    // --- Phase 3: Global Search (Ctrl+K), Background Folder Sizes & MFT Service Controls ---
+
+    pub fn open_global_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.context_menu = None;
+        self.quicklook_open = false;
+        self.active_modal = None;
+        self.modal_subs.clear();
+        self.refresh_service_status(cx);
+
+        let active_folder = self
+            .active_tab()
+            .and_then(|t| t.model.active_pane_ref().location.as_local_path())
+            .map(|p| p.to_path_buf());
+        let initial_scope = if self.service_install_state == IndexServiceInstallState::Running
+            && self.settings.use_mft_service
+        {
+            SearchScope::Global
+        } else if let Some(ref dir) = active_folder {
+            SearchScope::Folder(dir.clone())
+        } else {
+            SearchScope::Global
+        };
+
+        let input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("Search files... (ext:rs;toml, size:>10mb, dir:, !target, /regex/)")
+        });
+        input.update(cx, |s, cx| s.focus(window, cx));
+
+        let sub = cx.subscribe_in(&input, window, |this, state, ev: &InputEvent, window, cx| {
+            match ev {
+                InputEvent::Change => {
+                    let query = state.read(cx).value().to_string();
+                    this.schedule_global_search(query, window, cx);
+                }
+                InputEvent::PressEnter { secondary, shift } => {
+                    if *shift || *secondary {
+                        this.open_global_search_in_tab(window, cx);
+                    } else {
+                        this.open_global_search_selected(window, cx);
+                    }
+                }
+                _ => {}
+            }
+        });
+
+        self.global_search_subs = vec![sub];
+        self.global_search = Some(GlobalSearchState {
+            input,
+            scroll_handle: UniformListScrollHandle::new(),
+            scope: initial_scope,
+            active_folder,
+            query_text: String::new(),
+            results: Vec::new(),
+            total_matches: 0,
+            elapsed_ms: 0,
+            from_mft: false,
+            truncated: false,
+            searching: false,
+            selected_idx: 0,
+            generation: 0,
+            cancel_flag: Arc::new(AtomicBool::new(false)),
+        });
+        cx.notify();
+    }
+
+    pub fn close_global_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(gs) = self.global_search.take() {
+            gs.cancel_flag.store(true, Ordering::Relaxed);
+            self.global_search_subs.clear();
+            self.focus_handle.focus(window, cx);
+            cx.notify();
+        }
+    }
+
+    pub fn set_global_search_scope(&mut self, scope: SearchScope, cx: &mut Context<Self>) {
+        let query = {
+            let Some(gs) = self.global_search.as_mut() else {
+                return;
+            };
+            if gs.scope == scope {
+                return;
+            }
+            gs.scope = scope;
+            gs.query_text.clone()
+        };
+        self.dispatch_global_search_now(query, cx);
+    }
+
+    fn schedule_global_search(
+        &mut self,
+        query: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let generation = {
+            let Some(gs) = self.global_search.as_mut() else {
+                return;
+            };
+            gs.cancel_flag.store(true, Ordering::Relaxed);
+            gs.generation = gs.generation.wrapping_add(1);
+            gs.query_text = query.clone();
+            if query.trim().is_empty() {
+                gs.results.clear();
+                gs.total_matches = 0;
+                gs.searching = false;
+                cx.notify();
+                return;
+            }
+            gs.searching = true;
+            gs.generation
+        };
+        cx.notify();
+
+        let delay_ms = if self.service_install_state == IndexServiceInstallState::Running
+            && self.settings.use_mft_service
+        {
+            35
+        } else {
+            140
+        };
+        cx.spawn_in(window, async move |weak, cx| {
+            smol_sleep(Duration::from_millis(delay_ms)).await;
+            let _ = weak.update(cx, |this, cx| {
+                let matches_gen = this
+                    .global_search
+                    .as_ref()
+                    .is_some_and(|gs| gs.generation == generation);
+                if matches_gen {
+                    this.dispatch_global_search_now(query, cx);
+                }
+            });
+        })
+        .detach();
+    }
+
+    fn dispatch_global_search_now(&mut self, query: String, cx: &mut Context<Self>) {
+        let (scope, generation, cancel) = {
+            let Some(gs) = self.global_search.as_mut() else {
+                return;
+            };
+            gs.cancel_flag.store(true, Ordering::Relaxed);
+            if query.trim().is_empty() {
+                gs.results.clear();
+                gs.total_matches = 0;
+                gs.searching = false;
+                cx.notify();
+                return;
+            }
+            gs.generation = gs.generation.wrapping_add(1);
+            let cancel = Arc::new(AtomicBool::new(false));
+            gs.cancel_flag = Arc::clone(&cancel);
+            gs.searching = true;
+            (gs.scope.clone(), gs.generation, cancel)
+        };
+        let use_mft = self.settings.use_mft_service;
+        let tx = self.bg_tx.clone();
+        tokio_runtime().spawn(async move {
+            let outcome = tokio::task::spawn_blocking(move || {
+                execute_search(&query, &scope, use_mft, 400, &cancel)
+            })
+            .await
+            .unwrap_or_else(|e| Err(format!("Search worker failed: {e}")));
+            let _ = tx.unbounded_send(BgEvent::GlobalSearchReady {
+                generation,
+                outcome,
+            });
+        });
+        cx.notify();
+    }
+
+    pub fn move_global_search_selection(&mut self, delta: isize, cx: &mut Context<Self>) {
+        let Some(gs) = self.global_search.as_mut() else {
+            return;
+        };
+        let total = gs.results.len();
+        if total == 0 {
+            return;
+        }
+        let next = gs
+            .selected_idx
+            .saturating_add_signed(delta)
+            .min(total.saturating_sub(1));
+        if next != gs.selected_idx {
+            gs.selected_idx = next;
+            gs.scroll_handle
+                .scroll_to_item(next, ScrollStrategy::Nearest);
+            cx.notify();
+        }
+    }
+
+    pub fn open_global_search_selected(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let target = self.global_search.as_ref().and_then(|gs| {
+            let entry = gs.results.get(gs.selected_idx)?;
+            Some((entry.location.clone(), entry.is_dir()))
+        });
+        if let Some((loc, is_dir)) = target {
+            self.close_global_search(window, cx);
+            self.open_location_or_file(loc, is_dir, window, cx);
+        }
+    }
+
+    pub fn open_global_search_in_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let req = self.global_search.as_ref().and_then(|gs| {
+            let q = gs.query_text.trim();
+            if q.is_empty() {
+                None
+            } else {
+                Some(Location::Search {
+                    query: q.to_string(),
+                    scope: gs.scope.clone(),
+                })
+            }
+        });
+        if let Some(loc) = req {
+            self.close_global_search(window, cx);
+            if self.settings.show_tabs {
+                self.open_new_tab(loc, window, cx);
+            } else {
+                self.navigate_active_pane(loc, window, cx);
+            }
+        }
+    }
+
+    pub fn reveal_search_hit_in_pane(
+        &mut self,
+        path: &Path,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let parent = path
+            .parent()
+            .map(Location::local)
+            .unwrap_or(Location::Home);
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned());
+        self.close_global_search(window, cx);
+        if let Some(tab) = self.active_tab_mut() {
+            tab.model.active_pane_mut().pending_select_name = name;
+        }
+        self.navigate_active_pane(parent, window, cx);
+    }
+
+    pub fn refresh_service_status(&mut self, _cx: &mut Context<Self>) {
+        let tx = self.bg_tx.clone();
+        tokio_runtime().spawn(async move {
+            let (install_state, live_status) = tokio::task::spawn_blocking(|| {
+                let install = query_service_install_state();
+                let live = if install == IndexServiceInstallState::Running {
+                    query_live_service_status()
+                } else {
+                    None
+                };
+                (install, live)
+            })
+            .await
+            .unwrap_or((IndexServiceInstallState::Unavailable, None));
+            let _ = tx.unbounded_send(BgEvent::ServiceStatusReady {
+                install_state,
+                live_status,
+            });
+        });
+    }
+
+    fn run_service_action<F>(&mut self, action: F, cx: &mut Context<Self>)
+    where
+        F: FnOnce() -> Result<String, String> + Send + 'static,
+    {
+        if self.service_busy {
+            return;
+        }
+        self.service_busy = true;
+        cx.notify();
+        let tx = self.bg_tx.clone();
+        tokio_runtime().spawn(async move {
+            let (result, install_state, live_status) = tokio::task::spawn_blocking(move || {
+                let res = action();
+                let install = query_service_install_state();
+                let live = if install == IndexServiceInstallState::Running {
+                    query_live_service_status()
+                } else {
+                    None
+                };
+                (res, install, live)
+            })
+            .await
+            .unwrap_or_else(|e| {
+                (
+                    Err(format!("Service worker failed: {e}")),
+                    query_service_install_state(),
+                    None,
+                )
+            });
+            let _ = tx.unbounded_send(BgEvent::ServiceActionFinished {
+                result,
+                install_state,
+                live_status,
+            });
+        });
+    }
+
+    pub fn install_mft_service(&mut self, cx: &mut Context<Self>) {
+        self.run_service_action(
+            || {
+                install_service_elevated()?;
+                Ok("Installed and started TExplorer NTFS MFT Index Service".to_string())
+            },
+            cx,
+        );
+    }
+
+    pub fn start_mft_service(&mut self, cx: &mut Context<Self>) {
+        self.run_service_action(
+            || {
+                start_service_elevated()?;
+                Ok("Started TExplorer NTFS MFT Index Service".to_string())
+            },
+            cx,
+        );
+    }
+
+    pub fn uninstall_mft_service(&mut self, cx: &mut Context<Self>) {
+        self.run_service_action(
+            || {
+                uninstall_service_elevated()?;
+                Ok("Uninstalled TExplorer NTFS MFT Index Service".to_string())
+            },
+            cx,
+        );
+    }
+
+    pub fn rebuild_mft_index(&mut self, cx: &mut Context<Self>) {
+        self.folder_size_cache.clear();
+        self.run_service_action(
+            || {
+                rebuild_index_via_service()?;
+                Ok("Rebuilding NTFS $MFT index in background...".to_string())
+            },
+            cx,
+        );
+    }
+
+    pub fn toggle_use_mft_service(&mut self, cx: &mut Context<Self>) {
+        self.settings.use_mft_service = !self.settings.use_mft_service;
+        let _ = self.settings.save();
+        cx.notify();
+    }
+
+    pub fn toggle_calculate_folder_sizes(&mut self, cx: &mut Context<Self>) {
+        self.settings.calculate_folder_sizes = !self.settings.calculate_folder_sizes;
+        let _ = self.settings.save();
+        if self.settings.calculate_folder_sizes {
+            self.refresh_visible_panes(cx);
+        }
         cx.notify();
     }
 
@@ -1675,7 +2283,7 @@ impl Workspace {
                 self.focus_handle.focus(window, cx);
             }
             Err(err) => {
-                self.show_toast(err, STATUS_ERROR, window, cx);
+                self.show_toast(err, ToastKind::Error, window, cx);
             }
         }
     }
@@ -1694,9 +2302,9 @@ impl Workspace {
                 } else {
                     format!("Moved {count} items to Recycle Bin")
                 };
-                self.show_toast(msg, STATUS_SUCCESS, window, cx);
+                self.show_toast(msg, ToastKind::Success, window, cx);
             }
-            Err(err) => self.show_toast(err, STATUS_ERROR, window, cx),
+            Err(err) => self.show_toast(err, ToastKind::Error, window, cx),
         }
     }
 
@@ -1724,12 +2332,12 @@ impl Workspace {
         if failures.is_empty() {
             self.show_toast(
                 format!("Permanently deleted {} item(s)", paths.len()),
-                STATUS_SUCCESS,
+                ToastKind::Success,
                 window,
                 cx,
             );
         } else {
-            self.show_toast(failures[0].clone(), STATUS_ERROR, window, cx);
+            self.show_toast(failures[0].clone(), ToastKind::Error, window, cx);
         }
     }
 
@@ -1751,10 +2359,22 @@ impl Workspace {
         cx.notify();
     }
 
+    pub fn set_theme(&mut self, preset: ThemePreset, cx: &mut Context<Self>) {
+        self.system_is_dark = system_prefers_dark_mode();
+        self.settings.theme = preset;
+        let _ = self.settings.save();
+        apply_theme(self.palette(), cx);
+        if self.settings.show_inspector || self.quicklook_open {
+            self.preview_path = None;
+            self.sync_preview_for_selection(cx);
+        }
+        cx.notify();
+    }
+
     pub fn set_accent(&mut self, preset: AccentPreset, cx: &mut Context<Self>) {
         self.settings.accent = preset;
         let _ = self.settings.save();
-        apply_obsidian_theme(preset, cx);
+        apply_theme(self.palette(), cx);
         cx.notify();
     }
 
@@ -1778,11 +2398,11 @@ impl Workspace {
                 self.default_explorer_status = query_default_explorer_status();
                 self.set_toast_simple(
                     "TExplorer is now your default Windows file manager",
-                    STATUS_SUCCESS,
+                    ToastKind::Success,
                     cx,
                 );
             }
-            Err(err) => self.set_toast_simple(err, STATUS_ERROR, cx),
+            Err(err) => self.set_toast_simple(err, ToastKind::Error, cx),
         }
     }
 
@@ -1792,9 +2412,9 @@ impl Workspace {
                 self.settings.replace_default_explorer = false;
                 let _ = self.settings.save();
                 self.default_explorer_status = query_default_explorer_status();
-                self.set_toast_simple("Restored original Windows Explorer", STATUS_INFO, cx);
+                self.set_toast_simple("Restored original Windows Explorer", ToastKind::Info, cx);
             }
-            Err(err) => self.set_toast_simple(err, STATUS_ERROR, cx),
+            Err(err) => self.set_toast_simple(err, ToastKind::Error, cx),
         }
     }
 
@@ -1831,7 +2451,7 @@ impl Workspace {
             let _ = self.settings.save();
             self.set_toast_simple(
                 "Removed from Quick Access (restore anytime in Settings)",
-                STATUS_INFO,
+                ToastKind::Info,
                 cx,
             );
         }
@@ -1897,21 +2517,21 @@ impl Workspace {
     pub fn open_releases_page(&mut self, cx: &mut Context<Self>) {
         let url = format!("{REPO_URL}/releases");
         if let Err(err) = open_url_in_browser(&url) {
-            self.set_toast_simple(err, STATUS_ERROR, cx);
+            self.set_toast_simple(err, ToastKind::Error, cx);
         }
     }
 
     fn set_toast_simple(
         &mut self,
         message: impl Into<SharedString>,
-        accent_hex: u32,
+        kind: ToastKind,
         cx: &mut Context<Self>,
     ) {
         self.toast_seq = self.toast_seq.wrapping_add(1);
         let id = self.toast_seq;
         self.toast = Some(ToastBanner {
             message: message.into(),
-            accent_hex,
+            kind,
             id,
         });
         cx.notify();
@@ -1920,7 +2540,7 @@ impl Workspace {
     fn show_toast(
         &mut self,
         message: impl Into<SharedString>,
-        accent_hex: u32,
+        kind: ToastKind,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -1928,7 +2548,7 @@ impl Workspace {
         let id = self.toast_seq;
         self.toast = Some(ToastBanner {
             message: message.into(),
-            accent_hex,
+            kind,
             id,
         });
         cx.spawn_in(window, async move |weak, cx| {
@@ -1945,7 +2565,9 @@ impl Workspace {
     }
 
     fn is_modal_blocking(&self) -> bool {
-        self.active_modal.is_some() || !self.conflict_queue.is_empty()
+        self.active_modal.is_some()
+            || self.global_search.is_some()
+            || !self.conflict_queue.is_empty()
     }
 
     fn handle_key_down(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
@@ -2094,12 +2716,12 @@ impl Focusable for Workspace {
 
 impl Render for Workspace {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let accent = self.settings.accent;
+        let p = self.palette();
         let is_split = self.active_tab().is_some_and(|t| t.model.split_enabled);
 
         let main_panes = if is_split {
             h_resizable("dual-pane-split")
-                .with_handle_appearance(crisp_resize_handle_appearance(accent))
+                .with_handle_appearance(crisp_resize_handle_appearance(p))
                 .child(resizable_panel().child(render_pane(self, PaneSide::Left, true, cx)))
                 .child(resizable_panel().child(render_pane(self, PaneSide::Right, true, cx)))
                 .into_any_element()
@@ -2109,7 +2731,7 @@ impl Render for Workspace {
 
         let center_and_inspector = if self.settings.show_inspector {
             h_resizable("center-inspector-split")
-                .with_handle_appearance(crisp_resize_handle_appearance(accent))
+                .with_handle_appearance(crisp_resize_handle_appearance(p))
                 .child(resizable_panel().child(main_panes))
                 .child(
                     resizable_panel()
@@ -2125,7 +2747,7 @@ impl Render for Workspace {
 
         let body = if self.settings.show_sidebar {
             h_resizable("sidebar-main-split")
-                .with_handle_appearance(crisp_resize_handle_appearance(accent))
+                .with_handle_appearance(crisp_resize_handle_appearance(p))
                 .child(
                     resizable_panel()
                         .size(px(238.))
@@ -2155,8 +2777,8 @@ impl Render for Workspace {
             .track_focus(&self.focus_handle)
             .size_full()
             .relative()
-            .bg(solid(BG_BASE))
-            .text_color(solid(TEXT_PRIMARY))
+            .bg(solid(p.bg_base))
+            .text_color(solid(p.text_primary))
             .overflow_hidden()
             .on_key_down(cx.listener(Self::handle_key_down))
             .on_action(cx.listener(|this, _: &NewTab, window, cx| {
@@ -2274,6 +2896,16 @@ impl Render for Workspace {
                     let side = tab.model.active_pane;
                     let input = tab.pane_ui(side).filter_input.clone();
                     input.update(cx, |s, cx| s.focus(window, cx));
+                }
+            }))
+            .on_action(cx.listener(|this, _: &OpenGlobalSearch, window, cx| {
+                if this.active_modal.is_some() || !this.conflict_queue.is_empty() {
+                    return;
+                }
+                if this.global_search.is_some() {
+                    this.close_global_search(window, cx);
+                } else {
+                    this.open_global_search(window, cx);
                 }
             }))
             .on_action(cx.listener(|this, _: &ToggleSidebar, _, cx| {
@@ -2412,6 +3044,8 @@ impl Render for Workspace {
             .on_action(cx.listener(|this, _: &CancelOrDismiss, window, cx| {
                 if this.context_menu.is_some() {
                     this.dismiss_context_menu(cx);
+                } else if this.global_search.is_some() {
+                    this.close_global_search(window, cx);
                 } else if this.quicklook_open {
                     this.close_quicklook(cx);
                     this.focus_handle.focus(window, cx);
@@ -2441,6 +3075,11 @@ impl Render for Workspace {
             .when(has_transfers, |el| el.child(render_transfer_drawer(self, cx)))
             // Subtle bottom-right toast banner (lifted above transfer drawer when visible)
             .when_some(self.toast.clone(), |el, toast| {
+                let dot_hex = match toast.kind {
+                    ToastKind::Info => p.status_info,
+                    ToastKind::Success => p.status_success,
+                    ToastKind::Error => p.status_error,
+                };
                 el.child(
                     h_flex()
                         .id("toast-banner")
@@ -2452,20 +3091,20 @@ impl Render for Workspace {
                         .gap_2()
                         .items_center()
                         .rounded(px(RADIUS_ROW))
-                        .bg(solid(BG_ELEVATED))
+                        .bg(solid(p.bg_elevated))
                         .border_1()
-                        .border_color(solid(BORDER))
+                        .border_color(solid(p.border))
                         .child(
                             div()
                                 .w(px(6.))
                                 .h(px(6.))
                                 .rounded(px(999.))
-                                .bg(solid(toast.accent_hex)),
+                                .bg(solid(dot_hex)),
                         )
                         .child(
                             div()
                                 .text_xs()
-                                .text_color(solid(TEXT_PRIMARY))
+                                .text_color(solid(p.text_primary))
                                 .child(toast.message),
                         ),
                 )
@@ -2477,6 +3116,10 @@ impl Render for Workspace {
             // QuickLook Spacebar modal overlay
             .when_some(quicklook_entry, |el, entry| {
                 el.child(render_quicklook_modal(self, &entry, &quicklook_payload, cx))
+            })
+            // Global Search overlay (Ctrl+K)
+            .when_some(self.global_search.as_ref(), |el, gs| {
+                el.child(render_global_search_modal(self, gs, cx))
             })
             // Active modal overlay (Settings / Prompts / Confirmations)
             .when_some(self.active_modal.clone(), |el, modal| {

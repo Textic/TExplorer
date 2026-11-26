@@ -1,8 +1,11 @@
 //! Virtual File System providers for T Explorer.
 
+pub mod folder_size;
 pub mod local;
+pub mod search;
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicBool;
 
 use texplorer_core::{FileEntry, Location};
 
@@ -18,9 +21,10 @@ pub fn list_location(location: &Location) -> Result<Vec<FileEntry>, String> {
             "Archive virtual browsing for \"{}\" will be enabled in Phase 4.",
             archive_path.display()
         )),
-        Location::Search { query, .. } => Err(format!(
-            "Global MFT search for \"{query}\" will be enabled in Phase 3."
-        )),
+        Location::Search { query, scope } => {
+            let cancel = AtomicBool::new(false);
+            search::execute_search(query, scope, true, 1_000, &cancel).map(|res| res.entries)
+        }
     }
 }
 

@@ -11,9 +11,7 @@ use gpui_kit::{
 use texplorer_ops::{ConflictPrompt, ConflictResolution, TransferStatus};
 
 use crate::theme::{
-    BG_BASE, BG_ELEVATED, BG_HOVER, BG_SURFACE, BORDER, BORDER_SUBTLE, RADIUS_CONTROL, RADIUS_ROW,
-    STATUS_ERROR, STATUS_INFO, STATUS_SUCCESS, STATUS_WARNING, TEXT_MUTED, TEXT_PRIMARY,
-    TEXT_SECONDARY, format_size, format_timestamp, soft_tint, solid,
+    Palette, RADIUS_CONTROL, RADIUS_ROW, format_size, format_timestamp, soft_tint, solid,
 };
 use crate::ui::workspace::Workspace;
 
@@ -23,7 +21,7 @@ pub fn render_transfer_drawer(ws: &Workspace, cx: &mut Context<Workspace>) -> im
         return div().into_any_element();
     }
 
-    let accent = ws.settings.accent;
+    let p = ws.palette();
     let unit = ws.settings.size_unit;
     let has_finished = ws.transfers.iter().any(|t| t.snapshot.status.is_terminal());
 
@@ -33,9 +31,9 @@ pub fn render_transfer_drawer(ws: &Workspace, cx: &mut Context<Workspace>) -> im
         .right(px(16.))
         .bottom(px(34.))
         .w(px(356.))
-        .bg(solid(BG_SURFACE))
+        .bg(solid(p.bg_surface))
         .border_1()
-        .border_color(solid(BORDER))
+        .border_color(solid(p.border))
         .rounded(px(RADIUS_ROW))
         .overflow_hidden()
         .occlude()
@@ -46,14 +44,14 @@ pub fn render_transfer_drawer(ws: &Workspace, cx: &mut Context<Workspace>) -> im
                 .px_3()
                 .items_center()
                 .justify_between()
-                .bg(solid(BG_ELEVATED))
+                .bg(solid(p.bg_elevated))
                 .border_b_1()
-                .border_color(solid(BORDER_SUBTLE))
+                .border_color(solid(p.border_subtle))
                 .child(
                     div()
                         .text_size(px(11.))
                         .font_semibold()
-                        .text_color(solid(TEXT_SECONDARY))
+                        .text_color(solid(p.text_secondary))
                         .child("TRANSFERS"),
                 )
                 .when(has_finished, |el| {
@@ -65,8 +63,10 @@ pub fn render_transfer_drawer(ws: &Workspace, cx: &mut Context<Workspace>) -> im
                             .rounded(px(RADIUS_CONTROL))
                             .cursor_pointer()
                             .text_size(px(10.))
-                            .text_color(solid(TEXT_MUTED))
-                            .hover(|s| s.bg(solid(BG_HOVER)).text_color(solid(TEXT_PRIMARY)))
+                            .text_color(solid(p.text_muted))
+                            .hover(move |s| {
+                                s.bg(solid(p.bg_hover)).text_color(solid(p.text_primary))
+                            })
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.clear_finished_transfers(cx);
                             }))
@@ -82,7 +82,7 @@ pub fn render_transfer_drawer(ws: &Workspace, cx: &mut Context<Workspace>) -> im
             let is_terminal = snap.status.is_terminal();
 
             let (status_text, bar_hex): (SharedString, u32) = match &snap.status {
-                TransferStatus::Queued => ("Queued...".into(), TEXT_MUTED),
+                TransferStatus::Queued => ("Queued...".into(), p.text_muted),
                 TransferStatus::Running => {
                     let speed = if snap.speed_bytes_per_sec > 1.0 {
                         format!(
@@ -100,14 +100,16 @@ pub fn render_transfer_drawer(ws: &Workspace, cx: &mut Context<Workspace>) -> im
                             frac * 100.0
                         )
                         .into(),
-                        accent.primary_hex(),
+                        p.accent_primary,
                     )
                 }
-                TransferStatus::Paused => ("Paused".into(), STATUS_WARNING),
-                TransferStatus::WaitingConflict => ("Waiting for conflict decision...".into(), STATUS_WARNING),
-                TransferStatus::Completed => ("Completed".into(), STATUS_SUCCESS),
-                TransferStatus::Cancelled => ("Cancelled".into(), TEXT_MUTED),
-                TransferStatus::Failed(err) => (err.clone().into(), STATUS_ERROR),
+                TransferStatus::Paused => ("Paused".into(), p.status_warning),
+                TransferStatus::WaitingConflict => {
+                    ("Waiting for conflict decision...".into(), p.status_warning)
+                }
+                TransferStatus::Completed => ("Completed".into(), p.status_success),
+                TransferStatus::Cancelled => ("Cancelled".into(), p.text_muted),
+                TransferStatus::Failed(err) => (err.clone().into(), p.status_error),
             };
 
             let title: SharedString = snap.title.clone().into();
@@ -119,7 +121,7 @@ pub fn render_transfer_drawer(ws: &Workspace, cx: &mut Context<Workspace>) -> im
                 .p_2p5()
                 .gap_1p5()
                 .border_b_1()
-                .border_color(solid(BORDER_SUBTLE))
+                .border_color(solid(p.border_subtle))
                 .child(
                     h_flex()
                         .items_center()
@@ -132,7 +134,7 @@ pub fn render_transfer_drawer(ws: &Workspace, cx: &mut Context<Workspace>) -> im
                                 .truncate()
                                 .text_xs()
                                 .font_medium()
-                                .text_color(solid(TEXT_PRIMARY))
+                                .text_color(solid(p.text_primary))
                                 .child(title),
                         )
                         .child(
@@ -184,7 +186,7 @@ pub fn render_transfer_drawer(ws: &Workspace, cx: &mut Context<Workspace>) -> im
                         .w_full()
                         .h(px(4.))
                         .rounded(px(2.))
-                        .bg(solid(BG_BASE))
+                        .bg(solid(p.bg_base))
                         .overflow_hidden()
                         .child(div().h_full().w(relative(frac)).bg(solid(bar_hex))),
                 )
@@ -199,7 +201,7 @@ pub fn render_transfer_drawer(ws: &Workspace, cx: &mut Context<Workspace>) -> im
                                 .min_w_0()
                                 .truncate()
                                 .text_size(px(11.))
-                                .text_color(solid(TEXT_MUTED))
+                                .text_color(solid(p.text_muted))
                                 .child(status_text),
                         )
                         .when(!current.is_empty() && !is_terminal, |el| {
@@ -208,7 +210,7 @@ pub fn render_transfer_drawer(ws: &Workspace, cx: &mut Context<Workspace>) -> im
                                     .max_w(px(130.))
                                     .truncate()
                                     .text_size(px(10.))
-                                    .text_color(solid(TEXT_SECONDARY))
+                                    .text_color(solid(p.text_secondary))
                                     .child(current),
                             )
                         }),
@@ -223,7 +225,7 @@ pub fn render_conflict_modal(
     prompt: &ConflictPrompt,
     cx: &mut Context<Workspace>,
 ) -> impl IntoElement {
-    let accent = ws.settings.accent;
+    let p = ws.palette();
     let unit = ws.settings.size_unit;
     let apply_all = ws.conflict_apply_to_all;
 
@@ -260,7 +262,7 @@ pub fn render_conflict_modal(
                 .id("conflict-backdrop")
                 .absolute()
                 .inset_0()
-                .bg(gpui_kit::hsla(0.0, 0.0, 0.0, 0.68))
+                .bg(gpui_kit::hsla(0.0, 0.0, 0.0, p.backdrop_alpha()))
                 .occlude()
                 .on_scroll(|_, _, cx| cx.stop_propagation())
                 .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation()),
@@ -270,9 +272,9 @@ pub fn render_conflict_modal(
                 .id("conflict-card")
                 .relative()
                 .w(px(500.))
-                .bg(solid(BG_SURFACE))
+                .bg(solid(p.bg_surface))
                 .border_1()
-                .border_color(solid(BORDER))
+                .border_color(solid(p.border))
                 .rounded(px(RADIUS_ROW))
                 .overflow_hidden()
                 .occlude()
@@ -283,19 +285,19 @@ pub fn render_conflict_modal(
                         .px_4()
                         .items_center()
                         .gap_2()
-                        .bg(solid(BG_ELEVATED))
+                        .bg(solid(p.bg_elevated))
                         .border_b_1()
-                        .border_color(solid(BORDER_SUBTLE))
+                        .border_color(solid(p.border_subtle))
                         .child(
                             Icon::new(LucideIcon::TriangleAlert)
                                 .small()
-                                .text_color(solid(STATUS_WARNING)),
+                                .text_color(solid(p.status_warning)),
                         )
                         .child(
                             div()
                                 .text_sm()
                                 .font_semibold()
-                                .text_color(solid(TEXT_PRIMARY))
+                                .text_color(solid(p.text_primary))
                                 .child("Replace or Skip Item?"),
                         ),
                 )
@@ -306,7 +308,7 @@ pub fn render_conflict_modal(
                         .child(
                             div()
                                 .text_xs()
-                                .text_color(solid(TEXT_SECONDARY))
+                                .text_color(solid(p.text_secondary))
                                 .child(format!(
                                     "The destination already contains an item named \"{item_name}\"."
                                 )),
@@ -319,13 +321,15 @@ pub fn render_conflict_modal(
                                     "Source (Incoming)",
                                     src_size,
                                     src_time,
-                                    STATUS_INFO,
+                                    p.status_info,
+                                    p,
                                 ))
                                 .child(compare_card(
                                     "Destination (Existing)",
                                     dst_size,
                                     dst_time,
-                                    STATUS_WARNING,
+                                    p.status_warning,
+                                    p,
                                 )),
                         )
                         // Apply to all toggle
@@ -351,28 +355,28 @@ pub fn render_conflict_modal(
                                         .justify_center()
                                         .rounded(px(3.))
                                         .bg(if apply_all {
-                                            soft_tint(accent.primary_hex(), 0.22)
+                                            soft_tint(p.accent_primary, 0.22)
                                         } else {
-                                            solid(BG_BASE)
+                                            solid(p.bg_base)
                                         })
                                         .border_1()
                                         .border_color(if apply_all {
-                                            solid(accent.primary_hex())
+                                            solid(p.accent_primary)
                                         } else {
-                                            solid(BORDER)
+                                            solid(p.border)
                                         })
                                         .when(apply_all, |el| {
                                             el.child(
                                                 Icon::new(LucideIcon::Check)
                                                     .xsmall()
-                                                    .text_color(solid(accent.primary_hex())),
+                                                    .text_color(solid(p.accent_primary)),
                                             )
                                         }),
                                 )
                                 .child(
                                     div()
                                         .text_xs()
-                                        .text_color(solid(TEXT_SECONDARY))
+                                        .text_color(solid(p.text_secondary))
                                         .child("Apply this decision to all remaining conflicts"),
                                 ),
                         )
@@ -438,6 +442,7 @@ fn compare_card(
     size_text: SharedString,
     time_text: SharedString,
     dot_hex: u32,
+    p: Palette,
 ) -> impl IntoElement {
     v_flex()
         .flex_1()
@@ -445,9 +450,9 @@ fn compare_card(
         .p_2p5()
         .gap_1()
         .rounded(px(RADIUS_ROW))
-        .bg(solid(BG_BASE))
+        .bg(solid(p.bg_base))
         .border_1()
-        .border_color(solid(BORDER_SUBTLE))
+        .border_color(solid(p.border_subtle))
         .child(
             h_flex()
                 .gap_1p5()
@@ -457,20 +462,20 @@ fn compare_card(
                     div()
                         .text_size(px(11.))
                         .font_semibold()
-                        .text_color(solid(TEXT_PRIMARY))
+                        .text_color(solid(p.text_primary))
                         .child(heading),
                 ),
         )
         .child(
             div()
                 .text_xs()
-                .text_color(solid(TEXT_SECONDARY))
+                .text_color(solid(p.text_secondary))
                 .child(size_text),
         )
         .child(
             div()
                 .text_size(px(11.))
-                .text_color(solid(TEXT_MUTED))
+                .text_color(solid(p.text_muted))
                 .child(time_text),
         )
 }

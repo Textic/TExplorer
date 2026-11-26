@@ -14,7 +14,7 @@ use smallvec::smallvec;
 use texplorer_core::FileKind;
 use texplorer_platform::{RawBgraImage, ShellWorker};
 
-use crate::theme::{STATUS_INFO, STATUS_SUCCESS, STATUS_VIOLET, STATUS_WARNING, TEXT_MUTED, solid};
+use crate::theme::{Palette, solid};
 
 /// Cache key uniquely identifying a rendered thumbnail by path, timestamp, and pixel dimension.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -159,6 +159,7 @@ pub fn load_preview_blocking(
     path: PathBuf,
     kind: FileKind,
     shell_worker: ShellWorker,
+    palette: Palette,
 ) -> PreviewPayload {
     if path.is_dir() || kind == FileKind::Folder {
         return load_folder_summary(&path);
@@ -198,7 +199,7 @@ pub fn load_preview_blocking(
         && let Some((text, truncated)) = read_utf8_preview(&path, 192 * 1024)
     {
         let language = language_label(&ext);
-        let lines = highlight_code_lines(&text, &ext, 450);
+        let lines = highlight_code_lines(&text, &ext, 450, palette);
         return PreviewPayload::Code {
             language,
             lines,
@@ -224,7 +225,7 @@ pub fn load_preview_blocking(
 
     // 5. Fallback heuristic: attempt UTF-8 text preview for extensionless small text files (e.g. LICENSE, Dockerfile).
     if let Some((text, truncated)) = read_utf8_preview(&path, 64 * 1024) {
-        let lines = highlight_code_lines(&text, "", 300);
+        let lines = highlight_code_lines(&text, "", 300, palette);
         return PreviewPayload::Code {
             language: "Plain Text",
             lines,
@@ -370,7 +371,12 @@ fn language_label(ext: &str) -> &'static str {
 
 /// Lightweight per-line syntax highlighter producing sorted, non-overlapping byte ranges
 /// guaranteed safe for GPUI `StyledText::with_highlights`.
-pub fn highlight_code_lines(text: &str, ext: &str, max_lines: usize) -> Vec<HighlightedLine> {
+pub fn highlight_code_lines(
+    text: &str,
+    ext: &str,
+    max_lines: usize,
+    palette: Palette,
+) -> Vec<HighlightedLine> {
     let hash_comments = matches!(
         ext,
         "py" | "toml" | "yaml" | "yml" | "sh" | "bash" | "zsh" | "ps1" | "rb" | "env" | "conf" | "cfg"
@@ -382,23 +388,23 @@ pub fn highlight_code_lines(text: &str, ext: &str, max_lines: usize) -> Vec<High
     );
 
     let kw_style = HighlightStyle {
-        color: Some(solid(STATUS_VIOLET)),
+        color: Some(solid(palette.syntax_keyword)),
         ..Default::default()
     };
     let str_style = HighlightStyle {
-        color: Some(solid(STATUS_SUCCESS)),
+        color: Some(solid(palette.syntax_string)),
         ..Default::default()
     };
     let num_style = HighlightStyle {
-        color: Some(solid(STATUS_WARNING)),
+        color: Some(solid(palette.syntax_number)),
         ..Default::default()
     };
     let type_style = HighlightStyle {
-        color: Some(solid(STATUS_INFO)),
+        color: Some(solid(palette.syntax_type)),
         ..Default::default()
     };
     let comment_style = HighlightStyle {
-        color: Some(solid(TEXT_MUTED)),
+        color: Some(solid(palette.syntax_comment)),
         ..Default::default()
     };
 
@@ -562,11 +568,17 @@ fn is_keyword(word: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use texplorer_core::{AccentPreset, ThemePreset};
 
     #[test]
     fn highlights_rust_code_with_non_overlapping_ranges() {
+        let palette = crate::theme::resolve_palette(
+            ThemePreset::FilesDark,
+            AccentPreset::FilesBlue,
+            true,
+        );
         let src = "pub fn answer() -> u32 {\n    // comment\n    let x = \"hi\";\n    42\n}";
-        let lines = highlight_code_lines(src, "rs", 50);
+        let lines = highlight_code_lines(src, "rs", 50, palette);
         assert_eq!(lines.len(), 5);
         for line in &lines {
             let mut prev_end = 0usize;

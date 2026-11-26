@@ -13,17 +13,15 @@ use gpui_kit::{
 use texplorer_core::Location;
 
 use crate::theme::{
-    BG_BASE, BG_ELEVATED, BG_HOVER, BG_SURFACE, BORDER_SUBTLE, RADIUS_CONTROL, TEXT_MUTED,
-    TEXT_PRIMARY, TEXT_SECONDARY, drive_kind_icon, known_folder_icon, soft_tint, solid,
-    usage_bar_color,
+    Palette, RADIUS_CONTROL, drive_kind_icon, known_folder_icon, soft_tint, solid, usage_bar_color,
 };
 use crate::ui::context_menu::ContextMenuTarget;
 use crate::ui::workspace::Workspace;
 
-/// Renders the flat-dark left navigation rail containing Home, customizable Quick Access,
+/// Renders the flat left navigation rail containing Home, customizable Quick Access,
 /// Pinned folders, compact drive rows with usage bars, and WSL distributions.
 pub fn render_sidebar(ws: &Workspace, cx: &mut Context<Workspace>) -> impl IntoElement {
-    let accent = ws.settings.accent;
+    let p = ws.palette();
     let current_loc = ws
         .active_tab()
         .map(|t| t.model.active_pane_ref().location.clone())
@@ -40,7 +38,7 @@ pub fn render_sidebar(ws: &Workspace, cx: &mut Context<Workspace>) -> impl IntoE
     v_flex()
         .id("explorer-sidebar")
         .size_full()
-        .bg(solid(BG_SURFACE))
+        .bg(solid(p.bg_surface))
         .overflow_hidden()
         .child(
             v_flex()
@@ -62,32 +60,32 @@ pub fn render_sidebar(ws: &Workspace, cx: &mut Context<Workspace>) -> impl IntoE
                         .rounded(px(RADIUS_CONTROL))
                         .cursor_pointer()
                         .bg(if is_home {
-                            solid(BG_ELEVATED)
+                            solid(p.bg_elevated)
                         } else {
                             gpui_kit::transparent_black()
                         })
                         .border_1()
                         .border_color(if is_home {
-                            solid(BORDER_SUBTLE)
+                            solid(p.border_subtle)
                         } else {
                             gpui_kit::transparent_black()
                         })
-                        .hover(|s| s.bg(solid(BG_ELEVATED)))
+                        .hover(move |s| s.bg(solid(p.bg_elevated)))
                         .on_click(cx.listener(|this, _, window, cx| {
                             this.navigate_active_pane(Location::Home, window, cx);
                         }))
                         .child(Icon::new(LucideIcon::House).xsmall().text_color(
                             if is_home {
-                                solid(accent.primary_hex())
+                                solid(p.accent_primary)
                             } else {
-                                solid(TEXT_SECONDARY)
+                                solid(p.text_secondary)
                             },
                         ))
                         .child(
                             div()
                                 .text_xs()
                                 .font_semibold()
-                                .text_color(solid(TEXT_PRIMARY))
+                                .text_color(solid(p.text_primary))
                                 .child("Home"),
                         ),
                 )
@@ -96,7 +94,7 @@ pub fn render_sidebar(ws: &Workspace, cx: &mut Context<Workspace>) -> impl IntoE
                     el.child(
                         v_flex()
                             .gap_0p5()
-                            .child(section_label("QUICK ACCESS"))
+                            .child(section_label("QUICK ACCESS", p))
                             .children(visible_quick_access.into_iter().enumerate().map(
                                 |(i, folder)| {
                                     let target = Location::local(&folder.path);
@@ -117,11 +115,11 @@ pub fn render_sidebar(ws: &Workspace, cx: &mut Context<Workspace>) -> impl IntoE
                                         .rounded(px(RADIUS_CONTROL))
                                         .cursor_pointer()
                                         .bg(if active {
-                                            solid(BG_ELEVATED)
+                                            solid(p.bg_elevated)
                                         } else {
                                             gpui_kit::transparent_black()
                                         })
-                                        .hover(|s| s.bg(solid(BG_ELEVATED)))
+                                        .hover(move |s| s.bg(solid(p.bg_elevated)))
                                         .on_mouse_down(
                                             MouseButton::Left,
                                             cx.listener(
@@ -159,9 +157,9 @@ pub fn render_sidebar(ws: &Workspace, cx: &mut Context<Workspace>) -> impl IntoE
                                             }),
                                         )
                                         .child(Icon::new(icon).xsmall().text_color(if active {
-                                            solid(accent.primary_hex())
+                                            solid(p.accent_primary)
                                         } else {
-                                            solid(TEXT_SECONDARY)
+                                            solid(p.text_secondary)
                                         }))
                                         .child(
                                             div()
@@ -170,9 +168,9 @@ pub fn render_sidebar(ws: &Workspace, cx: &mut Context<Workspace>) -> impl IntoE
                                                 .truncate()
                                                 .text_xs()
                                                 .text_color(if active {
-                                                    solid(TEXT_PRIMARY)
+                                                    solid(p.text_primary)
                                                 } else {
-                                                    solid(TEXT_SECONDARY)
+                                                    solid(p.text_secondary)
                                                 })
                                                 .child(label),
                                         )
@@ -185,7 +183,7 @@ pub fn render_sidebar(ws: &Workspace, cx: &mut Context<Workspace>) -> impl IntoE
                     el.child(
                         v_flex()
                             .gap_0p5()
-                            .child(section_label("PINNED"))
+                            .child(section_label("PINNED", p))
                             .children(ws.settings.pinned_folders.iter().enumerate().map(
                                 |(i, path)| {
                                     let target = Location::local(path);
@@ -205,11 +203,11 @@ pub fn render_sidebar(ws: &Workspace, cx: &mut Context<Workspace>) -> impl IntoE
                                         .rounded(px(RADIUS_CONTROL))
                                         .cursor_pointer()
                                         .bg(if active {
-                                            solid(BG_ELEVATED)
+                                            solid(p.bg_elevated)
                                         } else {
                                             gpui_kit::transparent_black()
                                         })
-                                        .hover(|s| s.bg(solid(BG_ELEVATED)))
+                                        .hover(move |s| s.bg(solid(p.bg_elevated)))
                                         .on_mouse_down(
                                             MouseButton::Left,
                                             cx.listener(
@@ -236,9 +234,9 @@ pub fn render_sidebar(ws: &Workspace, cx: &mut Context<Workspace>) -> impl IntoE
                                         )
                                         .child(Icon::new(LucideIcon::Pin).xsmall().text_color(
                                             if active {
-                                                solid(accent.primary_hex())
+                                                solid(p.accent_primary)
                                             } else {
-                                                solid(TEXT_MUTED)
+                                                solid(p.text_muted)
                                             },
                                         ))
                                         .child(
@@ -248,9 +246,9 @@ pub fn render_sidebar(ws: &Workspace, cx: &mut Context<Workspace>) -> impl IntoE
                                                 .truncate()
                                                 .text_xs()
                                                 .text_color(if active {
-                                                    solid(TEXT_PRIMARY)
+                                                    solid(p.text_primary)
                                                 } else {
-                                                    solid(TEXT_SECONDARY)
+                                                    solid(p.text_secondary)
                                                 })
                                                 .child(name),
                                         )
@@ -263,10 +261,10 @@ pub fn render_sidebar(ws: &Workspace, cx: &mut Context<Workspace>) -> impl IntoE
                                                 .items_center()
                                                 .justify_center()
                                                 .rounded(px(3.))
-                                                .text_color(solid(TEXT_MUTED))
-                                                .hover(|s| {
-                                                    s.bg(solid(BG_HOVER))
-                                                        .text_color(solid(TEXT_PRIMARY))
+                                                .text_color(solid(p.text_muted))
+                                                .hover(move |s| {
+                                                    s.bg(solid(p.bg_hover))
+                                                        .text_color(solid(p.text_primary))
                                                 })
                                                 .on_mouse_down(
                                                     MouseButton::Left,
@@ -296,7 +294,7 @@ pub fn render_sidebar(ws: &Workspace, cx: &mut Context<Workspace>) -> impl IntoE
                                 .items_center()
                                 .justify_between()
                                 .px_1()
-                                .child(section_label("DRIVES"))
+                                .child(section_label("DRIVES", p))
                                 .child(
                                     Button::new("sb-refresh-drives")
                                         .with_size(Size::XSmall)
@@ -311,14 +309,14 @@ pub fn render_sidebar(ws: &Workspace, cx: &mut Context<Workspace>) -> impl IntoE
                         .children(ws.volumes.iter().enumerate().map(|(i, vol)| {
                             let target = Location::local(&vol.root_path);
                             let active = match &current_loc {
-                                Location::Local(p) => p
+                                Location::Local(path) => path
                                     .to_string_lossy()
                                     .to_ascii_uppercase()
                                     .starts_with(&vol.short_name.to_ascii_uppercase()),
                                 _ => false,
                             };
                             let frac = vol.used_fraction();
-                            let bar_hex = usage_bar_color(frac, accent);
+                            let bar_hex = usage_bar_color(frac, p);
                             let title: SharedString = vol.display_name().into();
                             let fs_badge: SharedString = vol.file_system.clone().into();
                             let vol_mid = vol.root_path.clone();
@@ -333,17 +331,17 @@ pub fn render_sidebar(ws: &Workspace, cx: &mut Context<Workspace>) -> impl IntoE
                                 .rounded(px(RADIUS_CONTROL))
                                 .cursor_pointer()
                                 .bg(if active {
-                                    solid(BG_ELEVATED)
+                                    solid(p.bg_elevated)
                                 } else {
-                                    solid(BG_BASE)
+                                    solid(p.bg_base)
                                 })
                                 .border_1()
                                 .border_color(if active {
-                                    solid(accent.primary_hex())
+                                    solid(p.accent_primary)
                                 } else {
-                                    solid(BORDER_SUBTLE)
+                                    solid(p.border_subtle)
                                 })
-                                .hover(|s| s.bg(solid(BG_ELEVATED)))
+                                .hover(move |s| s.bg(solid(p.bg_elevated)))
                                 .on_mouse_down(
                                     MouseButton::Left,
                                     cx.listener(move |this, _: &MouseDownEvent, window, cx| {
@@ -381,9 +379,9 @@ pub fn render_sidebar(ws: &Workspace, cx: &mut Context<Workspace>) -> impl IntoE
                                                     Icon::new(drive_kind_icon(vol.kind))
                                                         .xsmall()
                                                         .text_color(if active {
-                                                            solid(accent.primary_hex())
+                                                            solid(p.accent_primary)
                                                         } else {
-                                                            solid(TEXT_SECONDARY)
+                                                            solid(p.text_secondary)
                                                         }),
                                                 )
                                                 .child(
@@ -393,7 +391,7 @@ pub fn render_sidebar(ws: &Workspace, cx: &mut Context<Workspace>) -> impl IntoE
                                                         .truncate()
                                                         .text_xs()
                                                         .font_medium()
-                                                        .text_color(solid(TEXT_PRIMARY))
+                                                        .text_color(solid(p.text_primary))
                                                         .child(title),
                                                 ),
                                         )
@@ -402,8 +400,8 @@ pub fn render_sidebar(ws: &Workspace, cx: &mut Context<Workspace>) -> impl IntoE
                                                 div()
                                                     .px_1()
                                                     .rounded(px(3.))
-                                                    .bg(soft_tint(accent.primary_hex(), 0.12))
-                                                    .text_color(solid(accent.primary_hex()))
+                                                    .bg(soft_tint(p.accent_primary, 0.12))
+                                                    .text_color(solid(p.accent_primary))
                                                     .text_size(px(9.))
                                                     .child(fs_badge),
                                             )
@@ -414,7 +412,7 @@ pub fn render_sidebar(ws: &Workspace, cx: &mut Context<Workspace>) -> impl IntoE
                                         .w_full()
                                         .h(px(3.))
                                         .rounded(px(2.))
-                                        .bg(solid(BORDER_SUBTLE))
+                                        .bg(solid(p.border_subtle))
                                         .overflow_hidden()
                                         .child(
                                             div()
@@ -430,7 +428,7 @@ pub fn render_sidebar(ws: &Workspace, cx: &mut Context<Workspace>) -> impl IntoE
                     el.child(
                         v_flex()
                             .gap_0p5()
-                            .child(section_label("LINUX / WSL"))
+                            .child(section_label("LINUX / WSL", p))
                             .children(ws.wsl_distros.iter().enumerate().map(|(i, (name, path))| {
                                 let target = Location::local(path);
                                 let active = current_loc == target;
@@ -448,11 +446,11 @@ pub fn render_sidebar(ws: &Workspace, cx: &mut Context<Workspace>) -> impl IntoE
                                     .rounded(px(RADIUS_CONTROL))
                                     .cursor_pointer()
                                     .bg(if active {
-                                        solid(BG_ELEVATED)
+                                        solid(p.bg_elevated)
                                     } else {
                                         gpui_kit::transparent_black()
                                     })
-                                    .hover(|s| s.bg(solid(BG_ELEVATED)))
+                                    .hover(move |s| s.bg(solid(p.bg_elevated)))
                                     .on_mouse_down(
                                         MouseButton::Left,
                                         cx.listener(move |this, _: &MouseDownEvent, window, cx| {
@@ -472,7 +470,7 @@ pub fn render_sidebar(ws: &Workspace, cx: &mut Context<Workspace>) -> impl IntoE
                                     .child(
                                         Icon::new(LucideIcon::Terminal)
                                             .xsmall()
-                                            .text_color(solid(TEXT_SECONDARY)),
+                                            .text_color(solid(p.text_secondary)),
                                     )
                                     .child(
                                         div()
@@ -480,7 +478,7 @@ pub fn render_sidebar(ws: &Workspace, cx: &mut Context<Workspace>) -> impl IntoE
                                             .min_w_0()
                                             .truncate()
                                             .text_xs()
-                                            .text_color(solid(TEXT_SECONDARY))
+                                            .text_color(solid(p.text_secondary))
                                             .child(label),
                                     )
                             })),
@@ -489,12 +487,12 @@ pub fn render_sidebar(ws: &Workspace, cx: &mut Context<Workspace>) -> impl IntoE
         )
 }
 
-fn section_label(text: &'static str) -> impl IntoElement {
+fn section_label(text: &'static str, p: Palette) -> impl IntoElement {
     div()
         .px_1p5()
         .py_0p5()
         .text_size(px(10.))
         .font_semibold()
-        .text_color(solid(TEXT_MUTED))
+        .text_color(solid(p.text_muted))
         .child(text)
 }

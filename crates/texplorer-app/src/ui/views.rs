@@ -12,8 +12,7 @@ use gpui_kit::{
 use texplorer_core::{EntryFlags, Location, PaneSide, SortColumn, SortSpec};
 
 use crate::theme::{
-    BG_BASE, BG_ELEVATED, BG_SURFACE, BORDER, BORDER_SUBTLE, RADIUS_CONTROL, RADIUS_ROW,
-    TEXT_MUTED, TEXT_PRIMARY, TEXT_SECONDARY, drive_kind_icon, file_kind_visual, format_size,
+    Palette, RADIUS_CONTROL, RADIUS_ROW, drive_kind_icon, file_kind_visual, format_size,
     format_timestamp, known_folder_icon, soft_tint, solid, usage_bar_color,
 };
 use crate::ui::context_menu::ContextMenuTarget;
@@ -28,30 +27,31 @@ pub struct DraggedEntries {
 
 struct DragBadgeView {
     label: SharedString,
-    accent_hex: u32,
+    palette: Palette,
 }
 
 impl Render for DragBadgeView {
     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        let p = self.palette;
         h_flex()
             .px_2p5()
             .py_1()
             .gap_1p5()
             .items_center()
             .rounded(px(RADIUS_CONTROL))
-            .bg(solid(BG_ELEVATED))
+            .bg(solid(p.bg_elevated))
             .border_1()
-            .border_color(solid(self.accent_hex))
+            .border_color(solid(p.accent_primary))
             .child(
                 Icon::new(LucideIcon::FolderOpen)
                     .xsmall()
-                    .text_color(solid(self.accent_hex)),
+                    .text_color(solid(p.accent_primary)),
             )
             .child(
                 div()
                     .text_xs()
                     .font_medium()
-                    .text_color(solid(TEXT_PRIMARY))
+                    .text_color(solid(p.text_primary))
                     .child(self.label.clone()),
             )
     }
@@ -63,7 +63,7 @@ pub fn render_home_view(
     side: PaneSide,
     cx: &mut Context<Workspace>,
 ) -> impl IntoElement {
-    let accent = ws.settings.accent;
+    let p = ws.palette();
     let unit = ws.settings.size_unit;
     let visible_quick_access: Vec<_> = ws
         .known_folders
@@ -78,7 +78,7 @@ pub fn render_home_view(
             PaneSide::Right => "home-view-right",
         })
         .size_full()
-        .bg(solid(BG_BASE))
+        .bg(solid(p.bg_base))
         .overflow_y_scrollbar()
         .p_5()
         .gap_6()
@@ -86,7 +86,7 @@ pub fn render_home_view(
             el.child(
                 v_flex()
                     .gap_2p5()
-                    .child(home_section_header("Quick Access"))
+                    .child(home_section_header("Quick Access", p))
                     .child(
                         h_flex()
                             .flex_wrap()
@@ -115,11 +115,12 @@ pub fn render_home_view(
                                         .items_center()
                                         .rounded(px(RADIUS_ROW))
                                         .cursor_pointer()
-                                        .bg(solid(BG_SURFACE))
+                                        .bg(solid(p.bg_surface))
                                         .border_1()
-                                        .border_color(solid(BORDER_SUBTLE))
-                                        .hover(|s| {
-                                            s.bg(solid(BG_ELEVATED)).border_color(solid(BORDER))
+                                        .border_color(solid(p.border_subtle))
+                                        .hover(move |s| {
+                                            s.bg(solid(p.bg_elevated))
+                                                .border_color(solid(p.border))
                                         })
                                         .on_mouse_down(
                                             MouseButton::Left,
@@ -167,11 +168,11 @@ pub fn render_home_view(
                                                 .items_center()
                                                 .justify_center()
                                                 .rounded(px(RADIUS_CONTROL))
-                                                .bg(soft_tint(accent.primary_hex(), 0.12))
+                                                .bg(soft_tint(p.accent_primary, 0.12))
                                                 .child(
                                                     Icon::new(icon)
                                                         .small()
-                                                        .text_color(solid(accent.primary_hex())),
+                                                        .text_color(solid(p.accent_primary)),
                                                 ),
                                         )
                                         .child(
@@ -184,14 +185,14 @@ pub fn render_home_view(
                                                         .truncate()
                                                         .text_xs()
                                                         .font_semibold()
-                                                        .text_color(solid(TEXT_PRIMARY))
+                                                        .text_color(solid(p.text_primary))
                                                         .child(name),
                                                 )
                                                 .child(
                                                     div()
                                                         .truncate()
                                                         .text_size(px(11.))
-                                                        .text_color(solid(TEXT_MUTED))
+                                                        .text_color(solid(p.text_muted))
                                                         .child(sub),
                                                 ),
                                         )
@@ -203,7 +204,7 @@ pub fn render_home_view(
         .child(
             v_flex()
                 .gap_2p5()
-                .child(home_section_header("Devices and Drives"))
+                .child(home_section_header("Devices and Drives", p))
                 .child(
                     h_flex()
                         .flex_wrap()
@@ -213,7 +214,7 @@ pub fn render_home_view(
                             let mid_target = target.clone();
                             let vol_ctx = vol.clone();
                             let frac = vol.used_fraction();
-                            let bar_hex = usage_bar_color(frac, accent);
+                            let bar_hex = usage_bar_color(frac, p);
                             let title: SharedString = vol.display_name().into();
                             let fs_label: SharedString = vol.file_system.clone().into();
                             let pct_label: SharedString = format!("{:.0}%", frac * 100.0).into();
@@ -237,10 +238,12 @@ pub fn render_home_view(
                                 .gap_2()
                                 .rounded(px(RADIUS_ROW))
                                 .cursor_pointer()
-                                .bg(solid(BG_SURFACE))
+                                .bg(solid(p.bg_surface))
                                 .border_1()
-                                .border_color(solid(BORDER_SUBTLE))
-                                .hover(|s| s.bg(solid(BG_ELEVATED)).border_color(solid(BORDER)))
+                                .border_color(solid(p.border_subtle))
+                                .hover(move |s| {
+                                    s.bg(solid(p.bg_elevated)).border_color(solid(p.border))
+                                })
                                 .on_mouse_down(
                                     MouseButton::Left,
                                     cx.listener(move |this, _: &MouseDownEvent, window, cx| {
@@ -277,7 +280,7 @@ pub fn render_home_view(
                                                 .child(
                                                     Icon::new(drive_kind_icon(vol.kind))
                                                         .small()
-                                                        .text_color(solid(accent.primary_hex())),
+                                                        .text_color(solid(p.accent_primary)),
                                                 )
                                                 .child(
                                                     div()
@@ -286,7 +289,7 @@ pub fn render_home_view(
                                                         .truncate()
                                                         .text_xs()
                                                         .font_semibold()
-                                                        .text_color(solid(TEXT_PRIMARY))
+                                                        .text_color(solid(p.text_primary))
                                                         .child(title),
                                                 ),
                                         )
@@ -296,11 +299,11 @@ pub fn render_home_view(
                                                     .px_1p5()
                                                     .py_0p5()
                                                     .rounded(px(3.))
-                                                    .bg(solid(BG_BASE))
+                                                    .bg(solid(p.bg_base))
                                                     .border_1()
-                                                    .border_color(solid(BORDER_SUBTLE))
+                                                    .border_color(solid(p.border_subtle))
                                                     .text_size(px(10.))
-                                                    .text_color(solid(TEXT_SECONDARY))
+                                                    .text_color(solid(p.text_secondary))
                                                     .child(fs_label),
                                             )
                                         }),
@@ -310,7 +313,7 @@ pub fn render_home_view(
                                         .w_full()
                                         .h(px(6.))
                                         .rounded(px(3.))
-                                        .bg(solid(BG_BASE))
+                                        .bg(solid(p.border_subtle))
                                         .overflow_hidden()
                                         .child(div().h_full().w(relative(frac)).bg(solid(bar_hex))),
                                 )
@@ -321,14 +324,14 @@ pub fn render_home_view(
                                         .child(
                                             div()
                                                 .text_size(px(11.))
-                                                .text_color(solid(TEXT_MUTED))
+                                                .text_color(solid(p.text_muted))
                                                 .child(space_label),
                                         )
                                         .child(
                                             div()
                                                 .text_size(px(11.))
                                                 .font_medium()
-                                                .text_color(solid(TEXT_SECONDARY))
+                                                .text_color(solid(p.text_secondary))
                                                 .child(pct_label),
                                         ),
                                 )
@@ -343,6 +346,7 @@ pub fn render_details_view(
     side: PaneSide,
     cx: &mut Context<Workspace>,
 ) -> impl IntoElement {
+    let p = ws.palette();
     let Some(tab) = ws.active_tab() else {
         return div().size_full().into_any_element();
     };
@@ -352,8 +356,7 @@ pub fn render_details_view(
     let sort = model.sort;
     let is_loading = model.loading;
     let error = model.error.clone();
-    let pane_dir = model.location.as_local_path().map(|p| p.to_path_buf());
-    let accent_hex = ws.settings.accent.primary_hex();
+    let pane_dir = model.location.as_local_path().map(|path| path.to_path_buf());
     let list_id = match side {
         PaneSide::Left => "details-list-left",
         PaneSide::Right => "details-list-right",
@@ -364,13 +367,13 @@ pub fn render_details_view(
 
     v_flex()
         .size_full()
-        .bg(solid(BG_BASE))
+        .bg(solid(p.bg_base))
         .overflow_hidden()
         .drag_over::<DraggedEntries>(move |style, _, _, _| {
-            style.border_1().border_color(solid(accent_hex))
+            style.border_1().border_color(solid(p.accent_primary))
         })
         .drag_over::<ExternalPaths>(move |style, _, _, _| {
-            style.border_1().border_color(solid(accent_hex))
+            style.border_1().border_color(solid(p.accent_primary))
         })
         .on_drop(cx.listener(move |this, drag: &DraggedEntries, window, cx| {
             if let Some(ref dest) = pane_dir_int {
@@ -397,9 +400,9 @@ pub fn render_details_view(
                 .px_2p5()
                 .flex_shrink_0()
                 .items_center()
-                .bg(solid(BG_ELEVATED))
+                .bg(solid(p.bg_elevated))
                 .border_b_1()
-                .border_color(solid(BORDER_SUBTLE))
+                .border_color(solid(p.border_subtle))
                 .child(sort_header_cell(
                     side,
                     "Name",
@@ -407,6 +410,7 @@ pub fn render_details_view(
                     sort,
                     None,
                     false,
+                    p,
                     cx,
                 ))
                 .child(sort_header_cell(
@@ -416,6 +420,7 @@ pub fn render_details_view(
                     sort,
                     Some(142.),
                     false,
+                    p,
                     cx,
                 ))
                 .child(sort_header_cell(
@@ -425,6 +430,7 @@ pub fn render_details_view(
                     sort,
                     Some(126.),
                     false,
+                    p,
                     cx,
                 ))
                 .child(sort_header_cell(
@@ -434,12 +440,18 @@ pub fn render_details_view(
                     sort,
                     Some(92.),
                     true,
+                    p,
                     cx,
                 )),
         )
         .child(if row_count == 0 {
-            render_empty_state(is_loading, error, !model.quick_filter.trim().is_empty())
-                .into_any_element()
+            render_empty_state(
+                is_loading,
+                error,
+                !model.quick_filter.trim().is_empty(),
+                p,
+            )
+            .into_any_element()
         } else {
             uniform_list(
                 list_id,
@@ -462,9 +474,8 @@ fn render_details_rows(
     range: Range<usize>,
     cx: &mut Context<Workspace>,
 ) -> Vec<gpui_kit::AnyElement> {
-    let accent = ws.settings.accent;
+    let p = ws.palette();
     let unit = ws.settings.size_unit;
-    let accent_hex = accent.primary_hex();
 
     let Some(tab) = ws.active_tab() else {
         return Vec::new();
@@ -476,10 +487,10 @@ fn render_details_rows(
             let entry = model.visible_entry(vis_idx)?;
             let selected = model.selection.contains(vis_idx);
             let is_cursor = model.selection.cursor == Some(vis_idx);
-            let (icon, icon_hex) = file_kind_visual(entry.kind, accent);
+            let (icon, icon_hex) = file_kind_visual(entry.kind, p);
             let is_hidden = entry.is_hidden();
-            let local_path = entry.location.as_local_path().map(|p| p.to_path_buf());
-            let is_cut = local_path.as_ref().is_some_and(|p| ws.is_path_cut(p));
+            let local_path = entry.location.as_local_path().map(|path| path.to_path_buf());
+            let is_cut = local_path.as_ref().is_some_and(|path| ws.is_path_cut(path));
             let is_dir = entry.is_dir();
             let name: SharedString = entry.name.clone().into();
             let modified: SharedString = format_timestamp(entry.modified_secs).into();
@@ -490,11 +501,11 @@ fn render_details_rows(
             };
             let is_symlink = entry.flags.contains(EntryFlags::IS_SYMLINK);
             let row_bg = if selected {
-                soft_tint(accent_hex, 0.16)
+                soft_tint(p.accent_primary, if p.is_dark { 0.16 } else { 0.12 })
             } else if vis_idx % 2 == 1 {
-                solid(BG_SURFACE)
+                solid(p.bg_surface)
             } else {
-                solid(BG_BASE)
+                solid(p.bg_base)
             };
 
             let drag_payload = build_drag_payload(ws, side, local_path.as_ref(), &entry.name);
@@ -517,7 +528,7 @@ fn render_details_rows(
                 .bg(row_bg)
                 .border_b_1()
                 .border_color(if is_cursor && selected {
-                    solid(accent_hex)
+                    solid(p.accent_primary)
                 } else {
                     gpui_kit::transparent_black()
                 })
@@ -525,20 +536,20 @@ fn render_details_rows(
                     if selected {
                         s
                     } else {
-                        s.bg(solid(BG_ELEVATED))
+                        s.bg(solid(p.bg_hover))
                     }
                 })
                 .when_some(drag_payload, |el, payload| {
                     el.on_drag(payload, move |drag, _, _, cx| {
                         cx.new(|_| DragBadgeView {
                             label: drag.label.clone(),
-                            accent_hex,
+                            palette: p,
                         })
                     })
                 })
                 .when_some(drop_dir_int, |el, dest| {
                     el.drag_over::<DraggedEntries>(move |style, _, _, _| {
-                        style.bg(soft_tint(accent_hex, 0.22))
+                        style.bg(soft_tint(p.accent_primary, 0.22))
                     })
                     .on_drop(cx.listener(
                         move |this, drag: &DraggedEntries, window, cx| {
@@ -555,7 +566,7 @@ fn render_details_rows(
                 })
                 .when_some(drop_dir_ext, |el, dest| {
                     el.drag_over::<ExternalPaths>(move |style, _, _, _| {
-                        style.bg(soft_tint(accent_hex, 0.22))
+                        style.bg(soft_tint(p.accent_primary, 0.22))
                     })
                     .on_drop(cx.listener(
                         move |this, ext: &ExternalPaths, window, cx| {
@@ -592,7 +603,7 @@ fn render_details_rows(
                         .items_center()
                         .child(
                             Icon::new(icon).small().text_color(if is_hidden || is_cut {
-                                solid(TEXT_MUTED)
+                                solid(p.text_muted)
                             } else {
                                 solid(icon_hex)
                             }),
@@ -604,11 +615,11 @@ fn render_details_rows(
                                 .truncate()
                                 .text_xs()
                                 .text_color(if is_cut {
-                                    solid(TEXT_MUTED)
+                                    solid(p.text_muted)
                                 } else if is_hidden {
-                                    solid(TEXT_SECONDARY)
+                                    solid(p.text_secondary)
                                 } else {
-                                    solid(TEXT_PRIMARY)
+                                    solid(p.text_primary)
                                 })
                                 .child(name),
                         )
@@ -616,7 +627,7 @@ fn render_details_rows(
                             el.child(
                                 Icon::new(LucideIcon::Link)
                                     .xsmall()
-                                    .text_color(solid(TEXT_MUTED)),
+                                    .text_color(solid(p.text_muted)),
                             )
                         }),
                 )
@@ -626,7 +637,7 @@ fn render_details_rows(
                         .flex_shrink_0()
                         .truncate()
                         .text_xs()
-                        .text_color(solid(TEXT_SECONDARY))
+                        .text_color(solid(p.text_secondary))
                         .child(modified),
                 )
                 .child(
@@ -635,7 +646,7 @@ fn render_details_rows(
                         .flex_shrink_0()
                         .truncate()
                         .text_xs()
-                        .text_color(solid(TEXT_MUTED))
+                        .text_color(solid(p.text_muted))
                         .child(type_label),
                 )
                 .child(
@@ -645,7 +656,7 @@ fn render_details_rows(
                         .text_right()
                         .truncate()
                         .text_xs()
-                        .text_color(solid(TEXT_SECONDARY))
+                        .text_color(solid(p.text_secondary))
                         .child(size_label),
                 );
 
@@ -654,12 +665,13 @@ fn render_details_rows(
         .collect()
 }
 
-/// Renders a virtualized Grid of flat Obsidian Dark tiles powered by native Windows Shell thumbnails.
+/// Renders a virtualized Grid of flat tiles powered by native Windows Shell thumbnails.
 pub fn render_grid_view(
     ws: &Workspace,
     side: PaneSide,
     cx: &mut Context<Workspace>,
 ) -> impl IntoElement {
+    let p = ws.palette();
     let Some(tab) = ws.active_tab() else {
         return div().size_full().into_any_element();
     };
@@ -668,8 +680,7 @@ pub fn render_grid_view(
     let total = model.filtered_indices.len();
     let is_loading = model.loading;
     let error = model.error.clone();
-    let pane_dir = model.location.as_local_path().map(|p| p.to_path_buf());
-    let accent_hex = ws.settings.accent.primary_hex();
+    let pane_dir = model.location.as_local_path().map(|path| path.to_path_buf());
     let cols = if tab.model.split_enabled { 4usize } else { 6usize };
     let row_count = total.div_ceil(cols);
     let list_id = match side {
@@ -681,13 +692,13 @@ pub fn render_grid_view(
 
     v_flex()
         .size_full()
-        .bg(solid(BG_BASE))
+        .bg(solid(p.bg_base))
         .overflow_hidden()
         .drag_over::<DraggedEntries>(move |style, _, _, _| {
-            style.border_1().border_color(solid(accent_hex))
+            style.border_1().border_color(solid(p.accent_primary))
         })
         .drag_over::<ExternalPaths>(move |style, _, _, _| {
-            style.border_1().border_color(solid(accent_hex))
+            style.border_1().border_color(solid(p.accent_primary))
         })
         .on_drop(cx.listener(move |this, drag: &DraggedEntries, window, cx| {
             if let Some(ref dest) = pane_dir_int {
@@ -708,8 +719,13 @@ pub fn render_grid_view(
             }),
         )
         .child(if total == 0 {
-            render_empty_state(is_loading, error, !model.quick_filter.trim().is_empty())
-                .into_any_element()
+            render_empty_state(
+                is_loading,
+                error,
+                !model.quick_filter.trim().is_empty(),
+                p,
+            )
+            .into_any_element()
         } else {
             uniform_list(
                 list_id,
@@ -733,8 +749,7 @@ fn render_grid_rows(
     range: Range<usize>,
     cx: &mut Context<Workspace>,
 ) -> Vec<gpui_kit::AnyElement> {
-    let accent = ws.settings.accent;
-    let accent_hex = accent.primary_hex();
+    let p = ws.palette();
     let unit = ws.settings.size_unit;
 
     // Collect visible entries for this range first so we can query/enqueue thumbnails cleanly.
@@ -792,9 +807,9 @@ fn render_grid_rows(
                     let offset = vis_idx.checked_sub(first_idx)?;
                     let (_, entry, selected) = visible_items.get(offset)?;
                     let thumb = thumbs.get(offset).cloned().flatten();
-                    let (icon, icon_hex) = file_kind_visual(entry.kind, accent);
-                    let local_path = entry.location.as_local_path().map(|p| p.to_path_buf());
-                    let is_cut = local_path.as_ref().is_some_and(|p| ws.is_path_cut(p));
+                    let (icon, icon_hex) = file_kind_visual(entry.kind, p);
+                    let local_path = entry.location.as_local_path().map(|path| path.to_path_buf());
+                    let is_cut = local_path.as_ref().is_some_and(|path| ws.is_path_cut(path));
                     let is_dir = entry.is_dir();
                     let name: SharedString = entry.name.clone().into();
                     let sub: SharedString = if is_dir {
@@ -839,7 +854,7 @@ fn render_grid_rows(
                                 Icon::new(icon)
                                     .with_size(Size::Medium)
                                     .text_color(if is_cut {
-                                        solid(TEXT_MUTED)
+                                        solid(p.text_muted)
                                     } else {
                                         solid(icon_hex)
                                     }),
@@ -867,34 +882,34 @@ fn render_grid_rows(
                             .rounded(px(RADIUS_ROW))
                             .cursor_pointer()
                             .bg(if selected_val {
-                                soft_tint(accent_hex, 0.16)
+                                soft_tint(p.accent_primary, if p.is_dark { 0.16 } else { 0.12 })
                             } else {
-                                solid(BG_SURFACE)
+                                solid(p.bg_surface)
                             })
                             .border_1()
                             .border_color(if selected_val {
-                                solid(accent_hex)
+                                solid(p.accent_primary)
                             } else {
-                                solid(BORDER_SUBTLE)
+                                solid(p.border_subtle)
                             })
                             .hover(move |s| {
                                 if selected_val {
                                     s
                                 } else {
-                                    s.bg(solid(BG_ELEVATED)).border_color(solid(BORDER))
+                                    s.bg(solid(p.bg_elevated)).border_color(solid(p.border))
                                 }
                             })
                             .when_some(drag_payload, |el, payload| {
                                 el.on_drag(payload, move |drag, _, _, cx| {
                                     cx.new(|_| DragBadgeView {
                                         label: drag.label.clone(),
-                                        accent_hex,
+                                        palette: p,
                                     })
                                 })
                             })
                             .when_some(drop_dir_int, |el, dest| {
                                 el.drag_over::<DraggedEntries>(move |style, _, _, _| {
-                                    style.border_color(solid(accent_hex))
+                                    style.border_color(solid(p.accent_primary))
                                 })
                                 .on_drop(cx.listener(
                                     move |this, drag: &DraggedEntries, window, cx| {
@@ -911,7 +926,7 @@ fn render_grid_rows(
                             })
                             .when_some(drop_dir_ext, |el, dest| {
                                 el.drag_over::<ExternalPaths>(move |style, _, _, _| {
-                                    style.border_color(solid(accent_hex))
+                                    style.border_color(solid(p.accent_primary))
                                 })
                                 .on_drop(cx.listener(
                                     move |this, ext: &ExternalPaths, window, cx| {
@@ -948,16 +963,16 @@ fn render_grid_rows(
                                     .text_xs()
                                     .font_medium()
                                     .text_color(if is_cut {
-                                        solid(TEXT_MUTED)
+                                        solid(p.text_muted)
                                     } else {
-                                        solid(TEXT_PRIMARY)
+                                        solid(p.text_primary)
                                     })
                                     .child(name),
                             )
                             .child(
                                 div()
                                     .text_size(px(10.))
-                                    .text_color(solid(TEXT_MUTED))
+                                    .text_color(solid(p.text_muted))
                                     .child(sub),
                             ),
                     )
@@ -974,6 +989,7 @@ pub fn render_compact_view(
     side: PaneSide,
     cx: &mut Context<Workspace>,
 ) -> impl IntoElement {
+    let p = ws.palette();
     let Some(tab) = ws.active_tab() else {
         return div().size_full().into_any_element();
     };
@@ -982,8 +998,7 @@ pub fn render_compact_view(
     let row_count = model.filtered_indices.len();
     let is_loading = model.loading;
     let error = model.error.clone();
-    let pane_dir = model.location.as_local_path().map(|p| p.to_path_buf());
-    let accent_hex = ws.settings.accent.primary_hex();
+    let pane_dir = model.location.as_local_path().map(|path| path.to_path_buf());
     let list_id = match side {
         PaneSide::Left => "compact-list-left",
         PaneSide::Right => "compact-list-right",
@@ -993,13 +1008,13 @@ pub fn render_compact_view(
 
     v_flex()
         .size_full()
-        .bg(solid(BG_BASE))
+        .bg(solid(p.bg_base))
         .overflow_hidden()
         .drag_over::<DraggedEntries>(move |style, _, _, _| {
-            style.border_1().border_color(solid(accent_hex))
+            style.border_1().border_color(solid(p.accent_primary))
         })
         .drag_over::<ExternalPaths>(move |style, _, _, _| {
-            style.border_1().border_color(solid(accent_hex))
+            style.border_1().border_color(solid(p.accent_primary))
         })
         .on_drop(cx.listener(move |this, drag: &DraggedEntries, window, cx| {
             if let Some(ref dest) = pane_dir_int {
@@ -1020,8 +1035,13 @@ pub fn render_compact_view(
             }),
         )
         .child(if row_count == 0 {
-            render_empty_state(is_loading, error, !model.quick_filter.trim().is_empty())
-                .into_any_element()
+            render_empty_state(
+                is_loading,
+                error,
+                !model.quick_filter.trim().is_empty(),
+                p,
+            )
+            .into_any_element()
         } else {
             uniform_list(
                 list_id,
@@ -1044,8 +1064,7 @@ fn render_compact_rows(
     range: Range<usize>,
     cx: &mut Context<Workspace>,
 ) -> Vec<gpui_kit::AnyElement> {
-    let accent = ws.settings.accent;
-    let accent_hex = accent.primary_hex();
+    let p = ws.palette();
     let unit = ws.settings.size_unit;
 
     let Some(tab) = ws.active_tab() else {
@@ -1057,9 +1076,9 @@ fn render_compact_rows(
         .filter_map(|vis_idx| {
             let entry = model.visible_entry(vis_idx)?;
             let selected = model.selection.contains(vis_idx);
-            let (icon, icon_hex) = file_kind_visual(entry.kind, accent);
-            let local_path = entry.location.as_local_path().map(|p| p.to_path_buf());
-            let is_cut = local_path.as_ref().is_some_and(|p| ws.is_path_cut(p));
+            let (icon, icon_hex) = file_kind_visual(entry.kind, p);
+            let local_path = entry.location.as_local_path().map(|path| path.to_path_buf());
+            let is_cut = local_path.as_ref().is_some_and(|path| ws.is_path_cut(path));
             let name: SharedString = entry.name.clone().into();
             let size: SharedString = entry
                 .size
@@ -1084,22 +1103,22 @@ fn render_compact_rows(
                     .items_center()
                     .cursor_pointer()
                     .bg(if selected {
-                        soft_tint(accent_hex, 0.16)
+                        soft_tint(p.accent_primary, if p.is_dark { 0.16 } else { 0.12 })
                     } else {
-                        solid(BG_BASE)
+                        solid(p.bg_base)
                     })
                     .hover(move |s| {
                         if selected {
                             s
                         } else {
-                            s.bg(solid(BG_ELEVATED))
+                            s.bg(solid(p.bg_hover))
                         }
                     })
                     .when_some(drag_payload, |el, payload| {
                         el.on_drag(payload, move |drag, _, _, cx| {
                             cx.new(|_| DragBadgeView {
                                 label: drag.label.clone(),
-                                accent_hex,
+                                palette: p,
                             })
                         })
                     })
@@ -1117,7 +1136,7 @@ fn render_compact_rows(
                         }),
                     )
                     .child(Icon::new(icon).xsmall().text_color(if is_cut {
-                        solid(TEXT_MUTED)
+                        solid(p.text_muted)
                     } else {
                         solid(icon_hex)
                     }))
@@ -1128,16 +1147,16 @@ fn render_compact_rows(
                             .truncate()
                             .text_xs()
                             .text_color(if is_cut {
-                                solid(TEXT_MUTED)
+                                solid(p.text_muted)
                             } else {
-                                solid(TEXT_PRIMARY)
+                                solid(p.text_primary)
                             })
                             .child(name),
                     )
                     .child(
                         div()
                             .text_size(px(11.))
-                            .text_color(solid(TEXT_MUTED))
+                            .text_color(solid(p.text_muted))
                             .child(size),
                     )
                     .into_any_element(),
@@ -1167,6 +1186,7 @@ fn build_drag_payload(
     Some(DraggedEntries { paths, label })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn sort_header_cell(
     side: PaneSide,
     label: &'static str,
@@ -1174,6 +1194,7 @@ fn sort_header_cell(
     sort: SortSpec,
     width_px: Option<f32>,
     align_right: bool,
+    p: Palette,
     cx: &mut Context<Workspace>,
 ) -> impl IntoElement {
     let is_active = sort.column == column;
@@ -1203,11 +1224,11 @@ fn sort_header_cell(
         .text_xs()
         .font_medium()
         .text_color(if is_active {
-            solid(TEXT_PRIMARY)
+            solid(p.text_primary)
         } else {
-            solid(TEXT_SECONDARY)
+            solid(p.text_secondary)
         })
-        .hover(|s| s.text_color(solid(TEXT_PRIMARY)))
+        .hover(move |s| s.text_color(solid(p.text_primary)))
         .on_click(cx.listener(move |this, _, _, cx| {
             this.toggle_sort_column(side, column, cx);
         }))
@@ -1224,15 +1245,20 @@ fn sort_header_cell(
         })
 }
 
-fn home_section_header(title: &'static str) -> impl IntoElement {
+fn home_section_header(title: &'static str, p: Palette) -> impl IntoElement {
     div()
         .text_xs()
         .font_semibold()
-        .text_color(solid(TEXT_SECONDARY))
+        .text_color(solid(p.text_secondary))
         .child(title)
 }
 
-fn render_empty_state(loading: bool, error: Option<String>, filtered: bool) -> impl IntoElement {
+fn render_empty_state(
+    loading: bool,
+    error: Option<String>,
+    filtered: bool,
+    p: Palette,
+) -> impl IntoElement {
     let (headline, helper): (SharedString, SharedString) = if loading {
         ("Loading folder".into(), "Reading directory entries...".into())
     } else if let Some(err) = error {
@@ -1260,13 +1286,13 @@ fn render_empty_state(loading: bool, error: Option<String>, filtered: bool) -> i
             div()
                 .text_sm()
                 .font_semibold()
-                .text_color(solid(TEXT_PRIMARY))
+                .text_color(solid(p.text_primary))
                 .child(headline),
         )
         .child(
             div()
                 .text_xs()
-                .text_color(solid(TEXT_MUTED))
+                .text_color(solid(p.text_muted))
                 .child(helper),
         )
 }

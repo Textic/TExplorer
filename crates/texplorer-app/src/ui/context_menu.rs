@@ -8,10 +8,7 @@ use gpui_kit::{
 };
 use texplorer_core::{FileEntry, KnownFolder, KnownFolderKind, Location, PaneSide, VolumeInfo};
 
-use crate::theme::{
-    BG_ELEVATED, BG_HOVER, BORDER, BORDER_SUBTLE, RADIUS_CONTROL, RADIUS_ROW, STATUS_ERROR,
-    TEXT_MUTED, TEXT_PRIMARY, TEXT_SECONDARY, soft_tint, solid,
-};
+use crate::theme::{RADIUS_CONTROL, RADIUS_ROW, soft_tint, solid};
 use crate::ui::workspace::Workspace;
 
 #[derive(Debug, Clone)]
@@ -77,13 +74,14 @@ enum MenuAction {
     HideQuickAccess(KnownFolderKind),
 }
 
-/// Renders the flat Obsidian Dark floating context menu clamped cleanly inside the viewport.
+/// Renders the flat floating context menu clamped cleanly inside the viewport.
 pub fn render_context_menu(
     ws: &Workspace,
     menu: &ContextMenuState,
     window: &Window,
     cx: &mut Context<Workspace>,
 ) -> impl IntoElement {
+    let p = ws.palette();
     let rows = build_rows(ws, &menu.target);
     if rows.is_empty() {
         return div().into_any_element();
@@ -148,9 +146,9 @@ pub fn render_context_menu(
                 .top(px(top))
                 .w(px(MENU_W))
                 .p_1()
-                .bg(solid(BG_ELEVATED))
+                .bg(solid(p.bg_elevated))
                 .border_1()
-                .border_color(solid(BORDER))
+                .border_color(solid(p.border))
                 .rounded(px(RADIUS_ROW))
                 .occlude()
                 .children(rows.into_iter().map(|row| match row {
@@ -158,7 +156,7 @@ pub fn render_context_menu(
                         .w_full()
                         .h(px(1.))
                         .my_1()
-                        .bg(solid(BORDER_SUBTLE))
+                        .bg(solid(p.border_subtle))
                         .into_any_element(),
                     MenuRow::Item {
                         id,
@@ -168,8 +166,16 @@ pub fn render_context_menu(
                         danger,
                         action,
                     } => {
-                        let text_hex = if danger { STATUS_ERROR } else { TEXT_PRIMARY };
-                        let icon_hex = if danger { STATUS_ERROR } else { TEXT_SECONDARY };
+                        let text_hex = if danger {
+                            p.status_error
+                        } else {
+                            p.text_primary
+                        };
+                        let icon_hex = if danger {
+                            p.status_error
+                        } else {
+                            p.text_secondary
+                        };
                         let icon_el = match icon {
                             MenuIcon::Lucide(i) => {
                                 Icon::new(i).xsmall().text_color(solid(icon_hex))
@@ -189,9 +195,9 @@ pub fn render_context_menu(
                             .cursor_pointer()
                             .hover(move |s| {
                                 if danger {
-                                    s.bg(soft_tint(STATUS_ERROR, 0.14))
+                                    s.bg(soft_tint(p.status_error, 0.14))
                                 } else {
-                                    s.bg(solid(BG_HOVER))
+                                    s.bg(solid(p.bg_hover))
                                 }
                             })
                             .on_mouse_down(
@@ -221,7 +227,7 @@ pub fn render_context_menu(
                                     div()
                                         .flex_shrink_0()
                                         .text_size(px(10.))
-                                        .text_color(solid(TEXT_MUTED))
+                                        .text_color(solid(p.text_muted))
                                         .child(sc),
                                 )
                             })
