@@ -18,6 +18,8 @@ pub enum LaunchIntent {
     DelegateToWindowsExplorer(String),
     EnableDefaultExplorer { intercept_win_e: bool },
     RestoreDefaultExplorer,
+    RunWinEDaemon,
+    StopWinEDaemon,
 }
 
 /// Parses process arguments (excluding `argv[0]`) into a `LaunchIntent` and `force_new_window`.
@@ -29,6 +31,12 @@ pub fn parse_cli_args(args: &[String]) -> (LaunchIntent, bool) {
     let mut i = 0usize;
     while i < args.len() {
         let arg = args[i].trim();
+        if arg.eq_ignore_ascii_case("--win-e-daemon") {
+            return (LaunchIntent::RunWinEDaemon, false);
+        }
+        if arg.eq_ignore_ascii_case("--stop-win-e-daemon") {
+            return (LaunchIntent::StopWinEDaemon, false);
+        }
         if arg.eq_ignore_ascii_case("--restore-explorer")
             || arg.eq_ignore_ascii_case("--restore-default-explorer")
         {
@@ -254,6 +262,14 @@ mod tests {
     fn parses_standard_select_restore_and_clsid_cli_args() {
         assert_eq!(parse_cli_args(&[]), (LaunchIntent::OpenDefault, false));
 
+        assert_eq!(
+            parse_cli_args(&["--win-e-daemon".to_string()]),
+            (LaunchIntent::RunWinEDaemon, false)
+        );
+        assert_eq!(
+            parse_cli_args(&["--stop-win-e-daemon".to_string()]),
+            (LaunchIntent::StopWinEDaemon, false)
+        );
         assert_eq!(
             parse_cli_args(&["--restore-explorer".to_string()]),
             (LaunchIntent::RestoreDefaultExplorer, false)

@@ -36,6 +36,7 @@ UninstallDisplayIcon={app}\texplorer.exe
 Compression=lzma2/max
 SolidCompression=yes
 WizardStyle=modern
+CloseApplications=yes
 VersionInfoVersion={#MyAppVersion}.0
 
 [Languages]
@@ -69,3 +70,17 @@ Filename: "{app}\texplorer.exe"; Description: "{cm:LaunchProgram,TExplorer}"; Fl
 ; Always stop/remove the optional MFT Index Service and restore Windows Explorer HKCU associations on uninstall
 Filename: "{app}\texplorer-service.exe"; Parameters: "--uninstall"; RunOnceId: "RemoveIndexService"; Flags: runhidden waituntilterminated
 Filename: "{app}\texplorer.exe"; Parameters: "--restore-explorer"; RunOnceId: "RestoreWindowsExplorer"; Flags: runhidden waituntilterminated
+
+[Code]
+function PrepareToInstall(var NeedsRestart: Boolean): String;
+var
+  ExePath: String;
+  ResultCode: Integer;
+begin
+  Result := '';
+  ExePath := ExpandConstant('{app}\texplorer.exe');
+  if FileExists(ExePath) then
+  begin
+    Exec(ExePath, '--stop-win-e-daemon', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  end;
+end;

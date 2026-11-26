@@ -36,11 +36,11 @@ use texplorer_ops::{
 };
 use texplorer_platform::{
     DefaultExplorerStatus, DirectoryWatcher, FileLockStatus, LaunchIntent, ShellWorker,
-    cursor_screen_pos, delete_permanently, enable_default_explorer, get_clipboard_files,
-    inspect_file_lock, list_known_folders, list_volumes, list_wsl_distros, move_to_trash,
-    open_in_editor, open_item, open_terminal_here, query_default_explorer_status,
-    restore_windows_explorer, reveal_in_windows_explorer, set_clipboard_files,
-    system_prefers_dark_mode,
+    bring_current_process_window_to_front, cursor_screen_pos, delete_permanently,
+    enable_default_explorer, get_clipboard_files, inspect_file_lock, list_known_folders,
+    list_volumes, list_wsl_distros, move_to_trash, open_in_editor, open_item, open_terminal_here,
+    query_default_explorer_status, restore_windows_explorer, reveal_in_windows_explorer,
+    set_clipboard_files, set_win_e_interception, system_prefers_dark_mode,
 };
 use texplorer_vfs::archive::{
     compress_to_zip, extract_archive_all, extract_archive_entries, is_supported_archive,
@@ -642,6 +642,7 @@ impl Workspace {
             }
             BgEvent::ExternalIntent(intent) => {
                 window.activate_window();
+                bring_current_process_window_to_front();
                 let open_in_tab = self.settings.show_tabs;
                 match intent {
                     LaunchIntent::OpenLocation(path) => {
@@ -686,6 +687,7 @@ impl Workspace {
                     LaunchIntent::RestoreDefaultExplorer => {
                         self.restore_default_file_manager(cx);
                     }
+                    LaunchIntent::RunWinEDaemon | LaunchIntent::StopWinEDaemon => {}
                 }
             }
             BgEvent::UpdateCheckFinished { manual, result } => {
@@ -3390,13 +3392,28 @@ impl Workspace {
     }
 
     pub fn toggle_intercept_win_e(&mut self, cx: &mut Context<Self>) {
-        self.settings.intercept_win_e = !self.settings.intercept_win_e;
-        let _ = self.settings.save();
-        if matches!(self.default_explorer_status, DefaultExplorerStatus::Enabled) {
-            let _ = enable_default_explorer(self.settings.intercept_win_e);
-            self.default_explorer_status = query_default_explorer_status();
+        let next = !self.settings.intercept_win_e;
+        match set_win_e_interception(next) {
+            Ok(()) => {
+                self.settings.intercept_win_e = next;
+                let _ = self.settings.save();
+                self.default_explorer_status = query_default_explorer_status();
+                self.set_toast_simple(
+                    if next {
+                        "Win+E shortcut now opens TExplorer"
+                    } else {
+                        "Restored Windows Win+E shortcut"
+                    },
+                    if next {
+                        ToastKind::Success
+                    } else {
+                        ToastKind::Info
+                    },
+                    cx,
+                );
+            }
+            Err(err) => self.set_toast_simple(err, ToastKind::Error, cx),
         }
-        cx.notify();
     }
 
     pub fn toggle_show_tabs(&mut self, cx: &mut Context<Self>) {

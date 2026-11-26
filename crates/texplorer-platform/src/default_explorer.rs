@@ -103,6 +103,11 @@ const WIN_E_COMMAND_KEYS: [&str; 2] = [
     r"Software\Classes\CLSID\{52205fd8-5dfb-447d-801a-d0b52f2e83e1}\shell\open\command",
 ];
 
+#[cfg(target_os = "windows")]
+const RUN_AUTOSTART_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
+#[cfg(target_os = "windows")]
+const WIN_E_RUN_VALUE: &str = "TExplorerWinE";
+
 /// Checks whether T Explorer is currently registered as the default Windows file manager.
 #[cfg(target_os = "windows")]
 pub fn query_default_explorer_status() -> DefaultExplorerStatus {
@@ -169,16 +174,44 @@ pub fn enable_default_explorer(intercept_win_e: bool) -> Result<(), String> {
     }
 
     if intercept_win_e {
+        set_win_e_interception(true)?;
+    } else {
+        set_win_e_interception(false)?;
+    }
+
+    notify_shell_assoc_changed();
+    Ok(())
+}
+
+/// Enables or disables universal `Win+E` interception across all Windows 10 & Windows 11 versions
+/// (writes both the HKCU Shell CLSID verbs and the lightweight `Win+E` background daemon + logon
+/// entry so `Win+E` works even on Windows 11 26H2 Build 26300+ where `ExplorerDirectLaunch`
+/// bypasses CLSID routing).
+#[cfg(target_os = "windows")]
+pub fn set_win_e_interception(enabled: bool) -> Result<(), String> {
+    if enabled {
+        let exe = std::env::current_exe()
+            .map_err(|e| format!("Failed resolving current TExplorer executable path: {e}"))?;
+        let exe_str = exe.display().to_string();
         let win_e_cmd = format!("\"{exe_str}\"");
         for key in WIN_E_COMMAND_KEYS {
             write_hkcu_string(key, "", &win_e_cmd)?;
             write_hkcu_string(key, "DelegateExecute", "")?;
         }
+        let daemon_cmd = format!("\"{exe_str}\" --win-e-daemon");
+        write_hkcu_string(RUN_AUTOSTART_KEY, WIN_E_RUN_VALUE, &daemon_cmd)?;
+        crate::win_e_hook::start_win_e_daemon(&exe)?;
     } else {
         delete_hkcu_tree(r"Software\Classes\CLSID\{52205fd8-5dfb-447d-801a-d0b52f2e83e1}");
+        delete_hkcu_value(RUN_AUTOSTART_KEY, WIN_E_RUN_VALUE);
+        crate::win_e_hook::stop_win_e_daemon();
     }
-
     notify_shell_assoc_changed();
+    Ok(())
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn set_win_e_interception(_enabled: bool) -> Result<(), String> {
     Ok(())
 }
 
@@ -227,6 +260,8 @@ pub fn restore_windows_explorer() -> Result<(), String> {
     }
 
     delete_hkcu_tree(r"Software\Classes\CLSID\{52205fd8-5dfb-447d-801a-d0b52f2e83e1}");
+    delete_hkcu_value(RUN_AUTOSTART_KEY, WIN_E_RUN_VALUE);
+    crate::win_e_hook::stop_win_e_daemon();
     notify_shell_assoc_changed();
     Ok(())
 }

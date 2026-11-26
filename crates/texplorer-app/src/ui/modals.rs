@@ -1020,6 +1020,7 @@ fn render_settings_card(
                         ),
                 )
                 .when(is_windows, |el| {
+                    let daemon_running = texplorer_platform::is_win_e_daemon_running();
                     el.child(
                         h_flex()
                             .p_3()
@@ -1028,22 +1029,41 @@ fn render_settings_card(
                             .gap_3()
                             .child(setting_label(
                                 "Intercept Win+E Shortcut",
-                                "Routes HKCU File Explorer CLSID verbs to TExplorer (no keyboard hooks). Note: Windows 11 26H2 (Build 26300+) bypasses registry Win+E handlers via ExplorerDirectLaunch (feature 63202390) unless disabled or remapped.",
+                                "Opens TExplorer on Win+E across all Windows 10 & Windows 11 versions (including 26H2) via HKCU Shell routing and a tiny background shortcut listener (no reboot or UAC).",
                                 p,
                             ))
-                            .child(choice_pill(
-                                "win-e-toggle",
-                                if ws.settings.intercept_win_e {
-                                    "Enabled"
-                                } else {
-                                    "Disabled"
-                                },
-                                ws.settings.intercept_win_e,
-                                p,
-                                cx.listener(|this, _, _, cx| {
-                                    this.toggle_intercept_win_e(cx);
-                                }),
-                            )),
+                            .child(
+                                h_flex()
+                                    .flex_shrink_0()
+                                    .items_center()
+                                    .gap_2()
+                                    .when(daemon_running, |row| {
+                                        row.child(
+                                            div()
+                                                .px_2()
+                                                .py_0p5()
+                                                .rounded(px(RADIUS_CONTROL))
+                                                .bg(soft_tint(p.status_success, 0.14))
+                                                .text_size(px(13.))
+                                                .font_medium()
+                                                .text_color(solid(p.status_success))
+                                                .child("Active"),
+                                        )
+                                    })
+                                    .child(choice_pill(
+                                        "win-e-toggle",
+                                        if ws.settings.intercept_win_e {
+                                            "Enabled"
+                                        } else {
+                                            "Disabled"
+                                        },
+                                        ws.settings.intercept_win_e,
+                                        p,
+                                        cx.listener(|this, _, _, cx| {
+                                            this.toggle_intercept_win_e(cx);
+                                        }),
+                                    )),
+                            ),
                     )
                 }),
         );

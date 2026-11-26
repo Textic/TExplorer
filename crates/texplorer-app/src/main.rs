@@ -14,9 +14,10 @@ use gpui_kit::{
 };
 use texplorer_core::{AppSession, AppSettings};
 use texplorer_platform::{
-    LaunchIntent, delegate_to_windows_explorer, enable_default_explorer, parse_cli_args,
-    restore_windows_explorer, start_single_instance_server, system_prefers_dark_mode,
-    try_forward_to_running_instance,
+    DefaultExplorerStatus, LaunchIntent, delegate_to_windows_explorer, enable_default_explorer,
+    ensure_win_e_daemon_running, parse_cli_args, query_default_explorer_status,
+    restore_windows_explorer, run_win_e_daemon, start_single_instance_server, stop_win_e_daemon,
+    system_prefers_dark_mode, try_forward_to_running_instance,
 };
 
 use crate::ui::workspace::{
@@ -119,6 +120,17 @@ fn main() {
     let (launch_intent, force_new_window) = parse_cli_args(&raw_args);
 
     match &launch_intent {
+        LaunchIntent::RunWinEDaemon => {
+            if let Err(err) = run_win_e_daemon() {
+                eprintln!("Win+E daemon failed: {err}");
+                std::process::exit(1);
+            }
+            return;
+        }
+        LaunchIntent::StopWinEDaemon => {
+            stop_win_e_daemon();
+            return;
+        }
         LaunchIntent::RestoreDefaultExplorer => {
             if let Err(err) = restore_windows_explorer() {
                 eprintln!("Failed to restore Windows Explorer: {err}");
@@ -157,6 +169,13 @@ fn main() {
     });
 
     let initial_settings = AppSettings::load();
+    if initial_settings.intercept_win_e
+        && (initial_settings.replace_default_explorer
+            || query_default_explorer_status() == DefaultExplorerStatus::Enabled)
+        && let Ok(exe) = std::env::current_exe()
+    {
+        let _ = ensure_win_e_daemon_running(&exe);
+    }
     let initial_session = if initial_settings.restore_tabs_on_startup && !force_new_window {
         AppSession::load()
     } else {
