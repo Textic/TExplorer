@@ -3,14 +3,18 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::File;
-use std::io::Read;
+use std::io::{Cursor, Read};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, mpsc};
 
 use gpui_kit::{HighlightStyle, RenderImage};
-use image::{Frame, RgbaImage, imageops::FilterType};
-use smallvec::smallvec;
+use image::{
+    AnimationDecoder as _, Delay, Frame, ImageDecoder as _, ImageFormat, RgbaImage,
+    codecs::{gif::GifDecoder, webp::WebPDecoder},
+    imageops::FilterType,
+};
+use smallvec::{SmallVec, smallvec};
 use texplorer_core::FileKind;
 use texplorer_platform::{RawBgraImage, ShellWorker};
 
@@ -92,9 +96,113 @@ pub fn raw_bgra_to_render_image(raw: RawBgraImage) -> Option<Arc<RenderImage>> {
     Some(Arc::new(RenderImage::new(smallvec![frame])))
 }
 
-/// Decodes a local raster image, scales it cleanly to fit `max_dim`, and swizzles RGBA -> BGRA for GPUI.
-pub fn decode_local_image(path: &Path, max_dim: u32) -> Option<(Arc<RenderImage>, u32, u32)> {
+const MAX_ANIMATED_FRAMES: usize = 240;
+const MAX_ANIMATED_DIM: u32 = 800;
+const MAX_ANIMATED_FILE_BYTES: u64 = 32 * 1024 * 1024;
+
+/// Normalizes GIF/WebP frame delays matching web browser behavior:
+/// delays under 20 ms (such as 0 ms or 10 ms) default to 100 ms so animations never spin uncontrollably.
+fn normalize_frame_delay(delay: Delay) -> Delay {
+    let (numer, denom) = delay.numer_denom_ms();
+    let ms = numer.checked_div(denom).unwrap_or(100);
+    if ms < 20 {
+        Delay::from_numer_denom_ms(100, 1)
+    } else {
+        delay
+    }
+}
+
+/// Resizes an animation frame proportionally if larger than `max_dim` and swizzles RGBA -> BGRA for GPUI.
+fn prepare_animated_frame(frame: Frame, max_dim: u32) -> Frame {
+    let delay = normalize_frame_delay(frame.delay());
+    let mut rgba = frame.into_buffer();
+    let w = rgba.width();
+    let h = rgba.height();
+    if (w > max_dim || h > max_dim) && w > 0 && h > 0 {
+        let scale = (max_dim as f32 / w as f32).min(max_dim as f32 / h as f32);
+        let target_w = ((w as f32 * scale).round() as u32).max(1);
+        let target_h = ((h as f32 * scale).round() as u32).max(1);
+        rgba = image::imageops::resize(&rgba, target_w, target_h, FilterType::Triangle);
+    }
+    for px in rgba.pixels_mut() {
+        px.0.swap(0, 2);
+    }
+    Frame::from_parts(rgba, 0, 0, delay)
+}
+
+/// Decodes a multi-frame GIF from memory into an animated GPUI `RenderImage`.
+/// Returns `None` if decoding fails or the GIF contains only a single static frame.
+pub fn decode_animated_gif_bytes(
+    bytes: &[u8],
+    max_dim: u32,
+) -> Option<(Arc<RenderImage>, u32, u32, usize)> {
+    let decoder = GifDecoder::new(Cursor::new(bytes)).ok()?;
+    let (orig_w, orig_h) = decoder.dimensions();
+    let mut frames: SmallVec<[Frame; 1]> = SmallVec::new();
+    for frame_res in decoder.into_frames().take(MAX_ANIMATED_FRAMES) {
+        match frame_res {
+            Ok(frame) => frames.push(prepare_animated_frame(frame, max_dim)),
+            Err(_) if !frames.is_empty() => break,
+            Err(_) => return None,
+        }
+    }
+    if frames.len() <= 1 {
+        return None;
+    }
+    let count = frames.len();
+    Some((Arc::new(RenderImage::new(frames)), orig_w, orig_h, count))
+}
+
+/// Decodes an animated WebP from memory into an animated GPUI `RenderImage`.
+/// Returns `None` for static WebP images so they decode at full static resolution.
+pub fn decode_animated_webp_bytes(
+    bytes: &[u8],
+    max_dim: u32,
+) -> Option<(Arc<RenderImage>, u32, u32, usize)> {
+    let decoder = WebPDecoder::new(Cursor::new(bytes)).ok()?;
+    if !decoder.has_animation() {
+        return None;
+    }
+    let (orig_w, orig_h) = decoder.dimensions();
+    let mut frames: SmallVec<[Frame; 1]> = SmallVec::new();
+    for frame_res in decoder.into_frames().take(MAX_ANIMATED_FRAMES) {
+        match frame_res {
+            Ok(frame) => frames.push(prepare_animated_frame(frame, max_dim)),
+            Err(_) if !frames.is_empty() => break,
+            Err(_) => return None,
+        }
+    }
+    if frames.len() <= 1 {
+        return None;
+    }
+    let count = frames.len();
+    Some((Arc::new(RenderImage::new(frames)), orig_w, orig_h, count))
+}
+
+/// Decodes a local raster image (including animated GIFs & animated WebPs), scales it cleanly
+/// to fit `max_dim`, and swizzles RGBA -> BGRA for GPUI.
+pub fn decode_local_image(path: &Path, max_dim: u32) -> Option<(Arc<RenderImage>, u32, u32, usize)> {
     let reader = image::ImageReader::open(path).ok()?.with_guessed_format().ok()?;
+    let format = reader.format();
+
+    // Decode animated GIF / WebP with all frames preserved so GPUI animates them natively.
+    if matches!(format, Some(ImageFormat::Gif | ImageFormat::WebP))
+        && std::fs::metadata(path)
+            .map(|m| m.len() <= MAX_ANIMATED_FILE_BYTES)
+            .unwrap_or(false)
+        && let Ok(bytes) = std::fs::read(path)
+    {
+        let anim_dim = max_dim.min(MAX_ANIMATED_DIM);
+        let animated = match format {
+            Some(ImageFormat::Gif) => decode_animated_gif_bytes(&bytes, anim_dim),
+            Some(ImageFormat::WebP) => decode_animated_webp_bytes(&bytes, anim_dim),
+            _ => None,
+        };
+        if let Some(result) = animated {
+            return Some(result);
+        }
+    }
+
     let dyn_img = reader.decode().ok()?;
     let orig_w = dyn_img.width();
     let orig_h = dyn_img.height();
@@ -110,7 +218,7 @@ pub fn decode_local_image(path: &Path, max_dim: u32) -> Option<(Arc<RenderImage>
         px.0.swap(0, 2);
     }
     let frame = Frame::new(rgba);
-    Some((Arc::new(RenderImage::new(smallvec![frame])), orig_w, orig_h))
+    Some((Arc::new(RenderImage::new(smallvec![frame])), orig_w, orig_h, 1))
 }
 
 /// A single line of syntax-highlighted source code ready for GPUI `StyledText`.
@@ -129,6 +237,7 @@ pub enum PreviewPayload {
         image: Arc<RenderImage>,
         orig_width: u32,
         orig_height: u32,
+        frame_count: usize,
     },
     ShellThumbnail {
         image: Arc<RenderImage>,
@@ -171,16 +280,17 @@ pub fn load_preview_blocking(
         .map(|s| s.to_ascii_lowercase())
         .unwrap_or_default();
 
-    // 1. Direct local raster image decoding for crisp full-resolution preview.
+    // 1. Direct local raster image decoding for crisp full-resolution preview (and animated GIF/WebP).
     if matches!(
         ext.as_str(),
         "png" | "jpg" | "jpeg" | "webp" | "gif" | "bmp" | "ico"
-    ) && let Some((image, orig_width, orig_height)) = decode_local_image(&path, 1280)
+    ) && let Some((image, orig_width, orig_height, frame_count)) = decode_local_image(&path, 1280)
     {
         return PreviewPayload::Image {
             image,
             orig_width,
             orig_height,
+            frame_count,
         };
     }
 
@@ -268,31 +378,46 @@ pub fn load_archive_entry_preview_blocking(
         .map(|(_, e)| e.to_ascii_lowercase())
         .unwrap_or_default();
 
-    // Images inside archive (up to 16 MiB)
+    // Images inside archive (up to 16 MiB, including animated GIF/WebP)
     if matches!(
         ext.as_str(),
         "png" | "jpg" | "jpeg" | "webp" | "gif" | "bmp" | "ico"
     ) && let Ok((bytes, false)) =
         texplorer_vfs::archive::read_archive_entry_bytes(&archive_path, &inner_path, 16 * 1024 * 1024)
-        && let Ok(dyn_img) = image::load_from_memory(&bytes)
     {
-        let orig_w = dyn_img.width();
-        let orig_h = dyn_img.height();
-        let resized = if orig_w > 1280 || orig_h > 1280 {
-            dyn_img.resize(1280, 1280, FilterType::Triangle)
-        } else {
-            dyn_img
+        let animated = match ext.as_str() {
+            "gif" => decode_animated_gif_bytes(&bytes, MAX_ANIMATED_DIM),
+            "webp" => decode_animated_webp_bytes(&bytes, MAX_ANIMATED_DIM),
+            _ => None,
         };
-        let mut rgba = resized.to_rgba8();
-        for px in rgba.pixels_mut() {
-            px.0.swap(0, 2);
+        if let Some((image, orig_width, orig_height, frame_count)) = animated {
+            return PreviewPayload::Image {
+                image,
+                orig_width,
+                orig_height,
+                frame_count,
+            };
         }
-        let frame = Frame::new(rgba);
-        return PreviewPayload::Image {
-            image: Arc::new(RenderImage::new(smallvec![frame])),
-            orig_width: orig_w,
-            orig_height: orig_h,
-        };
+        if let Ok(dyn_img) = image::load_from_memory(&bytes) {
+            let orig_w = dyn_img.width();
+            let orig_h = dyn_img.height();
+            let resized = if orig_w > 1280 || orig_h > 1280 {
+                dyn_img.resize(1280, 1280, FilterType::Triangle)
+            } else {
+                dyn_img
+            };
+            let mut rgba = resized.to_rgba8();
+            for px in rgba.pixels_mut() {
+                px.0.swap(0, 2);
+            }
+            let frame = Frame::new(rgba);
+            return PreviewPayload::Image {
+                image: Arc::new(RenderImage::new(smallvec![frame])),
+                orig_width: orig_w,
+                orig_height: orig_h,
+                frame_count: 1,
+            };
+        }
     }
 
     // Markdown or source code inside archive (up to 192 KiB)
@@ -675,5 +800,34 @@ mod tests {
                 prev_end = range.end;
             }
         }
+    }
+
+    #[test]
+    fn decodes_multi_frame_gif_with_preserved_animation_frames() {
+        let mut encoded = Vec::new();
+        {
+            let mut encoder = image::codecs::gif::GifEncoder::new(&mut encoded);
+            let f1 = Frame::from_parts(
+                RgbaImage::from_pixel(4, 4, image::Rgba([255, 0, 0, 255])),
+                0,
+                0,
+                Delay::from_numer_denom_ms(80, 1),
+            );
+            let f2 = Frame::from_parts(
+                RgbaImage::from_pixel(4, 4, image::Rgba([0, 0, 255, 255])),
+                0,
+                0,
+                Delay::from_numer_denom_ms(0, 1), // tests normalization (<20ms -> 100ms)
+            );
+            encoder.encode_frames([f1, f2]).expect("encode 2-frame gif");
+        }
+
+        let (render_img, w, h, count) =
+            decode_animated_gif_bytes(&encoded, 800).expect("decode animated gif");
+        assert_eq!((w, h), (4, 4));
+        assert_eq!(count, 2);
+        assert_eq!(render_img.frame_count(), 2);
+        assert!(render_img.delay(0).numer_denom_ms().0 >= 70);
+        assert_eq!(render_img.delay(1).numer_denom_ms(), (100, 1));
     }
 }

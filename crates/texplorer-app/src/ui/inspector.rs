@@ -140,8 +140,15 @@ pub fn render_inspector(ws: &Workspace, cx: &mut Context<Workspace>) -> impl Int
                     .as_ref()
                     .is_some_and(|pl| pl == &entry.location);
                 let preview_visual = if matches_preview {
-                    render_inline_preview(&ws.preview_payload, icon, icon_hex, unit, p)
-                        .into_any_element()
+                    render_inline_preview(
+                        &ws.preview_payload,
+                        ws.preview_generation,
+                        icon,
+                        icon_hex,
+                        unit,
+                        p,
+                    )
+                    .into_any_element()
                 } else {
                     render_icon_box(icon, icon_hex).into_any_element()
                 };
@@ -679,6 +686,7 @@ fn hash_digest_row(
 
 fn render_inline_preview(
     payload: &PreviewPayload,
+    preview_gen: u64,
     fallback_icon: LucideIcon,
     fallback_hex: u32,
     unit: texplorer_core::SizeUnit,
@@ -689,6 +697,7 @@ fn render_inline_preview(
             image,
             orig_width,
             orig_height,
+            frame_count,
         } => v_flex()
             .w_full()
             .items_center()
@@ -703,6 +712,7 @@ fn render_inline_preview(
                     .overflow_hidden()
                     .child(
                         img(image.clone())
+                            .id(("insp-preview-img", preview_gen))
                             .max_w_full()
                             .max_h_full()
                             .object_fit(ObjectFit::Contain),
@@ -712,7 +722,11 @@ fn render_inline_preview(
                 div()
                     .text_size(px(12.))
                     .text_color(solid(p.text_muted))
-                    .child(format!("{orig_width} × {orig_height}")),
+                    .child(if *frame_count > 1 {
+                        format!("{orig_width} × {orig_height}  •  Animated")
+                    } else {
+                        format!("{orig_width} × {orig_height}")
+                    }),
             )
             .into_any_element(),
         PreviewPayload::ShellThumbnail { image, .. } => div()

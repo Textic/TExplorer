@@ -354,9 +354,12 @@ pub fn cmp_ignore_ascii_case(a: &str, b: &str) -> Ordering {
 }
 
 /// Sorts file entries in place according to `spec`.
+///
+/// When sorting by `SortColumn::Modified`, folders and files are ordered strictly chronologically
+/// together so newly created/downloaded files are never buried beneath older folders.
 pub fn sort_entries(entries: &mut [FileEntry], spec: SortSpec) {
     entries.sort_by(|a, b| {
-        if spec.folders_first {
+        if spec.folders_first && spec.column != SortColumn::Modified {
             match (a.is_dir(), b.is_dir()) {
                 (true, false) => return Ordering::Less,
                 (false, true) => return Ordering::Greater,
@@ -366,24 +369,18 @@ pub fn sort_entries(entries: &mut [FileEntry], spec: SortSpec) {
 
         let primary = match spec.column {
             SortColumn::Name => natural_cmp_ignore_ascii_case(&a.name, &b.name),
-            SortColumn::Modified => a
-                .modified_secs
-                .cmp(&b.modified_secs)
-                .then_with(|| natural_cmp_ignore_ascii_case(&a.name, &b.name)),
-            SortColumn::Type => cmp_ignore_ascii_case(&a.type_label, &b.type_label)
-                .then_with(|| natural_cmp_ignore_ascii_case(&a.name, &b.name)),
-            SortColumn::Size => a
-                .size
-                .unwrap_or(0)
-                .cmp(&b.size.unwrap_or(0))
-                .then_with(|| natural_cmp_ignore_ascii_case(&a.name, &b.name)),
+            SortColumn::Modified => a.modified_secs.cmp(&b.modified_secs),
+            SortColumn::Type => cmp_ignore_ascii_case(&a.type_label, &b.type_label),
+            SortColumn::Size => a.size.unwrap_or(0).cmp(&b.size.unwrap_or(0)),
         };
 
-        if spec.descending {
+        let ordered = if spec.descending {
             primary.reverse()
         } else {
             primary
-        }
+        };
+
+        ordered.then_with(|| natural_cmp_ignore_ascii_case(&a.name, &b.name))
     });
 }
 
@@ -445,5 +442,35 @@ mod tests {
         sort_entries(&mut items, spec);
         let names: Vec<&str> = items.iter().map(|e| e.name.as_str()).collect();
         assert_eq!(names, vec!["folder", "huge.bin", "small.bin"]);
+    }
+
+    #[test]
+    fn sorts_by_date_modified_chronologically_across_folders_and_files() {
+        let mut items = vec![
+            dummy_entry("old_folder", true, None, 100),
+            dummy_entry("newest_file.zip", false, Some(50), 500),
+            dummy_entry("mid_folder", true, None, 300),
+            dummy_entry("oldest_file.txt", false, Some(10), 50),
+        ];
+        let mut spec = SortSpec::default();
+        spec.toggle_column(SortColumn::Modified);
+        assert!(spec.descending);
+
+        sort_entries(&mut items, spec);
+        let names: Vec<&str> = items.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["newest_file.zip", "mid_folder", "old_folder", "oldest_file.txt"]
+        );
+
+        // Ascending mixes oldest first too.
+        spec.toggle_column(SortColumn::Modified);
+        assert!(!spec.descending);
+        sort_entries(&mut items, spec);
+        let asc_names: Vec<&str> = items.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(
+            asc_names,
+            vec!["oldest_file.txt", "old_folder", "mid_folder", "newest_file.zip"]
+        );
     }
 }

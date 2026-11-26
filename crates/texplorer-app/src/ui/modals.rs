@@ -20,6 +20,7 @@ use texplorer_platform::DefaultExplorerStatus;
 use crate::theme::{
     Palette, RADIUS_CONTROL, RADIUS_ROW, full_hit_input, known_folder_icon, soft_tint, solid,
 };
+use crate::ui::sidebar::{DraggedQuickAccessItem, DraggedSidebarSection, SidebarDragGhost};
 use crate::ui::workspace::Workspace;
 use crate::updater::{CURRENT_VERSION, UpdateState, format_download_bytes};
 
@@ -776,7 +777,7 @@ fn render_settings_card(
                                 .gap_2()
                                 .child(setting_label(
                                     "Sidebar Categories",
-                                    "Show, hide, or reorder navigation categories in the left sidebar. Click any category header in the sidebar to collapse or expand it.",
+                                    "Drag categories to reorder them, or toggle visibility. You can also drag category headers directly in the sidebar.",
                                     p,
                                 ))
                                 .when(ws.settings.has_custom_sidebar_sections(), |el| {
@@ -793,7 +794,6 @@ fn render_settings_card(
                         )
                         .child({
                             let ordered = ws.settings.normalized_sidebar_order();
-                            let total = ordered.len();
                             v_flex().gap_1p5().children(ordered.into_iter().enumerate().map(
                                 |(idx, section)| {
                                     let visible = ws.settings.is_sidebar_section_visible(section);
@@ -805,8 +805,13 @@ fn render_settings_card(
                                         SidebarSection::Drives => LucideIcon::HardDrive,
                                         SidebarSection::LinuxWsl => LucideIcon::Terminal,
                                     };
+                                    let drag_payload = DraggedSidebarSection {
+                                        section,
+                                        label: section.label().into(),
+                                    };
 
                                     h_flex()
+                                        .id(("sb-sec-row", idx))
                                         .w_full()
                                         .px_2p5()
                                         .py_1p5()
@@ -814,15 +819,45 @@ fn render_settings_card(
                                         .items_center()
                                         .justify_between()
                                         .rounded(px(RADIUS_CONTROL))
+                                        .cursor_grab()
                                         .bg(solid(p.bg_surface))
                                         .border_1()
                                         .border_color(solid(p.border_subtle))
+                                        .hover(move |s| s.border_color(solid(p.border)))
+                                        .on_drag(drag_payload, move |drag, _, _, cx| {
+                                            cx.new(|_| SidebarDragGhost {
+                                                label: drag.label.clone(),
+                                                palette: p,
+                                            })
+                                        })
+                                        .drag_over::<DraggedSidebarSection>(
+                                            move |style, drag, _, _| {
+                                                if drag.section != section {
+                                                    style
+                                                        .bg(soft_tint(p.accent_primary, 0.14))
+                                                        .border_color(solid(p.accent_primary))
+                                                } else {
+                                                    style
+                                                }
+                                            },
+                                        )
+                                        .on_drop(cx.listener(
+                                            move |this, drag: &DraggedSidebarSection, _, cx| {
+                                                cx.stop_propagation();
+                                                this.reorder_sidebar_section(
+                                                    drag.section,
+                                                    section,
+                                                    cx,
+                                                );
+                                            },
+                                        ))
                                         .child(
                                             h_flex()
                                                 .flex_1()
                                                 .min_w_0()
                                                 .items_center()
                                                 .gap_2()
+                                                .child(drag_grip_handle(p))
                                                 .child(Icon::new(icon).xsmall().text_color(
                                                     if visible {
                                                         solid(p.accent_primary)
@@ -850,53 +885,15 @@ fn render_settings_card(
                                                     )
                                                 }),
                                         )
-                                        .child(
-                                            h_flex()
-                                                .flex_shrink_0()
-                                                .items_center()
-                                                .gap_1()
-                                                .child(
-                                                    Button::new(("sb-sec-up", idx))
-                                                        .with_size(Size::XSmall)
-                                                        .ghost()
-                                                        .disabled(idx == 0)
-                                                        .icon(LucideIcon::ChevronUp)
-                                                        .tooltip("Move Up")
-                                                        .on_click(cx.listener(
-                                                            move |this, _, _, cx| {
-                                                                this.move_sidebar_section(
-                                                                    section, -1, cx,
-                                                                );
-                                                            },
-                                                        )),
-                                                )
-                                                .child(
-                                                    Button::new(("sb-sec-down", idx))
-                                                        .with_size(Size::XSmall)
-                                                        .ghost()
-                                                        .disabled(idx + 1 >= total)
-                                                        .icon(LucideIcon::ChevronDown)
-                                                        .tooltip("Move Down")
-                                                        .on_click(cx.listener(
-                                                            move |this, _, _, cx| {
-                                                                this.move_sidebar_section(
-                                                                    section, 1, cx,
-                                                                );
-                                                            },
-                                                        )),
-                                                )
-                                                .child(choice_pill(
-                                                    ("sb-sec-vis", idx),
-                                                    if visible { "Visible" } else { "Hidden" },
-                                                    visible,
-                                                    p,
-                                                    cx.listener(move |this, _, _, cx| {
-                                                        this.toggle_sidebar_section_visible(
-                                                            section, cx,
-                                                        );
-                                                    }),
-                                                )),
-                                        )
+                                        .child(choice_pill(
+                                            ("sb-sec-vis", idx),
+                                            if visible { "Visible" } else { "Hidden" },
+                                            visible,
+                                            p,
+                                            cx.listener(move |this, _, _, cx| {
+                                                this.toggle_sidebar_section_visible(section, cx);
+                                            }),
+                                        ))
                                 },
                             ))
                         }),
@@ -913,7 +910,7 @@ fn render_settings_card(
                                 .gap_2()
                                 .child(setting_label(
                                     "Quick Access Folders",
-                                    "Reorder or choose which default folders appear in Quick Access. You can also right-click any item to remove it.",
+                                    "Drag folders to reorder them, or toggle which default folders appear in Quick Access.",
                                     p,
                                 ))
                                 .when(
@@ -933,15 +930,19 @@ fn render_settings_card(
                         )
                         .child({
                             let ordered_qa = ws.settings.ordered_quick_access(&ws.known_folders);
-                            let total = ordered_qa.len();
                             v_flex().gap_1p5().children(ordered_qa.into_iter().enumerate().map(
                                 |(idx, folder)| {
                                     let kind = folder.kind;
                                     let visible = ws.settings.is_quick_access_visible(kind);
                                     let label: SharedString = folder.name.clone().into();
                                     let icon = known_folder_icon(kind);
+                                    let drag_payload = DraggedQuickAccessItem {
+                                        kind,
+                                        label: label.clone(),
+                                    };
 
                                     h_flex()
+                                        .id(("qa-row", idx))
                                         .w_full()
                                         .px_2p5()
                                         .py_1p5()
@@ -949,15 +950,41 @@ fn render_settings_card(
                                         .items_center()
                                         .justify_between()
                                         .rounded(px(RADIUS_CONTROL))
+                                        .cursor_grab()
                                         .bg(solid(p.bg_surface))
                                         .border_1()
                                         .border_color(solid(p.border_subtle))
+                                        .hover(move |s| s.border_color(solid(p.border)))
+                                        .on_drag(drag_payload, move |drag, _, _, cx| {
+                                            cx.new(|_| SidebarDragGhost {
+                                                label: drag.label.clone(),
+                                                palette: p,
+                                            })
+                                        })
+                                        .drag_over::<DraggedQuickAccessItem>(
+                                            move |style, drag, _, _| {
+                                                if drag.kind != kind {
+                                                    style
+                                                        .bg(soft_tint(p.accent_primary, 0.14))
+                                                        .border_color(solid(p.accent_primary))
+                                                } else {
+                                                    style
+                                                }
+                                            },
+                                        )
+                                        .on_drop(cx.listener(
+                                            move |this, drag: &DraggedQuickAccessItem, _, cx| {
+                                                cx.stop_propagation();
+                                                this.reorder_quick_access(drag.kind, kind, cx);
+                                            },
+                                        ))
                                         .child(
                                             h_flex()
                                                 .flex_1()
                                                 .min_w_0()
                                                 .items_center()
                                                 .gap_2()
+                                                .child(drag_grip_handle(p))
                                                 .child(Icon::new(icon).xsmall().text_color(
                                                     if visible {
                                                         solid(p.accent_primary)
@@ -980,51 +1007,15 @@ fn render_settings_card(
                                                         .child(label),
                                                 ),
                                         )
-                                        .child(
-                                            h_flex()
-                                                .flex_shrink_0()
-                                                .items_center()
-                                                .gap_1()
-                                                .child(
-                                                    Button::new(("qa-up", idx))
-                                                        .with_size(Size::XSmall)
-                                                        .ghost()
-                                                        .disabled(idx == 0)
-                                                        .icon(LucideIcon::ChevronUp)
-                                                        .tooltip("Move Up")
-                                                        .on_click(cx.listener(
-                                                            move |this, _, _, cx| {
-                                                                this.move_quick_access(
-                                                                    kind, -1, cx,
-                                                                );
-                                                            },
-                                                        )),
-                                                )
-                                                .child(
-                                                    Button::new(("qa-down", idx))
-                                                        .with_size(Size::XSmall)
-                                                        .ghost()
-                                                        .disabled(idx + 1 >= total)
-                                                        .icon(LucideIcon::ChevronDown)
-                                                        .tooltip("Move Down")
-                                                        .on_click(cx.listener(
-                                                            move |this, _, _, cx| {
-                                                                this.move_quick_access(
-                                                                    kind, 1, cx,
-                                                                );
-                                                            },
-                                                        )),
-                                                )
-                                                .child(choice_pill(
-                                                    ("qa-vis", idx),
-                                                    if visible { "Visible" } else { "Hidden" },
-                                                    visible,
-                                                    p,
-                                                    cx.listener(move |this, _, _, cx| {
-                                                        this.toggle_quick_access(kind, cx);
-                                                    }),
-                                                )),
-                                        )
+                                        .child(choice_pill(
+                                            ("qa-vis", idx),
+                                            if visible { "Visible" } else { "Hidden" },
+                                            visible,
+                                            p,
+                                            cx.listener(move |this, _, _, cx| {
+                                                this.toggle_quick_access(kind, cx);
+                                            }),
+                                        ))
                                 },
                             ))
                         }),
@@ -1590,6 +1581,24 @@ fn setting_label_shared(
                 .text_color(solid(p.text_muted))
                 .child(subtitle),
         )
+}
+
+/// Minimalist 6-dot drag handle grip rendered inside drag-reorderable Settings rows.
+fn drag_grip_handle(p: Palette) -> impl IntoElement {
+    let dot = || {
+        div()
+            .w(px(2.5))
+            .h(px(2.5))
+            .rounded(px(999.))
+            .bg(solid(p.text_muted))
+    };
+    h_flex()
+        .flex_shrink_0()
+        .gap(px(2.5))
+        .px_0p5()
+        .items_center()
+        .child(v_flex().gap(px(2.5)).child(dot()).child(dot()).child(dot()))
+        .child(v_flex().gap(px(2.5)).child(dot()).child(dot()).child(dot()))
 }
 
 fn choice_pill(

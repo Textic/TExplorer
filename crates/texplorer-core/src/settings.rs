@@ -244,6 +244,11 @@ pub struct AppSettings {
     pub quick_access_order: Vec<KnownFolderKind>,
     pub hidden_quick_access: Vec<KnownFolderKind>,
     pub pinned_folders: Vec<PathBuf>,
+    pub details_col_modified: u16,
+    pub details_col_type: u16,
+    pub details_col_size: u16,
+    pub quicklook_video_muted: bool,
+    pub quicklook_video_volume: u8,
     pub terminal_command: String,
     pub editor_command: String,
 }
@@ -273,6 +278,11 @@ impl Default for AppSettings {
             quick_access_order: Vec::new(),
             hidden_quick_access: Vec::new(),
             pinned_folders: Vec::new(),
+            details_col_modified: 164,
+            details_col_type: 144,
+            details_col_size: 106,
+            quicklook_video_muted: true,
+            quicklook_video_volume: 70,
             terminal_command: "wt.exe".to_string(),
             editor_command: "code".to_string(),
         }
@@ -415,6 +425,33 @@ impl AppSettings {
         true
     }
 
+    /// Reorders Quick Access by dragging `from` onto `to`.
+    pub fn reorder_quick_access(
+        &mut self,
+        from: KnownFolderKind,
+        to: KnownFolderKind,
+        available: &[KnownFolder],
+    ) -> bool {
+        if from == to {
+            return false;
+        }
+        let mut order: Vec<KnownFolderKind> = self
+            .ordered_quick_access(available)
+            .into_iter()
+            .map(|f| f.kind)
+            .collect();
+        let (Some(from_idx), Some(to_idx)) = (
+            order.iter().position(|k| *k == from),
+            order.iter().position(|k| *k == to),
+        ) else {
+            return false;
+        };
+        let item = order.remove(from_idx);
+        order.insert(to_idx, item);
+        self.quick_access_order = order;
+        true
+    }
+
     /// Returns `true` when Quick Access folder order or visibility differs from defaults.
     pub fn has_custom_quick_access(&self, available: &[KnownFolder]) -> bool {
         if !self.hidden_quick_access.is_empty() {
@@ -503,6 +540,24 @@ impl AppSettings {
         true
     }
 
+    /// Reorders sidebar sections by dragging `from` onto `to`.
+    pub fn reorder_sidebar_section(&mut self, from: SidebarSection, to: SidebarSection) -> bool {
+        if from == to {
+            return false;
+        }
+        let mut order = self.normalized_sidebar_order();
+        let (Some(from_idx), Some(to_idx)) = (
+            order.iter().position(|s| *s == from),
+            order.iter().position(|s| *s == to),
+        ) else {
+            return false;
+        };
+        let item = order.remove(from_idx);
+        order.insert(to_idx, item);
+        self.sidebar_section_order = order;
+        true
+    }
+
     /// Returns `true` when sidebar section order or visibility differs from defaults.
     pub fn has_custom_sidebar_sections(&self) -> bool {
         self.normalized_sidebar_order().as_slice() != SidebarSection::DEFAULT_ORDER
@@ -542,6 +597,11 @@ mod tests {
         assert!(s.move_sidebar_section(SidebarSection::Drives, 1));
         assert_eq!(s.normalized_sidebar_order()[0], SidebarSection::QuickAccess);
         assert_eq!(s.normalized_sidebar_order()[1], SidebarSection::Drives);
+
+        // Drag-and-drop reorder inserts `from` at `to`'s position.
+        assert!(s.reorder_sidebar_section(SidebarSection::LinuxWsl, SidebarSection::QuickAccess));
+        assert_eq!(s.normalized_sidebar_order()[0], SidebarSection::LinuxWsl);
+        assert_eq!(s.normalized_sidebar_order()[1], SidebarSection::QuickAccess);
 
         // Visibility & collapse toggles.
         assert!(s.is_sidebar_section_visible(SidebarSection::LinuxWsl));
@@ -584,6 +644,17 @@ mod tests {
         assert!(!s.move_quick_access(KnownFolderKind::Desktop, -1, &available));
         assert!(s.move_quick_access(KnownFolderKind::Documents, -1, &available));
         assert!(s.has_custom_quick_access(&available));
+        assert!(s.reorder_quick_access(
+            KnownFolderKind::Downloads,
+            KnownFolderKind::Desktop,
+            &available
+        ));
+        assert_eq!(
+            s.ordered_quick_access(&available)[0].kind,
+            KnownFolderKind::Downloads
+        );
+        s.reset_quick_access();
+        assert!(s.move_quick_access(KnownFolderKind::Documents, -1, &available));
 
         let ordered: Vec<KnownFolderKind> = s
             .ordered_quick_access(&available)
@@ -611,6 +682,10 @@ mod tests {
             show_hidden_files: true,
             ..Default::default()
         };
+        assert!(settings.quicklook_video_muted);
+        assert_eq!(settings.quicklook_video_volume, 70);
+        settings.quicklook_video_muted = false;
+        settings.quicklook_video_volume = 45;
         settings.pin_folder(PathBuf::from(r"X:\TExplorer"));
 
         let json = serde_json::to_string(&settings).unwrap();
