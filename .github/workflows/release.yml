@@ -14,17 +14,11 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
-  CARGO_PROFILE_DEV_DEBUG: "0"
 
 jobs:
-  prepare:
-    name: Compute Release Version
-    runs-on: ubuntu-latest
-    outputs:
-      already_tagged: ${{ steps.ver.outputs.already_tagged }}
-      cargo_version: ${{ steps.ver.outputs.cargo_version }}
-      version: ${{ steps.ver.outputs.version }}
-      tag: ${{ steps.ver.outputs.tag }}
+  release:
+    name: Build & Publish Release (windows-x86_64)
+    runs-on: windows-latest
     steps:
       - name: Checkout repository with full tag history
         uses: actions/checkout@v4
@@ -78,79 +72,88 @@ jobs:
           Write-Output "version=$nextVersion" >> $env:GITHUB_OUTPUT
           Write-Output "tag=$nextTag" >> $env:GITHUB_OUTPUT
 
-  build:
-    name: Build (windows-x86_64)
-    needs: prepare
-    if: needs.prepare.outputs.already_tagged != 'true'
-    runs-on: windows-latest
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - name: Exclude build directories from Windows Defender
+        if: steps.ver.outputs.already_tagged != 'true'
+        shell: pwsh
+        run: |
+          try {
+            $cargoHome = if ($env:CARGO_HOME) { $env:CARGO_HOME } else { Join-Path $env:USERPROFILE ".cargo" }
+            Add-MpPreference -ExclusionPath $env:GITHUB_WORKSPACE, $cargoHome -ErrorAction SilentlyContinue
+          } catch {}
 
       - name: Install Rust toolchain
+        if: steps.ver.outputs.already_tagged != 'true'
         uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: x86_64-pc-windows-msvc
+
+      - name: Enable lld-link for faster Windows linking
+        if: steps.ver.outputs.already_tagged != 'true'
+        shell: pwsh
+        run: |
+          $lld = (Get-Command lld-link.exe -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty Source)
+          if (-not $lld -and (Test-Path "C:\Program Files\LLVM\bin\lld-link.exe")) {
+            $lld = "C:\Program Files\LLVM\bin\lld-link.exe"
+          }
+          if ($lld) {
+            Write-Host "Using faster linker: $lld"
+            "CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER=$lld" >> $env:GITHUB_ENV
+          }
 
       - name: Restore Cargo cache
+        if: steps.ver.outputs.already_tagged != 'true'
         uses: Swatinem/rust-cache@v2
         with:
-          key: release-windows-x86_64
+          shared-key: release-windows-x86_64-v2
+          cache-on-failure: true
 
       - name: Sync build version in runner Cargo.toml
-        if: needs.prepare.outputs.version != needs.prepare.outputs.cargo_version
+        if: steps.ver.outputs.already_tagged != 'true' && steps.ver.outputs.version != steps.ver.outputs.cargo_version
         shell: pwsh
         run: |
           $raw = Get-Content -Path "Cargo.toml" -Raw
-          $updated = $raw -replace '(?m)^(version\s*=\s*")\d+\.\d+\.\d+(")', "`${1}${{ needs.prepare.outputs.version }}`${2}"
+          $updated = $raw -replace '(?m)^(version\s*=\s*")\d+\.\d+\.\d+(")', "`${1}${{ steps.ver.outputs.version }}`${2}"
           Set-Content -Path "Cargo.toml" -Value $updated -NoNewline
 
-      - name: Test, build & package Windows release assets
+      - name: Build release binaries, test & package Windows installer
+        if: steps.ver.outputs.already_tagged != 'true'
         shell: pwsh
         run: |
-          cargo test --workspace --target x86_64-pc-windows-msvc
-          cargo build --release -p texplorer-app -p texplorer-service --target x86_64-pc-windows-msvc
+          $lockFlag = if ("${{ steps.ver.outputs.version }}" -eq "${{ steps.ver.outputs.cargo_version }}") { "--locked" } else { $null }
+          $buildArgs = @("build", "--release", "-p", "texplorer-app", "-p", "texplorer-service")
+          $testArgs = @("test", "--workspace", "--release")
+          if ($lockFlag) {
+            $buildArgs += $lockFlag
+            $testArgs += $lockFlag
+          }
+          & cargo @buildArgs
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & cargo @testArgs
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           & .\packaging\windows\build-setup.ps1 `
-            -BinaryPath "target\x86_64-pc-windows-msvc\release\texplorer.exe" `
-            -ServiceBinaryPath "target\x86_64-pc-windows-msvc\release\texplorer-service.exe" `
-            -Version "${{ needs.prepare.outputs.version }}" `
-            -Tag "${{ needs.prepare.outputs.tag }}" `
+            -BinaryPath "target\release\texplorer.exe" `
+            -ServiceBinaryPath "target\release\texplorer-service.exe" `
+            -Version "${{ steps.ver.outputs.version }}" `
+            -Tag "${{ steps.ver.outputs.tag }}" `
             -OutDir "dist"
 
-      - name: Upload build artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: release-assets-windows-x86_64
-          path: dist/*
-
-  publish:
-    name: Publish GitHub Release
-    needs: [prepare, build]
-    if: needs.prepare.outputs.already_tagged != 'true'
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Download release artifacts
-        uses: actions/download-artifact@v4
-        with:
-          path: dist
-          pattern: release-assets-*
-          merge-multiple: true
-
-      - name: Generate SHA-256 checksums
-        run: |
-          cd dist
-          sha256sum * > SHA256SUMS.txt
-
-      - name: Create tag and GitHub Release
+      - name: Generate SHA-256 checksums and publish GitHub Release
+        if: steps.ver.outputs.already_tagged != 'true'
+        shell: pwsh
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          TAG="${{ needs.prepare.outputs.tag }}"
-          gh release create "$TAG" \
-            --target "${{ github.sha }}" \
-            --title "TExplorer $TAG" \
-            --generate-notes \
-            dist/*
+          $distDir = (Resolve-Path "dist").Path
+          $files = Get-ChildItem -Path $distDir -File | Sort-Object Name
+          $lines = foreach ($f in $files) {
+            $hash = (Get-FileHash -LiteralPath $f.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+            "$hash  $($f.Name)"
+          }
+          $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+          [System.IO.File]::WriteAllText((Join-Path $distDir "SHA256SUMS.txt"), ($lines -join "`n") + "`n", $utf8NoBom)
+
+          $tag = "${{ steps.ver.outputs.tag }}"
+          $assets = Get-ChildItem -Path $distDir -File | Select-Object -ExpandProperty FullName
+          gh release create "$tag" `
+            --target "${{ github.sha }}" `
+            --title "TExplorer $tag" `
+            --generate-notes `
+            @assets

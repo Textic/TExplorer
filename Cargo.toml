@@ -13,7 +13,7 @@ members = [
 default-members = ["crates/texplorer-app"]
 
 [workspace.package]
-version = "0.7.0"
+version = "0.7.1"
 edition = "2024"
 authors = ["Textic"]
 license = "MIT"
@@ -66,3 +66,18 @@ opt-level = 1
 
 [profile.dev.package."*"]
 opt-level = 2
+
+# Fast, zero-optimization profile used exclusively by CI (`clippy` + `test`)
+# so dependencies compile 3-4x faster while local `cargo run` stays smooth.
+[profile.ci]
+inherits = "dev"
+opt-level = 0
+debug = 0
+incremental = false
+
+[profile.ci.package."*"]
+opt-level = 0
+debug = 0
+
+[profile.release]
+strip = "symbols"

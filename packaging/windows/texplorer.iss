@@ -1,5 +1,5 @@
 #ifndef MyAppVersion
-  #define MyAppVersion "0.7.0"
+  #define MyAppVersion "0.7.1"
 #endif
 #ifndef BinaryPath
   #define BinaryPath "..\..\target\release\texplorer.exe"
@@ -11,7 +11,7 @@
   #define OutputDir "..\..\dist"
 #endif
 #ifndef OutputBaseFilename
-  #define OutputBaseFilename "texplorer-v0.7.0-windows-x86_64-setup"
+  #define OutputBaseFilename "texplorer-v0.7.1-windows-x86_64-setup"
 #endif
 
 [Setup]
@@ -33,7 +33,9 @@ OutputDir={#OutputDir}
 OutputBaseFilename={#OutputBaseFilename}
 SetupIconFile=..\..\assets\texplorer.ico
 UninstallDisplayIcon={app}\texplorer.exe
-Compression=lzma2/max
+Compression=lzma2/normal
+LZMAUseSeparateProcess=yes
+LZMANumBlockThreads=4
 SolidCompression=yes
 WizardStyle=modern
 CloseApplications=yes

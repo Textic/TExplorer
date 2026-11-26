@@ -35,7 +35,7 @@ use texplorer_mft::{
 };
 use texplorer_net::{
     ActiveP2pShare, IncomingP2pOffer, NearbyPeer, P2pDirection, P2pEvent, P2pService,
-    RemoteClientPool, RemoteCredentials, decode_ticket,
+    RemoteClientPool, RemoteCredentials, decode_ticket, detect_default_ssh_key,
 };
 use texplorer_ops::{
     BulkRenameSpec, ConflictDecision, ConflictPrompt, ConflictResolution, RenameCasing,
@@ -50,7 +50,8 @@ use texplorer_platform::{
     delete_network_password, delete_permanently, disconnect_smb_share, enable_default_explorer,
     get_clipboard_files, inspect_file_lock, install_native_drop_target, is_elevated,
     list_known_folders, list_volumes, list_wsl_distros, load_network_password, move_to_trash,
-    open_in_editor, open_item, open_terminal_here, query_default_explorer_status,
+    open_in_editor, open_item, open_terminal_here, pick_files_dialog, pick_folder_dialog,
+    query_default_explorer_status,
     restore_windows_explorer, reveal_in_windows_explorer, save_network_password,
     set_clipboard_files, set_win_e_interception, spawn_as_desktop_user, spawn_video_player,
     system_prefers_dark_mode,
@@ -238,6 +239,9 @@ enum BgEvent {
     P2pShareCreated {
         result: Result<ActiveP2pShare, String>,
     },
+    P2pPickedSendPaths(Result<Vec<PathBuf>, String>),
+    P2pPickedDestDir(Result<Option<PathBuf>, String>),
+    NetworkPickedKeyPath(Result<Vec<PathBuf>, String>),
     P2p(P2pEvent),
     NativeDrop(NativeDropEvent),
 }
@@ -1381,6 +1385,65 @@ impl Workspace {
             BgEvent::NativeDrop(drop_ev) => {
                 self.handle_native_drop_event(drop_ev, window, cx);
             }
+            BgEvent::P2pPickedSendPaths(res) => match res {
+                Ok(paths) if !paths.is_empty() => {
+                    if let Some(share) = self.active_p2p_share.take() {
+                        let svc = self.p2p_service.clone();
+                        tokio_runtime().spawn(async move {
+                            svc.cancel_share_offer(share.transfer_id).await;
+                        });
+                    }
+                    if let Some(ActiveModal::P2p(ref mut m)) = self.active_modal {
+                        m.selected_paths = paths;
+                        m.generating_share = false;
+                        m.error = None;
+                        cx.notify();
+                    }
+                }
+                Ok(_) => {}
+                Err(err) => {
+                    if let Some(ActiveModal::P2p(ref mut m)) = self.active_modal {
+                        m.error = Some(err);
+                        cx.notify();
+                    }
+                }
+            },
+            BgEvent::P2pPickedDestDir(res) => match res {
+                Ok(Some(dir)) => {
+                    if let Some(ActiveModal::P2p(ref mut m)) = self.active_modal {
+                        m.dest_dir = dir;
+                        m.error = None;
+                        cx.notify();
+                    }
+                }
+                Ok(None) => {}
+                Err(err) => {
+                    if let Some(ActiveModal::P2p(ref mut m)) = self.active_modal {
+                        m.error = Some(err);
+                        cx.notify();
+                    }
+                }
+            },
+            BgEvent::NetworkPickedKeyPath(res) => match res {
+                Ok(paths) => {
+                    if let Some(first) = paths.first()
+                        && let Some(ActiveModal::NetworkConnect(ref mut form)) = self.active_modal
+                    {
+                        let key_str = first.display().to_string();
+                        let input = form.key_path_input.clone();
+                        form.status_message = None;
+                        input.update(cx, |s, cx| s.set_value(key_str, window, cx));
+                        cx.notify();
+                    }
+                }
+                Err(err) => {
+                    if let Some(ActiveModal::NetworkConnect(ref mut form)) = self.active_modal {
+                        form.status_message = Some(err);
+                        form.status_is_error = true;
+                        cx.notify();
+                    }
+                }
+            },
         }
     }
 
@@ -5027,6 +5090,14 @@ impl Workspace {
         cx.notify();
     }
 
+    pub fn set_win_e_new_window(&mut self, new_window: bool, cx: &mut Context<Self>) {
+        if self.settings.win_e_new_window != new_window {
+            self.settings.win_e_new_window = new_window;
+            let _ = self.settings.save();
+            cx.notify();
+        }
+    }
+
     pub fn toggle_show_brand_title(&mut self, cx: &mut Context<Self>) {
         self.settings.show_brand_title = !self.settings.show_brand_title;
         let _ = self.settings.save();
@@ -5095,6 +5166,24 @@ impl Workspace {
         self.settings.toggle_sidebar_section_visible(section);
         let _ = self.settings.save();
         cx.notify();
+    }
+
+    pub fn toggle_sidebar_p2p_row(&mut self, cx: &mut Context<Self>) {
+        self.settings.show_sidebar_p2p_row = !self.settings.show_sidebar_p2p_row;
+        let _ = self.settings.save();
+        cx.notify();
+    }
+
+    pub fn reorder_pinned_folder(
+        &mut self,
+        from: PathBuf,
+        to: PathBuf,
+        cx: &mut Context<Self>,
+    ) {
+        if self.settings.reorder_pinned_folder(&from, &to) {
+            let _ = self.settings.save();
+            cx.notify();
+        }
     }
 
     pub fn reorder_sidebar_section(
@@ -5200,7 +5289,7 @@ impl Workspace {
         self.stop_video_playback();
         self.modal_subs.clear();
 
-        let (editing_id, protocol, auth_mode, save_password, init_name, init_host, init_port, init_rpath, init_user, init_key, init_pass) =
+        let (editing_id, protocol, auth_mode, init_name, init_host, init_port, init_rpath, init_user, init_key, init_pass) =
             if let Some(conn) = editing {
                 let stored_pass = self
                     .session_passwords
@@ -5212,12 +5301,14 @@ impl Workspace {
                     .private_key_path
                     .as_ref()
                     .map(|p| p.display().to_string())
-                    .unwrap_or_else(default_ssh_key_path_str);
+                    .or_else(|| {
+                        detect_default_ssh_key(Some(&conn.host)).map(|p| p.display().to_string())
+                    })
+                    .unwrap_or_default();
                 (
                     Some(conn.id),
                     conn.protocol,
                     conn.auth_mode,
-                    conn.save_password,
                     conn.name,
                     conn.host,
                     conn.port.to_string(),
@@ -5228,31 +5319,35 @@ impl Workspace {
                 )
             } else if let Some(uri) = prefill {
                 let name_guess = uri.host.clone();
+                let key_str = detect_default_ssh_key(Some(&uri.host))
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_default();
                 (
                     None,
                     uri.protocol,
                     SshAuthMode::Password,
-                    true,
                     name_guess,
                     uri.host,
                     uri.port.to_string(),
                     uri.remote_path,
                     uri.username,
-                    default_ssh_key_path_str(),
+                    key_str,
                     String::new(),
                 )
             } else {
+                let key_str = detect_default_ssh_key(None)
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_default();
                 (
                     None,
                     NetworkProtocol::Smb,
                     SshAuthMode::Password,
-                    true,
                     String::new(),
                     String::new(),
                     NetworkProtocol::Smb.default_port().to_string(),
                     "/".to_string(),
                     String::new(),
-                    default_ssh_key_path_str(),
+                    key_str,
                     String::new(),
                 )
             };
@@ -5272,8 +5367,9 @@ impl Workspace {
                 .placeholder("Password")
                 .masked(true)
         });
-        let key_path_input =
-            cx.new(|cx| InputState::new(window, cx).placeholder(r"C:\Users\you\.ssh\id_ed25519"));
+        let key_path_input = cx.new(|cx| {
+            InputState::new(window, cx).placeholder("Auto-detected from system ~/.ssh")
+        });
 
         name_input.update(cx, |s, cx| s.set_value(init_name, window, cx));
         host_input.update(cx, |s, cx| s.set_value(init_host, window, cx));
@@ -5288,7 +5384,6 @@ impl Workspace {
             editing_id,
             protocol,
             auth_mode,
-            save_password,
             name_input,
             host_input,
             port_input,
@@ -5324,19 +5419,49 @@ impl Workspace {
         cx.notify();
     }
 
-    pub fn set_network_modal_auth_mode(&mut self, mode: SshAuthMode, cx: &mut Context<Self>) {
-        if let Some(ActiveModal::NetworkConnect(ref mut form)) = self.active_modal {
-            form.auth_mode = mode;
-            form.status_message = None;
-            cx.notify();
+    pub fn set_network_modal_auth_mode(
+        &mut self,
+        mode: SshAuthMode,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(ActiveModal::NetworkConnect(ref mut form)) = self.active_modal else {
+            return;
+        };
+        form.auth_mode = mode;
+        form.status_message = None;
+        if mode == SshAuthMode::PrivateKey {
+            let host = form.host_input.read(cx).value().trim().to_string();
+            let key_input = form.key_path_input.clone();
+            let current_key = key_input.read(cx).value().trim().to_string();
+            let generic_default = detect_default_ssh_key(None)
+                .map(|p| p.display().to_string())
+                .unwrap_or_default();
+            if (current_key.is_empty() || current_key == generic_default)
+                && let Some(detected) =
+                    detect_default_ssh_key((!host.is_empty()).then_some(host.as_str()))
+            {
+                let detected_str = detected.display().to_string();
+                key_input.update(cx, |s, cx| s.set_value(detected_str, window, cx));
+            }
         }
+        cx.notify();
     }
 
-    pub fn toggle_network_modal_save_password(&mut self, cx: &mut Context<Self>) {
-        if let Some(ActiveModal::NetworkConnect(ref mut form)) = self.active_modal {
-            form.save_password = !form.save_password;
-            cx.notify();
-        }
+    pub fn network_pick_ssh_key_file(&mut self, _cx: &mut Context<Self>) {
+        let ssh_dir = dirs::home_dir()
+            .map(|h| h.join(".ssh"))
+            .filter(|p| p.is_dir())
+            .or_else(dirs::home_dir);
+        let tx = self.bg_tx.clone();
+        tokio_runtime().spawn(async move {
+            let res = tokio::task::spawn_blocking(move || {
+                pick_files_dialog("Select SSH Private Key File", ssh_dir.as_deref())
+            })
+            .await
+            .unwrap_or_else(|e| Err(format!("SSH key picker failed: {e}")));
+            let _ = tx.unbounded_send(BgEvent::NetworkPickedKeyPath(res));
+        });
     }
 
     fn build_network_conn_from_modal(
@@ -5393,7 +5518,7 @@ impl Workspace {
             remote_path,
             auth_mode: form.auth_mode,
             private_key_path,
-            save_password: form.save_password,
+            save_password: true,
         };
         Ok((conn, password))
     }
@@ -5988,21 +6113,47 @@ impl Workspace {
         }
     }
 
-    pub fn p2p_load_current_selection(&mut self, cx: &mut Context<Self>) {
-        let side = self
-            .active_tab()
-            .map(|t| t.model.active_pane)
-            .unwrap_or(PaneSide::Left);
-        let paths = self.selected_local_paths(side);
-        if let Some(ActiveModal::P2p(ref mut m)) = self.active_modal {
-            if paths.is_empty() {
-                m.error = Some("No local files or folders are selected in the active pane.".to_string());
-            } else {
-                m.selected_paths = paths;
-                m.error = None;
-            }
-            cx.notify();
-        }
+    pub fn p2p_pick_send_files(&mut self, _cx: &mut Context<Self>) {
+        let initial = self.default_p2p_dest_dir();
+        let tx = self.bg_tx.clone();
+        tokio_runtime().spawn(async move {
+            let res = tokio::task::spawn_blocking(move || {
+                pick_files_dialog("Select files to send via P2P", Some(&initial))
+            })
+            .await
+            .unwrap_or_else(|e| Err(format!("File picker task failed: {e}")));
+            let _ = tx.unbounded_send(BgEvent::P2pPickedSendPaths(res));
+        });
+    }
+
+    pub fn p2p_pick_send_folder(&mut self, _cx: &mut Context<Self>) {
+        let initial = self.default_p2p_dest_dir();
+        let tx = self.bg_tx.clone();
+        tokio_runtime().spawn(async move {
+            let res = tokio::task::spawn_blocking(move || {
+                pick_folder_dialog("Select folder to send via P2P", Some(&initial))
+                    .map(|opt| opt.into_iter().collect())
+            })
+            .await
+            .unwrap_or_else(|e| Err(format!("Folder picker task failed: {e}")));
+            let _ = tx.unbounded_send(BgEvent::P2pPickedSendPaths(res));
+        });
+    }
+
+    pub fn p2p_pick_dest_folder(&mut self, _cx: &mut Context<Self>) {
+        let initial = match &self.active_modal {
+            Some(ActiveModal::P2p(m)) if m.dest_dir.is_dir() => m.dest_dir.clone(),
+            _ => self.default_p2p_dest_dir(),
+        };
+        let tx = self.bg_tx.clone();
+        tokio_runtime().spawn(async move {
+            let res = tokio::task::spawn_blocking(move || {
+                pick_folder_dialog("Choose P2P receive destination folder", Some(&initial))
+            })
+            .await
+            .unwrap_or_else(|e| Err(format!("Folder picker task failed: {e}")));
+            let _ = tx.unbounded_send(BgEvent::P2pPickedDestDir(res));
+        });
     }
 
     pub fn generate_p2p_share_code(&mut self, cx: &mut Context<Self>) {
@@ -6041,7 +6192,6 @@ impl Workspace {
         let peer_name = peer.device_name.clone();
         let svc = self.p2p_service.clone();
         let tx = self.bg_tx.clone();
-        self.close_modal(cx);
         self.set_toast_simple(
             format!("Waiting for {peer_name} to accept P2P transfer..."),
             ToastKind::Info,
@@ -6068,7 +6218,6 @@ impl Workspace {
         }
         let svc = self.p2p_service.clone();
         let tx = self.bg_tx.clone();
-        self.close_modal(cx);
         self.set_toast_simple("Connecting to P2P sender...", ToastKind::Info, cx);
         tokio_runtime().spawn(async move {
             if let Err(err) = svc.receive_from_ticket(&ticket_code, dest_dir).await {
@@ -6081,12 +6230,20 @@ impl Workspace {
         &mut self,
         transfer_id: Uuid,
         accept: bool,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         self.incoming_p2p_offers
             .retain(|o| o.transfer_id != transfer_id);
         let dest = if accept {
-            Some(self.default_p2p_dest_dir())
+            let chosen = match &self.active_modal {
+                Some(ActiveModal::P2p(m)) => m.dest_dir.clone(),
+                _ => self.default_p2p_dest_dir(),
+            };
+            if !matches!(self.active_modal, Some(ActiveModal::P2p(_))) {
+                self.open_p2p_modal(P2pModalTab::Receive, Vec::new(), window, cx);
+            }
+            Some(chosen)
         } else {
             None
         };
@@ -6284,12 +6441,6 @@ impl Workspace {
             _ => {}
         }
     }
-}
-
-fn default_ssh_key_path_str() -> String {
-    dirs::home_dir()
-        .map(|h| h.join(".ssh").join("id_ed25519").display().to_string())
-        .unwrap_or_else(|| r"C:\Users\.ssh\id_ed25519".to_string())
 }
 
 fn archive_stem_name(path: &Path) -> String {
@@ -6884,7 +7035,8 @@ impl Render for Workspace {
             .when(has_transfers, |el| el.child(render_transfer_drawer(self, cx)))
             // Floating P2P incoming confirmations and live P2P transfer progress
             .when(
-                !self.incoming_p2p_offers.is_empty() || !self.active_p2p_transfers.is_empty(),
+                !self.incoming_p2p_offers.is_empty()
+                    && !matches!(self.active_modal, Some(ActiveModal::P2p(_))),
                 |el| el.child(render_p2p_overlays(self, cx)),
             )
             // Subtle bottom-right toast banner (lifted above transfer drawer when visible)

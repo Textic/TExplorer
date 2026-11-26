@@ -11,7 +11,6 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
-  CARGO_PROFILE_DEV_DEBUG: "0"
 
 jobs:
   check:
@@ -21,19 +20,39 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Exclude build directories from Windows Defender
+        shell: pwsh
+        run: |
+          try {
+            $cargoHome = if ($env:CARGO_HOME) { $env:CARGO_HOME } else { Join-Path $env:USERPROFILE ".cargo" }
+            Add-MpPreference -ExclusionPath $env:GITHUB_WORKSPACE, $cargoHome -ErrorAction SilentlyContinue
+          } catch {}
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
-          targets: x86_64-pc-windows-msvc
+
+      - name: Enable lld-link for faster Windows linking
+        shell: pwsh
+        run: |
+          $lld = (Get-Command lld-link.exe -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty Source)
+          if (-not $lld -and (Test-Path "C:\Program Files\LLVM\bin\lld-link.exe")) {
+            $lld = "C:\Program Files\LLVM\bin\lld-link.exe"
+          }
+          if ($lld) {
+            Write-Host "Using faster linker: $lld"
+            "CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER=$lld" >> $env:GITHUB_ENV
+          }
 
       - name: Restore Cargo cache
         uses: Swatinem/rust-cache@v2
         with:
-          key: ci-windows-x86_64
+          shared-key: ci-windows-x86_64-v2
+          cache-on-failure: true
 
       - name: Run strict clippy
-        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+        run: cargo clippy --workspace --all-targets --locked --profile ci -- -D warnings
 
       - name: Run workspace test suite
-        run: cargo test --workspace --locked --target x86_64-pc-windows-msvc
+        run: cargo test --workspace --locked --profile ci

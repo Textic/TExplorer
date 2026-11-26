@@ -28,7 +28,6 @@ pub struct NetworkConnectModalState {
     pub editing_id: Option<Uuid>,
     pub protocol: NetworkProtocol,
     pub auth_mode: SshAuthMode,
-    pub save_password: bool,
     pub name_input: Entity<InputState>,
     pub host_input: Entity<InputState>,
     pub port_input: Entity<InputState>,
@@ -293,8 +292,8 @@ pub fn render_network_connect_modal(
                                                 } else {
                                                     solid(p.text_secondary)
                                                 })
-                                                .on_click(cx.listener(move |this, _, _, cx| {
-                                                    this.set_network_modal_auth_mode(mode, cx);
+                                                .on_click(cx.listener(move |this, _, window, cx| {
+                                                    this.set_network_modal_auth_mode(mode, window, cx);
                                                 }))
                                                 .child(
                                                     Icon::new(match mode {
@@ -349,74 +348,48 @@ pub fn render_network_connect_modal(
                                 )),
                         ),
                 )
-                // Private Key Path (SSH key auth only)
+                // Private Key Path (SSH key auth only — auto-detects system SSH key + native picker)
                 .when(is_key_auth, |el| {
-                    el.child(labeled_input_row(
-                        "Private Key File Path",
-                        "net-in-keypath",
-                        &form.key_path_input,
-                        false,
-                        p,
-                    ))
+                    el.child(
+                        v_flex()
+                            .w_full()
+                            .gap_1()
+                            .child(field_label("Private Key File (auto-detected from system SSH)", p))
+                            .child(
+                                h_flex()
+                                    .w_full()
+                                    .gap_2()
+                                    .items_center()
+                                    .child(
+                                        div()
+                                            .flex_1()
+                                            .min_w_0()
+                                            .h(px(32.))
+                                            .px_2p5()
+                                            .rounded(px(RADIUS_CONTROL))
+                                            .bg(solid(p.bg_base))
+                                            .border_1()
+                                            .border_color(solid(p.border))
+                                            .child(full_hit_input(
+                                                "net-in-keypath",
+                                                &form.key_path_input,
+                                                Input::new(&form.key_path_input)
+                                                    .with_size(Size::Small)
+                                                    .appearance(false),
+                                            )),
+                                    )
+                                    .child(
+                                        Button::new("net-pick-key")
+                                            .with_size(Size::Small)
+                                            .icon(LucideIcon::FolderOpen)
+                                            .label("Select Key")
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.network_pick_ssh_key_file(cx);
+                                            })),
+                                    ),
+                            ),
+                    )
                 })
-                // Windows Credential Manager toggle
-                .child(
-                    h_flex()
-                        .id("net-save-cred-toggle")
-                        .w_full()
-                        .px_2p5()
-                        .py_2()
-                        .gap_2()
-                        .items_center()
-                        .justify_between()
-                        .rounded(px(RADIUS_CONTROL))
-                        .bg(solid(p.bg_base))
-                        .border_1()
-                        .border_color(solid(p.border_subtle))
-                        .cursor_pointer()
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            this.toggle_network_modal_save_password(cx);
-                        }))
-                        .child(
-                            h_flex()
-                                .gap_2()
-                                .items_center()
-                                .child(
-                                    Icon::new(LucideIcon::ShieldCheck)
-                                        .xsmall()
-                                        .text_color(if form.save_password {
-                                            solid(p.status_success)
-                                        } else {
-                                            solid(p.text_muted)
-                                        }),
-                                )
-                                .child(
-                                    div()
-                                        .text_xs()
-                                        .text_color(solid(p.text_secondary))
-                                        .child("Remember password in Windows Credential Manager"),
-                                ),
-                        )
-                        .child(
-                            div()
-                                .px_2()
-                                .py_0p5()
-                                .rounded(px(RADIUS_CONTROL))
-                                .bg(if form.save_password {
-                                    soft_tint(p.accent_primary, 0.16)
-                                } else {
-                                    solid(p.bg_elevated)
-                                })
-                                .text_size(px(11.5))
-                                .font_semibold()
-                                .text_color(if form.save_password {
-                                    solid(p.accent_primary)
-                                } else {
-                                    solid(p.text_muted)
-                                })
-                                .child(if form.save_password { "Enabled" } else { "Session Only" }),
-                        ),
-                )
                 // Status / error feedback banner
                 .when_some(form.status_message.clone(), |el, msg| {
                     let color = if form.status_is_error {
@@ -630,13 +603,17 @@ pub fn render_p2p_modal(
                             h_flex()
                                 .items_center()
                                 .justify_between()
+                                .gap_2()
                                 .child(
                                     div()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .truncate()
                                         .text_xs()
                                         .font_semibold()
                                         .text_color(solid(p.text_primary))
                                         .child(if modal.selected_paths.is_empty() {
-                                            SharedString::from("No files selected")
+                                            SharedString::from("No files or folder selected")
                                         } else if modal.selected_paths.len() == 1 {
                                             SharedString::from(format!(
                                                 "Ready to send: {}",
@@ -656,23 +633,37 @@ pub fn render_p2p_modal(
                                             ))
                                         }),
                                 )
-                                .when(modal.selected_paths.is_empty(), |el| {
-                                    el.child(
-                                        Button::new("p2p-use-sel")
-                                            .with_size(Size::XSmall)
-                                            .label("Use Active Selection")
-                                            .on_click(cx.listener(|this, _, _, cx| {
-                                                this.p2p_load_current_selection(cx);
-                                            })),
-                                    )
-                                }),
+                                .child(
+                                    h_flex()
+                                        .flex_shrink_0()
+                                        .items_center()
+                                        .gap_1p5()
+                                        .child(
+                                            Button::new("p2p-pick-files")
+                                                .with_size(Size::XSmall)
+                                                .icon(LucideIcon::FilePlus)
+                                                .label("Select Files")
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    this.p2p_pick_send_files(cx);
+                                                })),
+                                        )
+                                        .child(
+                                            Button::new("p2p-pick-folder")
+                                                .with_size(Size::XSmall)
+                                                .icon(LucideIcon::FolderOpen)
+                                                .label("Select Folder")
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    this.p2p_pick_send_folder(cx);
+                                                })),
+                                        ),
+                                ),
                         )
                         .when(modal.selected_paths.is_empty(), |el| {
                             el.child(
                                 div()
                                     .text_xs()
                                     .text_color(solid(p.text_muted))
-                                    .child("Select files or folders in any pane, then right-click → \"Send via P2P...\" or click \"Use Active Selection\"."),
+                                    .child("Choose files or a folder to send, or right-click any item in a pane → \"Send via P2P...\"."),
                             )
                         })
                         .when(!modal.selected_paths.is_empty(), |el| {
@@ -976,7 +967,8 @@ pub fn render_p2p_modal(
                     h_flex()
                         .w_full()
                         .px_2p5()
-                        .py_2()
+                        .py_1p5()
+                        .gap_2()
                         .items_center()
                         .justify_between()
                         .rounded(px(RADIUS_CONTROL))
@@ -984,21 +976,32 @@ pub fn render_p2p_modal(
                         .border_1()
                         .border_color(solid(p.border_subtle))
                         .child(
-                            div()
-                                .text_xs()
-                                .text_color(solid(p.text_muted))
-                                .child("Save destination:"),
-                        )
-                        .child(
-                            div()
+                            v_flex()
                                 .flex_1()
                                 .min_w_0()
-                                .pl_2()
-                                .truncate()
-                                .text_right()
-                                .text_xs()
-                                .text_color(solid(p.text_primary))
-                                .child(modal.dest_dir.display().to_string()),
+                                .gap_0p5()
+                                .child(
+                                    div()
+                                        .text_size(px(11.5))
+                                        .text_color(solid(p.text_muted))
+                                        .child("Save destination"),
+                                )
+                                .child(
+                                    div()
+                                        .truncate()
+                                        .text_xs()
+                                        .text_color(solid(p.text_primary))
+                                        .child(modal.dest_dir.display().to_string()),
+                                ),
+                        )
+                        .child(
+                            Button::new("p2p-pick-dest")
+                                .with_size(Size::XSmall)
+                                .icon(LucideIcon::FolderOpen)
+                                .label("Choose Folder")
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.p2p_pick_dest_folder(cx);
+                                })),
                         ),
                 )
                 .when_some(modal.error.clone(), |el, err| {
@@ -1020,7 +1023,7 @@ pub fn render_p2p_modal(
                         .child(
                             Button::new("p2p-recv-cancel")
                                 .with_size(Size::Small)
-                                .label("Cancel")
+                                .label("Close")
                                 .on_click(cx.listener(|this, _, _, cx| {
                                     this.close_modal(cx);
                                 })),
@@ -1039,9 +1042,32 @@ pub fn render_p2p_modal(
                 )
                 .into_any_element(),
         })
+        // Inline incoming LAN offers & live transfer progress inside the P2P window
+        .when(
+            !ws.incoming_p2p_offers.is_empty() || !ws.active_p2p_transfers.is_empty(),
+            |el| {
+                el.child(
+                    v_flex()
+                        .w_full()
+                        .px_4()
+                        .pb_4()
+                        .gap_2()
+                        .border_t_1()
+                        .border_color(solid(p.border_subtle))
+                        .pt_3()
+                        .children(ws.incoming_p2p_offers.iter().enumerate().map(|(i, offer)| {
+                            render_incoming_offer_card(i, offer, unit, p, cx)
+                        }))
+                        .children(ws.active_p2p_transfers.iter().enumerate().map(|(i, xfer)| {
+                            render_p2p_transfer_card(i, xfer, unit, p)
+                        })),
+                )
+            },
+        )
 }
 
-/// Renders floating incoming P2P confirmation cards and live P2P progress pills.
+/// Renders floating incoming P2P LAN confirmation cards when the P2P modal is closed.
+/// Active transfer progress bars are shown directly inside the P2P window instead.
 pub fn render_p2p_overlays(ws: &Workspace, cx: &mut Context<Workspace>) -> impl IntoElement {
     let p = ws.palette();
     let unit = ws.settings.size_unit;
@@ -1053,104 +1079,110 @@ pub fn render_p2p_overlays(ws: &Workspace, cx: &mut Context<Workspace>) -> impl 
         .bottom(if has_transfers { px(190.) } else { px(72.) })
         .w(px(340.))
         .gap_2()
-        // Incoming LAN P2P offers waiting for Accept / Decline
         .children(ws.incoming_p2p_offers.iter().enumerate().map(|(i, offer)| {
             render_incoming_offer_card(i, offer, unit, p, cx)
         }))
-        // Active P2P transfer progress cards
-        .children(ws.active_p2p_transfers.iter().enumerate().map(|(i, xfer)| {
-            let frac = if xfer.total_bytes > 0 {
-                (xfer.bytes_transferred as f32 / xfer.total_bytes as f32).clamp(0.0, 1.0)
-            } else {
-                0.0
-            };
-            let pct = (frac * 100.0).round() as u8;
-            let verb = match xfer.direction {
-                P2pDirection::Send => "Sending to",
-                P2pDirection::Receive => "Receiving from",
-            };
-            v_flex()
-                .id(("p2p-xfer-card", i))
-                .w_full()
-                .p_3()
-                .gap_1p5()
-                .rounded(px(RADIUS_ROW))
-                .bg(solid(p.bg_elevated))
-                .border_1()
-                .border_color(solid(p.border))
-                .occlude()
+}
+
+fn render_p2p_transfer_card(
+    idx: usize,
+    xfer: &ActiveP2pTransferUi,
+    unit: texplorer_core::SizeUnit,
+    p: Palette,
+) -> impl IntoElement + use<> {
+    let frac = if xfer.total_bytes > 0 {
+        (xfer.bytes_transferred as f32 / xfer.total_bytes as f32).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let pct = (frac * 100.0).round() as u8;
+    let verb = match xfer.direction {
+        P2pDirection::Send => "Sending to",
+        P2pDirection::Receive => "Receiving from",
+    };
+    let file_label = if xfer.current_file.is_empty() {
+        xfer.summary.clone()
+    } else {
+        xfer.current_file.clone()
+    };
+    let bytes_label = format!(
+        "{} / {}",
+        format_size(xfer.bytes_transferred, unit),
+        format_size(xfer.total_bytes, unit)
+    );
+
+    v_flex()
+        .id(("p2p-xfer-card", idx))
+        .w_full()
+        .p_3()
+        .gap_1p5()
+        .rounded(px(RADIUS_ROW))
+        .bg(solid(p.bg_base))
+        .border_1()
+        .border_color(solid(p.border))
+        .child(
+            h_flex()
+                .items_center()
+                .justify_between()
+                .gap_2()
                 .child(
                     h_flex()
+                        .flex_1()
+                        .min_w_0()
+                        .gap_1p5()
                         .items_center()
-                        .justify_between()
-                        .gap_2()
                         .child(
-                            h_flex()
-                                .flex_1()
-                                .min_w_0()
-                                .gap_1p5()
-                                .items_center()
-                                .child(
-                                    Icon::new(match xfer.direction {
-                                        P2pDirection::Send => LucideIcon::Upload,
-                                        P2pDirection::Receive => LucideIcon::Download,
-                                    })
-                                    .xsmall()
-                                    .text_color(solid(p.accent_primary)),
-                                )
-                                .child(
-                                    div()
-                                        .truncate()
-                                        .text_xs()
-                                        .font_semibold()
-                                        .text_color(solid(p.text_primary))
-                                        .child(format!("{verb} {}", xfer.peer_name)),
-                                ),
+                            Icon::new(match xfer.direction {
+                                P2pDirection::Send => LucideIcon::Upload,
+                                P2pDirection::Receive => LucideIcon::Download,
+                            })
+                            .xsmall()
+                            .text_color(solid(p.accent_primary)),
                         )
                         .child(
                             div()
-                                .flex_shrink_0()
-                                .text_size(px(12.))
-                                .text_color(solid(p.text_secondary))
-                                .child(format!("{pct}%")),
+                                .truncate()
+                                .text_xs()
+                                .font_semibold()
+                                .text_color(solid(p.text_primary))
+                                .child(format!("{verb} {}", xfer.peer_name)),
                         ),
                 )
                 .child(
                     div()
-                        .truncate()
+                        .flex_shrink_0()
                         .text_size(px(12.))
-                        .text_color(solid(p.text_muted))
-                        .child(if xfer.current_file.is_empty() {
-                            xfer.summary.clone()
-                        } else {
-                            xfer.current_file.clone()
-                        }),
-                )
+                        .text_color(solid(p.text_secondary))
+                        .child(format!("{pct}%")),
+                ),
+        )
+        .child(
+            div()
+                .truncate()
+                .text_size(px(12.))
+                .text_color(solid(p.text_muted))
+                .child(file_label),
+        )
+        .child(
+            div()
+                .w_full()
+                .h(px(4.))
+                .rounded(px(999.))
+                .bg(solid(p.border_subtle))
+                .overflow_hidden()
                 .child(
                     div()
-                        .w_full()
-                        .h(px(4.))
-                        .rounded(px(999.))
-                        .bg(solid(p.border_subtle))
-                        .overflow_hidden()
-                        .child(
-                            div()
-                                .h_full()
-                                .w(relative(frac))
-                                .bg(solid(p.accent_primary)),
-                        ),
-                )
-                .child(
-                    div()
-                        .text_size(px(11.5))
-                        .text_color(solid(p.text_muted))
-                        .child(format!(
-                            "{} / {}",
-                            format_size(xfer.bytes_transferred, unit),
-                            format_size(xfer.total_bytes, unit)
-                        )),
-                )
-        }))
+                        .h_full()
+                        .w(relative(frac))
+                        .bg(solid(p.accent_primary)),
+                ),
+        )
+        .child(
+            div()
+                .text_size(px(11.5))
+                .text_color(solid(p.text_muted))
+                .child(bytes_label),
+        )
 }
 
 fn render_incoming_offer_card(
@@ -1211,8 +1243,8 @@ fn render_incoming_offer_card(
                     Button::new(("p2p-decline", idx))
                         .with_size(Size::XSmall)
                         .label("Decline")
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.respond_incoming_p2p(decline_id, false, cx);
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.respond_incoming_p2p(decline_id, false, window, cx);
                         })),
                 )
                 .child(
@@ -1221,8 +1253,8 @@ fn render_incoming_offer_card(
                         .primary()
                         .icon(LucideIcon::Download)
                         .label("Accept")
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.respond_incoming_p2p(accept_id, true, cx);
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.respond_incoming_p2p(accept_id, true, window, cx);
                         })),
                 ),
         )

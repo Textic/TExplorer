@@ -34,7 +34,9 @@ mod imp {
         WM_SYSKEYUP, WNDCLASSW,
     };
 
-    use crate::single_instance::{LaunchIntent, try_forward_to_running_instance};
+    use crate::single_instance::{
+        LaunchIntent, is_app_instance_running, try_forward_to_running_instance,
+    };
 
     const DAEMON_MUTEX_NAME: &str = "Local\\TExplorerWinEDaemonV1";
     const DAEMON_WINDOW_CLASS: &str = "TExplorerWinEDaemonClassV1";
@@ -164,18 +166,28 @@ mod imp {
             unsafe {
                 let _ = AllowSetForegroundWindow(ASFW_ANY);
             }
-            if try_forward_to_running_instance(&LaunchIntent::OpenDefault) {
+            let settings = texplorer_core::AppSettings::load();
+            let open_new_window = settings.should_win_e_open_new_window();
+            if !open_new_window && try_forward_to_running_instance(&LaunchIntent::OpenDefault) {
                 return;
             }
             if let Ok(exe) = std::env::current_exe() {
+                // Only pass `--new-window` when another window is already open, so launching
+                // the very first window via Win+E still restores saved session tabs if enabled.
+                let pass_new_window = open_new_window && is_app_instance_running();
                 if crate::elevation::is_elevated() {
                     let parent = exe.parent().unwrap_or_else(|| Path::new("."));
                     let exe_str = exe.to_string_lossy();
-                    if crate::launch::spawn_as_desktop_user(&exe_str, "", parent).is_ok() {
+                    let args = if pass_new_window { "--new-window" } else { "" };
+                    if crate::launch::spawn_as_desktop_user(&exe_str, args, parent).is_ok() {
                         return;
                     }
                 }
-                let _ = Command::new(exe)
+                let mut cmd = Command::new(exe);
+                if pass_new_window {
+                    cmd.arg("--new-window");
+                }
+                let _ = cmd
                     .stdin(Stdio::null())
                     .stdout(Stdio::null())
                     .stderr(Stdio::null())

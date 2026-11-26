@@ -3,7 +3,7 @@
 
 use std::collections::HashMap;
 use std::io::{Cursor, Read};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, UNIX_EPOCH};
 
@@ -681,18 +681,22 @@ async fn establish_sftp_session(
                 .success()
         }
         SshAuthMode::PrivateKey => {
-            let key_path = conn
+            let resolved_key = conn
                 .private_key_path
-                .as_ref()
-                .ok_or_else(|| "SSH private key path is required.".to_string())?;
+                .clone()
+                .filter(|p| !p.as_os_str().is_empty())
+                .or_else(|| detect_default_ssh_key(Some(host)))
+                .ok_or_else(|| {
+                    "No SSH private key found in ~/.ssh. Select a private key file.".to_string()
+                })?;
             let passphrase = creds
                 .password
                 .as_deref()
                 .filter(|p| !p.is_empty());
-            let key_pair = load_secret_key(key_path, passphrase).map_err(|e| {
+            let key_pair = load_secret_key(&resolved_key, passphrase).map_err(|e| {
                 format!(
                     "Failed to load SSH key \"{}\": {e}",
-                    key_path.display()
+                    resolved_key.display()
                 )
             })?;
             let hash_alg = handle
@@ -916,6 +920,180 @@ fn parse_posix_list_fallback(line: &str) -> Option<(String, bool, bool, u64, i64
     Some((name, first == b'd', first == b'l', size, 0))
 }
 
+/// Detects the default OpenSSH private key that the system `ssh` client would use for `host`:
+/// 1. Checks `~/.ssh/config` for a matching `Host` / `HostName` block with an `IdentityFile`.
+/// 2. Falls back to standard OpenSSH default keys in `~/.ssh/` (`id_ed25519`, `id_ecdsa`,
+///    `id_rsa`, `id_dsa`, `id_ed25519_sk`, `id_ecdsa_sk`).
+pub fn detect_default_ssh_key(host: Option<&str>) -> Option<PathBuf> {
+    let home = std::env::var_os("USERPROFILE")
+        .or_else(|| std::env::var_os("HOME"))
+        .map(PathBuf::from)?;
+    let ssh_dir = home.join(".ssh");
+    let target_host = host.map(str::trim).filter(|h| !h.is_empty());
+
+    let config_path = ssh_dir.join("config");
+    if let Ok(raw_cfg) = std::fs::read_to_string(&config_path) {
+        for candidate in parse_ssh_config_identity_files(&raw_cfg, target_host, &home) {
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+
+    const DEFAULT_KEYS: [&str; 6] = [
+        "id_ed25519",
+        "id_ecdsa",
+        "id_rsa",
+        "id_dsa",
+        "id_ed25519_sk",
+        "id_ecdsa_sk",
+    ];
+    for name in DEFAULT_KEYS {
+        let candidate = ssh_dir.join(name);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+fn expand_ssh_tilde(raw: &str, home: &Path) -> PathBuf {
+    let trimmed = raw.trim().trim_matches('"');
+    if let Some(rest) = trimmed
+        .strip_prefix("~/")
+        .or_else(|| trimmed.strip_prefix(r"~\"))
+    {
+        home.join(rest)
+    } else if trimmed == "~" {
+        home.to_path_buf()
+    } else {
+        PathBuf::from(trimmed)
+    }
+}
+
+fn ssh_host_pattern_matches(pattern: &str, host: &str) -> bool {
+    let p = pattern.to_ascii_lowercase();
+    let h = host.to_ascii_lowercase();
+    if p == "*" {
+        return true;
+    }
+    if !p.contains('*') && !p.contains('?') {
+        return p == h;
+    }
+    let pb = p.as_bytes();
+    let hb = h.as_bytes();
+    let (mut pi, mut hi) = (0usize, 0usize);
+    let (mut star_p, mut star_h) = (None::<usize>, 0usize);
+    while hi < hb.len() {
+        if pi < pb.len() && (pb[pi] == b'?' || pb[pi] == hb[hi]) {
+            pi += 1;
+            hi += 1;
+        } else if pi < pb.len() && pb[pi] == b'*' {
+            star_p = Some(pi);
+            pi += 1;
+            star_h = hi;
+        } else if let Some(sp) = star_p {
+            pi = sp + 1;
+            star_h += 1;
+            hi = star_h;
+        } else {
+            return false;
+        }
+    }
+    while pi < pb.len() && pb[pi] == b'*' {
+        pi += 1;
+    }
+    pi == pb.len()
+}
+
+fn parse_ssh_config_identity_files(
+    raw: &str,
+    target_host: Option<&str>,
+    home: &Path,
+) -> Vec<PathBuf> {
+    struct Block {
+        patterns: Vec<String>,
+        hostname: Option<String>,
+        identities: Vec<PathBuf>,
+    }
+
+    let mut blocks: Vec<Block> = Vec::new();
+    let mut current: Option<Block> = None;
+
+    for line in raw.lines() {
+        let trimmed = line.split('#').next().unwrap_or("").trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let mut parts = trimmed.splitn(2, |c: char| c.is_whitespace() || c == '=');
+        let key = parts.next().unwrap_or("").trim();
+        let val = parts.next().unwrap_or("").trim().trim_start_matches('=').trim();
+        if key.is_empty() || val.is_empty() {
+            continue;
+        }
+        if key.eq_ignore_ascii_case("Host") {
+            if let Some(prev) = current.take() {
+                blocks.push(prev);
+            }
+            let patterns = val.split_whitespace().map(String::from).collect();
+            current = Some(Block {
+                patterns,
+                hostname: None,
+                identities: Vec::new(),
+            });
+        } else if let Some(block) = current.as_mut() {
+            if key.eq_ignore_ascii_case("HostName") {
+                block.hostname = Some(val.trim_matches('"').to_string());
+            } else if key.eq_ignore_ascii_case("IdentityFile") {
+                block.identities.push(expand_ssh_tilde(val, home));
+            }
+        }
+    }
+    if let Some(last) = current {
+        blocks.push(last);
+    }
+
+    let mut specific = Vec::new();
+    let mut wildcard = Vec::new();
+    for block in blocks {
+        if block.identities.is_empty() {
+            continue;
+        }
+        let is_wild_only = block.patterns.iter().all(|p| p == "*");
+        if let Some(host) = target_host {
+            let mut matched = false;
+            let mut negated = false;
+            for pat in &block.patterns {
+                if let Some(neg) = pat.strip_prefix('!') {
+                    if ssh_host_pattern_matches(neg, host) {
+                        negated = true;
+                    }
+                } else if ssh_host_pattern_matches(pat, host) {
+                    matched = true;
+                }
+            }
+            if !matched
+                && let Some(hn) = block.hostname.as_deref()
+                && hn.eq_ignore_ascii_case(host)
+            {
+                matched = true;
+            }
+            if matched && !negated {
+                if is_wild_only {
+                    wildcard.extend(block.identities);
+                } else {
+                    specific.extend(block.identities);
+                }
+            }
+        } else if is_wild_only {
+            wildcard.extend(block.identities);
+        }
+    }
+
+    specific.extend(wildcard);
+    specific
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -961,5 +1139,31 @@ mod tests {
         assert_eq!(entries.len(), 2);
         assert!(entries.iter().any(|e| e.name == "releases" && e.is_dir()));
         assert!(entries.iter().any(|e| e.name == "app.zip" && e.size == Some(4096)));
+    }
+
+    #[test]
+    fn resolves_ssh_config_identity_files_for_host_and_wildcard() {
+        let cfg = r#"
+            # Prod VPS
+            Host prod-vps
+                HostName 10.0.0.5
+                IdentityFile ~/.ssh/prod_ed25519
+
+            Host *
+                IdentityFile ~/.ssh/default_rsa
+        "#;
+        let home = PathBuf::from(r"C:\Users\demo");
+        let by_alias = parse_ssh_config_identity_files(cfg, Some("prod-vps"), &home);
+        assert_eq!(
+            by_alias,
+            vec![
+                home.join(".ssh").join("prod_ed25519"),
+                home.join(".ssh").join("default_rsa"),
+            ]
+        );
+        let by_ip = parse_ssh_config_identity_files(cfg, Some("10.0.0.5"), &home);
+        assert_eq!(by_ip[0], home.join(".ssh").join("prod_ed25519"));
+        let other = parse_ssh_config_identity_files(cfg, Some("other.example.com"), &home);
+        assert_eq!(other, vec![home.join(".ssh").join("default_rsa")]);
     }
 }

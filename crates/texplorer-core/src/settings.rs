@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -243,6 +243,7 @@ pub struct AppSettings {
     pub auto_check_updates: bool,
     pub replace_default_explorer: bool,
     pub intercept_win_e: bool,
+    pub win_e_new_window: bool,
     pub restore_tabs_on_startup: bool,
     pub sidebar_section_order: Vec<SidebarSection>,
     pub hidden_sidebar_sections: Vec<SidebarSection>,
@@ -251,6 +252,7 @@ pub struct AppSettings {
     pub hidden_quick_access: Vec<KnownFolderKind>,
     pub pinned_folders: Vec<PathBuf>,
     pub network_connections: Vec<NetworkConnection>,
+    pub show_sidebar_p2p_row: bool,
     pub details_col_modified: u16,
     pub details_col_type: u16,
     pub details_col_size: u16,
@@ -278,6 +280,7 @@ impl Default for AppSettings {
             auto_check_updates: true,
             replace_default_explorer: false,
             intercept_win_e: false,
+            win_e_new_window: true,
             restore_tabs_on_startup: true,
             sidebar_section_order: SidebarSection::DEFAULT_ORDER.to_vec(),
             hidden_sidebar_sections: Vec::new(),
@@ -286,6 +289,7 @@ impl Default for AppSettings {
             hidden_quick_access: Vec::new(),
             pinned_folders: Vec::new(),
             network_connections: Vec::new(),
+            show_sidebar_p2p_row: false,
             details_col_modified: 164,
             details_col_type: 144,
             details_col_size: 106,
@@ -338,6 +342,13 @@ impl AppSettings {
             return (parsed, true);
         }
         (parsed, false)
+    }
+
+    /// Returns `true` when pressing `Win+E` while TExplorer is already open should open
+    /// a separate window instead of adding a new tab to the active window.
+    /// Always opens a separate window when the top tab bar is hidden.
+    pub fn should_win_e_open_new_window(&self) -> bool {
+        !self.show_tabs || self.win_e_new_window
     }
 
     /// Saves settings to disk.
@@ -579,6 +590,33 @@ impl AppSettings {
         self.collapsed_sidebar_sections.clear();
     }
 
+    /// Reorders pinned sidebar folders by dragging `from` onto `to`.
+    pub fn reorder_pinned_folder(&mut self, from: &Path, to: &Path) -> bool {
+        let same = |a: &Path, b: &Path| {
+            #[cfg(target_os = "windows")]
+            {
+                a.to_string_lossy()
+                    .eq_ignore_ascii_case(&b.to_string_lossy())
+            }
+            #[cfg(not(target_os = "windows"))]
+            {
+                a == b
+            }
+        };
+        if same(from, to) {
+            return false;
+        }
+        let (Some(from_idx), Some(to_idx)) = (
+            self.pinned_folders.iter().position(|p| same(p, from)),
+            self.pinned_folders.iter().position(|p| same(p, to)),
+        ) else {
+            return false;
+        };
+        let item = self.pinned_folders.remove(from_idx);
+        self.pinned_folders.insert(to_idx, item);
+        true
+    }
+
     /// Inserts or updates a saved network connection profile by `id`.
     pub fn upsert_network_connection(&mut self, conn: NetworkConnection) {
         if let Some(existing) = self
@@ -753,5 +791,29 @@ mod tests {
         assert!(!did_migrate_explicit);
         assert_eq!(explicit_settings.theme, ThemePreset::ObsidianDark);
         assert_eq!(explicit_settings.accent, AccentPreset::Emerald);
+    }
+
+    #[test]
+    fn reorders_pinned_folders_and_hides_sidebar_p2p_row_by_default() {
+        let mut s = AppSettings::default();
+        assert!(!s.show_sidebar_p2p_row);
+        assert!(s.win_e_new_window);
+        assert!(s.should_win_e_open_new_window());
+
+        s.win_e_new_window = false;
+        assert!(!s.should_win_e_open_new_window());
+        s.show_tabs = false;
+        assert!(s.should_win_e_open_new_window());
+
+        let a = PathBuf::from(r"C:\Alpha");
+        let b = PathBuf::from(r"C:\Beta");
+        let c = PathBuf::from(r"C:\Gamma");
+        s.pin_folder(a.clone());
+        s.pin_folder(b.clone());
+        s.pin_folder(c.clone());
+
+        assert!(s.reorder_pinned_folder(&c, &a));
+        assert_eq!(s.pinned_folders, vec![c.clone(), a.clone(), b.clone()]);
+        assert!(!s.reorder_pinned_folder(&a, &a));
     }
 }

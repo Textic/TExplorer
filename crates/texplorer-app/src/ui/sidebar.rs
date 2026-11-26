@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use gpui_kit::{
     AnyElement, Context, MouseButton, MouseDownEvent, Pixels, Point, Render, SharedString, Window,
     assets::IconName as LucideIcon,
@@ -32,6 +34,13 @@ pub struct DraggedSidebarSection {
 #[derive(Clone)]
 pub struct DraggedQuickAccessItem {
     pub kind: KnownFolderKind,
+    pub label: SharedString,
+}
+
+/// Drag payload for reordering Pinned folders (in both the sidebar and Settings).
+#[derive(Clone)]
+pub struct DraggedPinnedFolder {
+    pub path: PathBuf,
     pub label: SharedString,
 }
 
@@ -344,6 +353,12 @@ fn render_pinned_section(
                         let path_open = path.clone();
                         let path_mid = path.clone();
                         let path_unpin = path.clone();
+                        let path_drag_over = path.clone();
+                        let path_drop = path.clone();
+                        let drag_payload = DraggedPinnedFolder {
+                            path: path.clone(),
+                            label: name.clone(),
+                        };
 
                         h_flex()
                             .id(("sb-pinned", i))
@@ -360,6 +375,33 @@ fn render_pinned_section(
                                 gpui_kit::transparent_black()
                             })
                             .hover(move |s| s.bg(solid(p.bg_elevated)))
+                            .on_drag(drag_payload, move |drag, cursor_offset, _, cx| {
+                                cx.new(|_| SidebarDragGhost {
+                                    label: drag.label.clone(),
+                                    palette: p,
+                                    cursor_offset,
+                                })
+                            })
+                            .drag_over::<DraggedPinnedFolder>(move |style, drag, _, _| {
+                                if drag.path != path_drag_over {
+                                    style
+                                        .bg(soft_tint(p.accent_primary, 0.16))
+                                        .border_t_2()
+                                        .border_color(solid(p.accent_primary))
+                                } else {
+                                    style
+                                }
+                            })
+                            .on_drop(cx.listener(
+                                move |this, drag: &DraggedPinnedFolder, _window, cx| {
+                                    cx.stop_propagation();
+                                    this.reorder_pinned_folder(
+                                        drag.path.clone(),
+                                        path_drop.clone(),
+                                        cx,
+                                    );
+                                },
+                            ))
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(move |this, _: &MouseDownEvent, window, cx| {
@@ -648,69 +690,71 @@ fn render_network_section(
                         ),
                 )
             })
-            // Quick P2P Transfer entry (Internet + LAN encrypted sharing)
-            .child(
-                h_flex()
-                    .id("sb-p2p-entry")
-                    .w_full()
-                    .h(px(32.))
-                    .px_2p5()
-                    .gap_2()
-                    .items_center()
-                    .rounded(px(RADIUS_CONTROL))
-                    .cursor_pointer()
-                    .hover(move |s| s.bg(solid(p.bg_elevated)))
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|this, _: &MouseDownEvent, window, cx| {
-                            this.open_p2p_modal_from_sidebar(window, cx);
-                        }),
-                    )
-                    .child(
-                        Icon::new(LucideIcon::Send)
-                            .xsmall()
-                            .text_color(if active_share_count > 0 || peer_count > 0 {
-                                solid(p.accent_primary)
-                            } else {
-                                solid(p.text_secondary)
+            // Optional P2P Transfer shortcut row inside Network (off by default; configurable in Settings -> Interface & Sidebar)
+            .when(ws.settings.show_sidebar_p2p_row, |inner| {
+                inner.child(
+                    h_flex()
+                        .id("sb-p2p-entry")
+                        .w_full()
+                        .h(px(32.))
+                        .px_2p5()
+                        .gap_2()
+                        .items_center()
+                        .rounded(px(RADIUS_CONTROL))
+                        .cursor_pointer()
+                        .hover(move |s| s.bg(solid(p.bg_elevated)))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _: &MouseDownEvent, window, cx| {
+                                this.open_p2p_modal_from_sidebar(window, cx);
                             }),
-                    )
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .truncate()
-                            .text_xs()
-                            .text_color(solid(p.text_secondary))
-                            .child("P2P Transfer"),
-                    )
-                    .when(active_share_count > 0, |row| {
-                        row.child(
-                            div()
-                                .px_1p5()
-                                .py(px(1.))
-                                .rounded(px(3.))
-                                .bg(soft_tint(p.status_success, 0.16))
-                                .text_size(px(10.5))
-                                .font_semibold()
-                                .text_color(solid(p.status_success))
-                                .child("LIVE"),
                         )
-                    })
-                    .when(active_share_count == 0 && peer_count > 0, |row| {
-                        row.child(
-                            div()
-                                .px_1p5()
-                                .py(px(1.))
-                                .rounded(px(3.))
-                                .bg(soft_tint(p.accent_primary, 0.16))
-                                .text_size(px(10.5))
-                                .font_semibold()
-                                .text_color(solid(p.accent_primary))
-                                .child(format!("{peer_count}")),
+                        .child(
+                            Icon::new(LucideIcon::Send)
+                                .xsmall()
+                                .text_color(if active_share_count > 0 || peer_count > 0 {
+                                    solid(p.accent_primary)
+                                } else {
+                                    solid(p.text_secondary)
+                                }),
                         )
-                    }),
-            )
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .truncate()
+                                .text_xs()
+                                .text_color(solid(p.text_secondary))
+                                .child("P2P Transfer"),
+                        )
+                        .when(active_share_count > 0, |row| {
+                            row.child(
+                                div()
+                                    .px_1p5()
+                                    .py(px(1.))
+                                    .rounded(px(3.))
+                                    .bg(soft_tint(p.status_success, 0.16))
+                                    .text_size(px(10.5))
+                                    .font_semibold()
+                                    .text_color(solid(p.status_success))
+                                    .child("LIVE"),
+                            )
+                        })
+                        .when(active_share_count == 0 && peer_count > 0, |row| {
+                            row.child(
+                                div()
+                                    .px_1p5()
+                                    .py(px(1.))
+                                    .rounded(px(3.))
+                                    .bg(soft_tint(p.accent_primary, 0.16))
+                                    .text_size(px(10.5))
+                                    .font_semibold()
+                                    .text_color(solid(p.accent_primary))
+                                    .child(format!("{peer_count}")),
+                            )
+                        }),
+                )
+            })
             // Nearby LAN peers discovered automatically on the same network
             .children(
                 ws.p2p_nearby_peers
