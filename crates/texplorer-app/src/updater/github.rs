@@ -11,6 +11,7 @@ use tokio::io::AsyncWriteExt;
 pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const REPO_URL: &str = "https://github.com/Textic/TExplorer";
 const LATEST_RELEASE_API_URL: &str = "https://api.github.com/repos/Textic/TExplorer/releases/latest";
+const LATEST_RELEASE_WEB_URL: &str = "https://github.com/Textic/TExplorer/releases/latest";
 const SHA256SUMS_ASSET: &str = "SHA256SUMS.txt";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -653,6 +654,143 @@ pub fn is_newer_version(current: &str, latest: &str) -> bool {
     }
 }
 
+/// Extracts the release tag name from a redirected GitHub release URL such as
+/// `https://github.com/Textic/TExplorer/releases/tag/v0.6.1`.
+pub fn extract_tag_from_release_url(url: &str) -> Option<String> {
+    let (_, after_tag) = url.split_once("/releases/tag/")?;
+    let tag = after_tag
+        .split(['?', '#', '/'])
+        .next()
+        .unwrap_or("")
+        .trim();
+    if tag.is_empty() {
+        None
+    } else {
+        Some(tag.to_string())
+    }
+}
+
+/// Parses `(asset_name, download_url)` pairs from a release `SHA256SUMS.txt` file
+/// for the given `tag_name`, avoiding the rate-limited GitHub REST API.
+pub fn parse_assets_from_sha256sums(sums_text: &str, tag_name: &str) -> Vec<(String, String)> {
+    let mut pairs = Vec::new();
+    for line in sums_text.lines() {
+        let mut parts = line.split_whitespace();
+        let Some(hash) = parts.next() else {
+            continue;
+        };
+        let Some(raw_name) = parts.next() else {
+            continue;
+        };
+        if hash.len() != 64 || !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
+            continue;
+        }
+        let cleaned = raw_name.trim_start_matches('*').trim_start_matches("./");
+        let basename = cleaned.rsplit(['/', '\\']).next().unwrap_or(cleaned).trim();
+        if basename.is_empty() {
+            continue;
+        }
+        let url = format!("{REPO_URL}/releases/download/{tag_name}/{basename}");
+        pairs.push((basename.to_string(), url));
+    }
+    pairs
+}
+
+fn build_update_info(
+    tag_name: String,
+    release_url: String,
+    published_at: String,
+    pairs: &[(String, String)],
+    checksum_url: Option<String>,
+) -> UpdateInfo {
+    let version = tag_name
+        .trim()
+        .trim_start_matches(['v', 'V'])
+        .to_string();
+    let preferred_kind = detect_install_kind();
+    let (asset_name, download_url, install_kind) =
+        match pick_asset_for_install(pairs, preferred_kind, std::env::consts::OS) {
+            Some((name, url, kind)) => (name.to_string(), url.to_string(), kind),
+            None => (
+                String::new(),
+                release_url.clone(),
+                InstallTargetKind::ManualBrowserFallback,
+            ),
+        };
+
+    UpdateInfo {
+        version,
+        tag_name,
+        release_url,
+        download_url,
+        asset_name,
+        checksum_url,
+        published_at,
+        install_kind,
+    }
+}
+
+/// Fallback update check using `github.com/.../releases/latest` HTTP redirect + `SHA256SUMS.txt`,
+/// which does not consume GitHub's 60 req/hr unauthenticated REST API quota (HTTP 403 on shared IPs/CGNAT).
+async fn check_for_updates_via_web_redirect(
+    client: &reqwest::Client,
+) -> Result<Option<UpdateInfo>, String> {
+    let resp = client
+        .get(LATEST_RELEASE_WEB_URL)
+        .header("Accept", "text/html,application/xhtml+xml")
+        .send()
+        .await
+        .map_err(|e| format!("Network error: {e}"))?;
+
+    if resp.status().as_u16() == 404 {
+        return Ok(None);
+    }
+    if !resp.status().is_success() {
+        return Err(format!(
+            "GitHub Releases returned HTTP {}",
+            resp.status().as_u16()
+        ));
+    }
+
+    let final_url = resp.url().as_str().to_string();
+    let Some(tag_name) = extract_tag_from_release_url(&final_url) else {
+        return Ok(None);
+    };
+
+    if !is_newer_version(CURRENT_VERSION, &tag_name) {
+        return Ok(None);
+    }
+
+    let release_url = format!("{REPO_URL}/releases/tag/{tag_name}");
+    let checksum_candidate = format!("{REPO_URL}/releases/download/{tag_name}/{SHA256SUMS_ASSET}");
+
+    let mut pairs: Vec<(String, String)> = Vec::new();
+    let mut checksum_url: Option<String> = None;
+
+    if let Ok(sum_resp) = client
+        .get(&checksum_candidate)
+        .timeout(Duration::from_secs(8))
+        .send()
+        .await
+        && sum_resp.status().is_success()
+        && let Ok(text) = sum_resp.text().await
+    {
+        pairs = parse_assets_from_sha256sums(&text, &tag_name);
+        if !pairs.is_empty() {
+            checksum_url = Some(checksum_candidate);
+        }
+    }
+
+    // If SHA256SUMS.txt wasn't present on that release, still allow opening Releases in browser.
+    Ok(Some(build_update_info(
+        tag_name,
+        release_url,
+        String::new(),
+        &pairs,
+        checksum_url,
+    )))
+}
+
 pub async fn check_for_updates() -> Result<Option<UpdateInfo>, String> {
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(8))
@@ -663,19 +801,31 @@ pub async fn check_for_updates() -> Result<Option<UpdateInfo>, String> {
     let resp = client
         .get(LATEST_RELEASE_API_URL)
         .header("Accept", "application/vnd.github+json")
+        .header("X-GitHub-Api-Version", "2022-11-28")
         .send()
         .await
         .map_err(|e| format!("Network error: {e}"))?;
 
-    if resp.status().as_u16() == 404 {
+    let status = resp.status().as_u16();
+    if status == 404 {
         return Ok(None);
     }
 
+    // Unauthenticated GitHub REST API is limited to 60 requests/hour per IP (often exhausted on
+    // ISP CGNAT / shared Wi-Fi / VPNs -> HTTP 403/429). Seamlessly fall back to the non-API
+    // web release redirect which has no REST API rate limit.
+    if matches!(status, 403 | 429) || status >= 500 {
+        return check_for_updates_via_web_redirect(&client).await.map_err(|fallback_err| {
+            if status == 403 || status == 429 {
+                format!("GitHub rate limit reached (HTTP {status}); {fallback_err}")
+            } else {
+                format!("GitHub API returned HTTP {status}; {fallback_err}")
+            }
+        });
+    }
+
     if !resp.status().is_success() {
-        return Err(format!(
-            "GitHub API returned HTTP {}",
-            resp.status().as_u16()
-        ));
+        return Err(format!("GitHub API returned HTTP {status}"));
     }
 
     let rel: GithubRelease = resp
@@ -687,31 +837,15 @@ pub async fn check_for_updates() -> Result<Option<UpdateInfo>, String> {
         return Ok(None);
     }
 
-    let version = rel
-        .tag_name
-        .trim()
-        .trim_start_matches(['v', 'V'])
-        .to_string();
     let pairs: Vec<(String, String)> = rel
         .assets
         .iter()
         .map(|a| (a.name.clone(), a.browser_download_url.clone()))
         .collect();
-    let preferred_kind = detect_install_kind();
-    let (asset_name, download_url, install_kind) =
-        match pick_asset_for_install(&pairs, preferred_kind, std::env::consts::OS) {
-            Some((name, url, kind)) => (name.to_string(), url.to_string(), kind),
-            None => (
-                String::new(),
-                rel.html_url.clone(),
-                InstallTargetKind::ManualBrowserFallback,
-            ),
-        };
     let checksum_url = pairs
         .iter()
         .find(|(name, _)| name == SHA256SUMS_ASSET)
         .map(|(_, url)| url.clone());
-
     let published_at = rel
         .published_at
         .as_deref()
@@ -719,16 +853,13 @@ pub async fn check_for_updates() -> Result<Option<UpdateInfo>, String> {
         .unwrap_or("")
         .to_string();
 
-    Ok(Some(UpdateInfo {
-        version,
-        tag_name: rel.tag_name,
-        release_url: rel.html_url,
-        download_url,
-        asset_name,
-        checksum_url,
+    Ok(Some(build_update_info(
+        rel.tag_name,
+        rel.html_url,
         published_at,
-        install_kind,
-    }))
+        &pairs,
+        checksum_url,
+    )))
 }
 
 pub fn open_url_in_browser(url: &str) -> Result<(), String> {
@@ -798,6 +929,40 @@ mod tests {
         assert_eq!(
             parse_sha256_for_asset(sums, "texplorer-v0.1.1-windows-x86_64-setup.exe"),
             None
+        );
+    }
+
+    #[test]
+    fn extracts_tag_and_assets_for_web_redirect_fallback() {
+        assert_eq!(
+            extract_tag_from_release_url(
+                "https://github.com/Textic/TExplorer/releases/tag/v0.6.1"
+            ),
+            Some("v0.6.1".to_string())
+        );
+        assert_eq!(
+            extract_tag_from_release_url(
+                "https://github.com/Textic/TExplorer/releases/tag/v0.6.1?foo=bar"
+            ),
+            Some("v0.6.1".to_string())
+        );
+        assert_eq!(
+            extract_tag_from_release_url("https://github.com/Textic/TExplorer/releases"),
+            None
+        );
+
+        let sums = "\
+ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad  texplorer-v0.6.1-windows-x86_64-setup.exe
+e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855  texplorer-v0.6.1-windows-x86_64.exe
+";
+        let assets = parse_assets_from_sha256sums(sums, "v0.6.1");
+        assert_eq!(assets.len(), 2);
+        assert_eq!(
+            assets[0],
+            (
+                "texplorer-v0.6.1-windows-x86_64-setup.exe".to_string(),
+                "https://github.com/Textic/TExplorer/releases/download/v0.6.1/texplorer-v0.6.1-windows-x86_64-setup.exe".to_string()
+            )
         );
     }
 }
