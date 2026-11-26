@@ -1,0 +1,155 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-main
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_PROFILE_DEV_DEBUG: "0"
+
+jobs:
+  prepare:
+    name: Compute Release Version
+    runs-on: ubuntu-latest
+    outputs:
+      already_tagged: ${{ steps.ver.outputs.already_tagged }}
+      cargo_version: ${{ steps.ver.outputs.cargo_version }}
+      version: ${{ steps.ver.outputs.version }}
+      tag: ${{ steps.ver.outputs.tag }}
+    steps:
+      - name: Checkout repository with full tag history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Resolve next SemVer tag
+        id: ver
+        shell: pwsh
+        run: |
+          $cargoToml = Get-Content -Path "Cargo.toml" -Raw
+          if ($cargoToml -notmatch '(?m)^version\s*=\s*"(\d+)\.(\d+)\.(\d+)"') {
+            throw "Could not parse workspace version from Cargo.toml"
+          }
+          $major = [int]$Matches[1]
+          $minor = [int]$Matches[2]
+          $basePatch = [int]$Matches[3]
+          $cargoVersion = "$major.$minor.$basePatch"
+
+          $headTags = @(git tag --points-at HEAD "v*" | Where-Object { $_ -ne "" })
+          if ($headTags.Count -gt 0 -and "${{ github.event_name }}" -eq "push") {
+            Write-Output "already_tagged=true" >> $env:GITHUB_OUTPUT
+            Write-Output "cargo_version=$cargoVersion" >> $env:GITHUB_OUTPUT
+            Write-Output "version=$cargoVersion" >> $env:GITHUB_OUTPUT
+            Write-Output "tag=$($headTags[0])" >> $env:GITHUB_OUTPUT
+            exit 0
+          }
+
+          $prefix = "v$major.$minor."
+          $existingTags = @(git tag --list "${prefix}*" | Where-Object { $_ -ne "" })
+          if ($existingTags.Count -eq 0) {
+            $nextPatch = $basePatch
+          } else {
+            $maxPatch = -1
+            foreach ($t in $existingTags) {
+              if ($t -match "^v$major\.$minor\.(\d+)$") {
+                $p = [int]$Matches[1]
+                if ($p -gt $maxPatch) { $maxPatch = $p }
+              }
+            }
+            $nextPatch = [Math]::Max($basePatch, $maxPatch + 1)
+          }
+
+          $nextVersion = "$major.$minor.$nextPatch"
+          $nextTag = "v$nextVersion"
+
+          Write-Host "Resolved release version: $nextVersion (tag: $nextTag)"
+          Write-Output "already_tagged=false" >> $env:GITHUB_OUTPUT
+          Write-Output "cargo_version=$cargoVersion" >> $env:GITHUB_OUTPUT
+          Write-Output "version=$nextVersion" >> $env:GITHUB_OUTPUT
+          Write-Output "tag=$nextTag" >> $env:GITHUB_OUTPUT
+
+  build:
+    name: Build (windows-x86_64)
+    needs: prepare
+    if: needs.prepare.outputs.already_tagged != 'true'
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Restore Cargo cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: release-windows-x86_64
+
+      - name: Sync build version in runner Cargo.toml
+        if: needs.prepare.outputs.version != needs.prepare.outputs.cargo_version
+        shell: pwsh
+        run: |
+          $raw = Get-Content -Path "Cargo.toml" -Raw
+          $updated = $raw -replace '(?m)^(version\s*=\s*")\d+\.\d+\.\d+(")', "`${1}${{ needs.prepare.outputs.version }}`${2}"
+          Set-Content -Path "Cargo.toml" -Value $updated -NoNewline
+
+      - name: Test, build & package Windows release assets
+        shell: pwsh
+        run: |
+          cargo test --workspace --target x86_64-pc-windows-msvc
+          cargo build --release -p texplorer-app --target x86_64-pc-windows-msvc
+          & .\packaging\windows\build-setup.ps1 `
+            -BinaryPath "target\x86_64-pc-windows-msvc\release\texplorer.exe" `
+            -Version "${{ needs.prepare.outputs.version }}" `
+            -Tag "${{ needs.prepare.outputs.tag }}" `
+            -OutDir "dist"
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-assets-windows-x86_64
+          path: dist/*
+
+  publish:
+    name: Publish GitHub Release
+    needs: [prepare, build]
+    if: needs.prepare.outputs.already_tagged != 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download release artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: release-assets-*
+          merge-multiple: true
+
+      - name: Generate SHA-256 checksums
+        run: |
+          cd dist
+          sha256sum * > SHA256SUMS.txt
+
+      - name: Create tag and GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ needs.prepare.outputs.tag }}"
+          gh release create "$TAG" \
+            --target "${{ github.sha }}" \
+            --title "TExplorer $TAG" \
+            --generate-notes \
+            dist/*
