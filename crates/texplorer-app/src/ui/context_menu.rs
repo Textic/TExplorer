@@ -6,9 +6,12 @@ use gpui_kit::{
     component::{Icon, IconName, Sizable as _, h_flex, v_flex},
     div, prelude::*, px,
 };
-use texplorer_core::{FileEntry, KnownFolder, KnownFolderKind, Location, PaneSide, VolumeInfo};
+use texplorer_core::{
+    FileEntry, KnownFolder, KnownFolderKind, Location, PaneSide, SidebarSection, VolumeInfo,
+};
 
 use crate::theme::{RADIUS_CONTROL, RADIUS_ROW, soft_tint, solid};
+use crate::ui::modals::SettingsCategory;
 use crate::ui::workspace::Workspace;
 
 #[derive(Debug, Clone)]
@@ -23,6 +26,8 @@ pub enum ContextMenuTarget {
     },
     KnownFolder(KnownFolder),
     Volume(VolumeInfo),
+    SidebarSection(SidebarSection),
+    SidebarBackground,
 }
 
 #[derive(Debug, Clone)]
@@ -77,6 +82,9 @@ enum MenuAction {
     PermanentDeleteSelected(PaneSide),
     RefreshPane(PaneSide),
     HideQuickAccess(KnownFolderKind),
+    ToggleSidebarSectionCollapsed(SidebarSection),
+    HideSidebarSection(SidebarSection),
+    OpenSidebarSettings,
 }
 
 /// Renders the flat floating context menu clamped cleanly inside the viewport.
@@ -638,6 +646,14 @@ fn build_rows(ws: &Workspace, target: &ContextMenuTarget) -> Vec<MenuRow> {
                     danger: true,
                     action: MenuAction::HideQuickAccess(folder.kind),
                 },
+                MenuRow::Item {
+                    id: "ctx-qa-customize",
+                    label: "Customize Sidebar...".into(),
+                    shortcut: None,
+                    icon: MenuIcon::Lucide(LucideIcon::Settings),
+                    danger: false,
+                    action: MenuAction::OpenSidebarSettings,
+                },
             ]);
             rows
         }
@@ -687,9 +703,64 @@ fn build_rows(ws: &Workspace, target: &ContextMenuTarget) -> Vec<MenuRow> {
                     danger: false,
                     action: MenuAction::ShowProperties(vol.root_path.clone()),
                 },
+                MenuRow::Separator,
+                MenuRow::Item {
+                    id: "ctx-vol-customize",
+                    label: "Customize Sidebar...".into(),
+                    shortcut: None,
+                    icon: MenuIcon::Lucide(LucideIcon::Settings),
+                    danger: false,
+                    action: MenuAction::OpenSidebarSettings,
+                },
             ]);
             rows
         }
+        ContextMenuTarget::SidebarSection(section) => {
+            let collapsed = ws.settings.is_sidebar_section_collapsed(*section);
+            vec![
+                MenuRow::Item {
+                    id: "ctx-sb-toggle-collapse",
+                    label: if collapsed {
+                        format!("Expand {}", section.label()).into()
+                    } else {
+                        format!("Collapse {}", section.label()).into()
+                    },
+                    shortcut: None,
+                    icon: MenuIcon::Lucide(if collapsed {
+                        LucideIcon::ChevronDown
+                    } else {
+                        LucideIcon::ChevronRight
+                    }),
+                    danger: false,
+                    action: MenuAction::ToggleSidebarSectionCollapsed(*section),
+                },
+                MenuRow::Item {
+                    id: "ctx-sb-hide-sec",
+                    label: format!("Hide {}", section.label()).into(),
+                    shortcut: None,
+                    icon: MenuIcon::Lucide(LucideIcon::EyeOff),
+                    danger: false,
+                    action: MenuAction::HideSidebarSection(*section),
+                },
+                MenuRow::Separator,
+                MenuRow::Item {
+                    id: "ctx-sb-customize",
+                    label: "Customize Sidebar...".into(),
+                    shortcut: None,
+                    icon: MenuIcon::Lucide(LucideIcon::Settings),
+                    danger: false,
+                    action: MenuAction::OpenSidebarSettings,
+                },
+            ]
+        }
+        ContextMenuTarget::SidebarBackground => vec![MenuRow::Item {
+            id: "ctx-sb-bg-customize",
+            label: "Customize Sidebar...".into(),
+            shortcut: None,
+            icon: MenuIcon::Lucide(LucideIcon::Settings),
+            danger: false,
+            action: MenuAction::OpenSidebarSettings,
+        }],
     }
 }
 
@@ -737,5 +808,12 @@ fn execute_action(
         MenuAction::PermanentDeleteSelected(side) => ws.prompt_permanent_delete(side, cx),
         MenuAction::RefreshPane(side) => ws.refresh_pane(side, window, cx),
         MenuAction::HideQuickAccess(kind) => ws.hide_quick_access(kind, cx),
+        MenuAction::ToggleSidebarSectionCollapsed(sec) => {
+            ws.toggle_sidebar_section_collapsed(sec, cx);
+        }
+        MenuAction::HideSidebarSection(sec) => ws.toggle_sidebar_section_visible(sec, cx),
+        MenuAction::OpenSidebarSettings => {
+            ws.open_settings_category(SettingsCategory::Interface, window, cx);
+        }
     }
 }

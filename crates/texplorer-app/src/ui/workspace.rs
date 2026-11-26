@@ -179,6 +179,7 @@ enum BgEvent {
         result: Result<Option<String>, String>,
         refresh_side: Option<PaneSide>,
     },
+    DismissToast(u64),
     FolderSizesReady {
         tab_id: Uuid,
         side: PaneSide,
@@ -707,6 +708,12 @@ impl Workspace {
                         self.restore_default_file_manager(cx);
                     }
                     LaunchIntent::RunWinEDaemon | LaunchIntent::StopWinEDaemon => {}
+                }
+            }
+            BgEvent::DismissToast(id) => {
+                if self.toast.as_ref().is_some_and(|t| t.id == id) {
+                    self.toast = None;
+                    cx.notify();
                 }
             }
             BgEvent::UpdateCheckFinished { manual, result } => {
@@ -3754,15 +3761,15 @@ impl Workspace {
         cx.notify();
     }
 
-    pub fn move_quick_access(
+    pub fn reorder_quick_access(
         &mut self,
-        kind: KnownFolderKind,
-        delta: isize,
+        from: KnownFolderKind,
+        to: KnownFolderKind,
         cx: &mut Context<Self>,
     ) {
         if self
             .settings
-            .move_quick_access(kind, delta, &self.known_folders)
+            .reorder_quick_access(from, to, &self.known_folders)
         {
             let _ = self.settings.save();
             cx.notify();
@@ -3795,13 +3802,13 @@ impl Workspace {
         cx.notify();
     }
 
-    pub fn move_sidebar_section(
+    pub fn reorder_sidebar_section(
         &mut self,
-        section: SidebarSection,
-        delta: isize,
+        from: SidebarSection,
+        to: SidebarSection,
         cx: &mut Context<Self>,
     ) {
-        if self.settings.move_sidebar_section(section, delta) {
+        if self.settings.reorder_sidebar_section(from, to) {
             let _ = self.settings.save();
             cx.notify();
         }
@@ -3883,6 +3890,11 @@ impl Workspace {
             message: message.into(),
             kind,
             id,
+        });
+        let bg_tx = self.bg_tx.clone();
+        tokio_runtime().spawn(async move {
+            tokio::time::sleep(Duration::from_millis(3200)).await;
+            let _ = bg_tx.unbounded_send(BgEvent::DismissToast(id));
         });
         cx.notify();
     }
@@ -4603,9 +4615,14 @@ impl Render for Workspace {
                         .gap_2()
                         .items_center()
                         .rounded(px(RADIUS_ROW))
+                        .cursor_pointer()
                         .bg(solid(p.bg_elevated))
                         .border_1()
                         .border_color(solid(p.border))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.toast = None;
+                            cx.notify();
+                        }))
                         .child(
                             div()
                                 .w(px(6.))

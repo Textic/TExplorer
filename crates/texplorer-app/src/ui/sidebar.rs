@@ -1,5 +1,5 @@
 use gpui_kit::{
-    AnyElement, Context, MouseButton, MouseDownEvent, SharedString,
+    AnyElement, Context, MouseButton, MouseDownEvent, Render, SharedString, Window,
     assets::IconName as LucideIcon,
     component::{
         Icon, IconName, Sizable as _, Size, StyledExt as _,
@@ -10,16 +10,55 @@ use gpui_kit::{
     },
     div, prelude::*, px, relative,
 };
-use texplorer_core::{Location, SidebarSection};
+use texplorer_core::{KnownFolderKind, Location, SidebarSection};
 
 use crate::theme::{
-    Palette, RADIUS_CONTROL, drive_kind_icon, known_folder_icon, solid, usage_bar_color,
+    Palette, RADIUS_CONTROL, RADIUS_ROW, drive_kind_icon, known_folder_icon, soft_tint, solid,
+    usage_bar_color,
 };
 use crate::ui::context_menu::ContextMenuTarget;
 use crate::ui::workspace::Workspace;
 
+/// Drag payload for reordering sidebar categories (in both the sidebar and Settings).
+#[derive(Clone)]
+pub struct DraggedSidebarSection {
+    pub section: SidebarSection,
+    pub label: SharedString,
+}
+
+/// Drag payload for reordering Quick Access folders (in both the sidebar and Settings).
+#[derive(Clone)]
+pub struct DraggedQuickAccessItem {
+    pub kind: KnownFolderKind,
+    pub label: SharedString,
+}
+
+/// Lightweight flat ghost pill rendered under the cursor while dragging sidebar items/categories.
+pub struct SidebarDragGhost {
+    pub label: SharedString,
+    pub palette: Palette,
+}
+
+impl Render for SidebarDragGhost {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        h_flex()
+            .px_2p5()
+            .py_1()
+            .gap_1p5()
+            .items_center()
+            .rounded(px(RADIUS_ROW))
+            .bg(solid(self.palette.bg_elevated))
+            .border_1()
+            .border_color(solid(self.palette.accent_primary))
+            .text_xs()
+            .font_medium()
+            .text_color(solid(self.palette.text_primary))
+            .child(self.label.clone())
+    }
+}
+
 /// Renders the flat left navigation rail containing Home and customizable, collapsible,
-/// reorderable sections (Quick Access, Pinned folders, Drives, and Linux/WSL).
+/// drag-reorderable sections (Quick Access, Pinned folders, Drives, and Linux/WSL).
 pub fn render_sidebar(ws: &Workspace, cx: &mut Context<Workspace>) -> impl IntoElement {
     let p = ws.palette();
     let current_loc = ws
@@ -62,11 +101,14 @@ pub fn render_sidebar(ws: &Workspace, cx: &mut Context<Workspace>) -> impl IntoE
                     if ws.settings.pinned_folders.is_empty() {
                         return None;
                     }
-                    Some(render_pinned_section(ws, &current_loc, collapsed, p, cx).into_any_element())
+                    Some(
+                        render_pinned_section(ws, &current_loc, collapsed, p, cx)
+                            .into_any_element(),
+                    )
                 }
-                SidebarSection::Drives => {
-                    Some(render_drives_section(ws, &current_loc, collapsed, p, cx).into_any_element())
-                }
+                SidebarSection::Drives => Some(
+                    render_drives_section(ws, &current_loc, collapsed, p, cx).into_any_element(),
+                ),
                 SidebarSection::LinuxWsl => {
                     if ws.wsl_distros.is_empty() {
                         return None;
@@ -82,6 +124,14 @@ pub fn render_sidebar(ws: &Workspace, cx: &mut Context<Workspace>) -> impl IntoE
         .size_full()
         .bg(solid(p.bg_surface))
         .overflow_hidden()
+        .on_mouse_down(
+            MouseButton::Right,
+            cx.listener(|this, ev: &MouseDownEvent, window, cx| {
+                if !window.default_prevented() {
+                    this.open_context_menu(ev.position, ContextMenuTarget::SidebarBackground, cx);
+                }
+            }),
+        )
         .child(
             v_flex()
                 .flex_1()
@@ -156,11 +206,16 @@ fn render_quick_access_section(
             el.children(visible_quick_access.iter().enumerate().map(|(i, folder)| {
                 let target = Location::local(&folder.path);
                 let active = *current_loc == target;
+                let kind = folder.kind;
                 let path_click = folder.path.clone();
                 let path_mid = folder.path.clone();
                 let folder_ctx = folder.clone();
-                let icon = known_folder_icon(folder.kind);
+                let icon = known_folder_icon(kind);
                 let label: SharedString = folder.name.clone().into();
+                let drag_payload = DraggedQuickAccessItem {
+                    kind,
+                    label: label.clone(),
+                };
 
                 h_flex()
                     .id(("sb-known", i))
@@ -177,6 +232,28 @@ fn render_quick_access_section(
                         gpui_kit::transparent_black()
                     })
                     .hover(move |s| s.bg(solid(p.bg_elevated)))
+                    .on_drag(drag_payload, move |drag, _, _, cx| {
+                        cx.new(|_| SidebarDragGhost {
+                            label: drag.label.clone(),
+                            palette: p,
+                        })
+                    })
+                    .drag_over::<DraggedQuickAccessItem>(move |style, drag, _, _| {
+                        if drag.kind != kind {
+                            style
+                                .bg(soft_tint(p.accent_primary, 0.16))
+                                .border_t_2()
+                                .border_color(solid(p.accent_primary))
+                        } else {
+                            style
+                        }
+                    })
+                    .on_drop(cx.listener(
+                        move |this, drag: &DraggedQuickAccessItem, _window, cx| {
+                            cx.stop_propagation();
+                            this.reorder_quick_access(drag.kind, kind, cx);
+                        },
+                    ))
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(move |this, _: &MouseDownEvent, window, cx| {
@@ -196,7 +273,8 @@ fn render_quick_access_section(
                     )
                     .on_mouse_down(
                         MouseButton::Right,
-                        cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
+                        cx.listener(move |this, ev: &MouseDownEvent, window, cx| {
+                            window.prevent_default();
                             this.open_context_menu(
                                 ev.position,
                                 ContextMenuTarget::KnownFolder(folder_ctx.clone()),
@@ -418,7 +496,8 @@ fn render_drives_section(
                     )
                     .on_mouse_down(
                         MouseButton::Right,
-                        cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
+                        cx.listener(move |this, ev: &MouseDownEvent, window, cx| {
+                            window.prevent_default();
                             this.open_context_menu(
                                 ev.position,
                                 ContextMenuTarget::Volume(vol_ctx.clone()),
@@ -571,6 +650,10 @@ fn collapsible_section_header(
     } else {
         LucideIcon::ChevronDown
     };
+    let drag_payload = DraggedSidebarSection {
+        section,
+        label: section.label().into(),
+    };
 
     h_flex()
         .w_full()
@@ -590,9 +673,42 @@ fn collapsible_section_header(
                 .cursor_pointer()
                 .text_color(solid(p.text_muted))
                 .hover(move |s| s.bg(solid(p.bg_elevated)).text_color(solid(p.text_primary)))
+                .on_drag(drag_payload, move |drag, _, _, cx| {
+                    cx.new(|_| SidebarDragGhost {
+                        label: drag.label.clone(),
+                        palette: p,
+                    })
+                })
+                .drag_over::<DraggedSidebarSection>(move |style, drag, _, _| {
+                    if drag.section != section {
+                        style
+                            .bg(soft_tint(p.accent_primary, 0.16))
+                            .border_t_2()
+                            .border_color(solid(p.accent_primary))
+                    } else {
+                        style
+                    }
+                })
+                .on_drop(cx.listener(
+                    move |this, drag: &DraggedSidebarSection, _window, cx| {
+                        cx.stop_propagation();
+                        this.reorder_sidebar_section(drag.section, section, cx);
+                    },
+                ))
                 .on_click(cx.listener(move |this, _, _, cx| {
                     this.toggle_sidebar_section_collapsed(section, cx);
                 }))
+                .on_mouse_down(
+                    MouseButton::Right,
+                    cx.listener(move |this, ev: &MouseDownEvent, window, cx| {
+                        window.prevent_default();
+                        this.open_context_menu(
+                            ev.position,
+                            ContextMenuTarget::SidebarSection(section),
+                            cx,
+                        );
+                    }),
+                )
                 .child(Icon::new(chevron).xsmall())
                 .child(
                     div()
