@@ -1,6 +1,9 @@
 use std::path::{Component, Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
+
+use crate::network::{NetworkProtocol, normalize_remote_path, normalize_smb_share_path};
 
 /// Scope for virtual search queries.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -25,6 +28,14 @@ pub enum Location {
         archive_path: PathBuf,
         /// Forward-slash normalized inner path without leading slash.
         inner_path: String,
+    },
+    /// Remote directory or file hosted on an SFTP / FTP / FTPS server.
+    Remote {
+        connection_id: Uuid,
+        label: String,
+        protocol: NetworkProtocol,
+        /// Forward-slash normalized POSIX path starting with `/`.
+        remote_path: String,
     },
     /// Virtual search results view.
     Search {
@@ -54,6 +65,34 @@ impl Location {
         }
     }
 
+    /// Constructs a normalized remote server location (`SFTP`, `FTP`, or `FTPS`).
+    pub fn remote(
+        connection_id: Uuid,
+        label: impl Into<String>,
+        protocol: NetworkProtocol,
+        remote_path: impl AsRef<str>,
+    ) -> Self {
+        Self::Remote {
+            connection_id,
+            label: label.into(),
+            protocol,
+            remote_path: normalize_remote_path(remote_path.as_ref()),
+        }
+    }
+
+    /// Returns `(connection_id, protocol, remote_path)` when this location is a remote server path.
+    pub fn as_remote(&self) -> Option<(Uuid, NetworkProtocol, &str)> {
+        match self {
+            Self::Remote {
+                connection_id,
+                protocol,
+                remote_path,
+                ..
+            } => Some((*connection_id, *protocol, remote_path.as_str())),
+            _ => None,
+        }
+    }
+
     /// Returns the underlying local path when this location points directly to disk.
     pub fn as_local_path(&self) -> Option<&Path> {
         match self {
@@ -77,6 +116,12 @@ impl Location {
                     format!("{}\\{}", archive_path.display(), inner_path.replace('/', "\\"))
                 }
             }
+            Self::Remote {
+                label,
+                protocol,
+                remote_path,
+                ..
+            } => format!("{}://{}{}", protocol.scheme(), label, remote_path),
             Self::Search { query, scope } => match scope {
                 SearchScope::Global => format!("search://{query}"),
                 SearchScope::Folder(dir) => format!("search://{}?in={}", query, dir.display()),
@@ -117,6 +162,17 @@ impl Location {
                     .unwrap_or("Archive")
                     .to_string()
             }
+            Self::Remote {
+                label, remote_path, ..
+            } => {
+                let trimmed = remote_path.trim_end_matches('/');
+                if let Some(last) = trimmed.rsplit('/').next()
+                    && !last.is_empty()
+                {
+                    return last.to_string();
+                }
+                label.clone()
+            }
             Self::Search { query, .. } => {
                 if query.trim().is_empty() {
                     "Search".to_string()
@@ -153,6 +209,23 @@ impl Location {
                     Some(Self::archive(archive_path.clone(), head))
                 } else {
                     Some(Self::archive(archive_path.clone(), ""))
+                }
+            }
+            Self::Remote {
+                connection_id,
+                label,
+                protocol,
+                remote_path,
+            } => {
+                let clean = normalize_remote_path(remote_path);
+                if clean == "/" {
+                    Some(Self::Home)
+                } else {
+                    let parent = match clean.rsplit_once('/') {
+                        Some(("", _)) | None => "/",
+                        Some((head, _)) => head,
+                    };
+                    Some(Self::remote(*connection_id, label.clone(), *protocol, parent))
                 }
             }
             Self::Search { scope, .. } => match scope {
@@ -229,6 +302,26 @@ impl Location {
                     });
                 }
             }
+            Self::Remote {
+                connection_id,
+                label,
+                protocol,
+                remote_path,
+            } => {
+                out.push(BreadcrumbSegment {
+                    label: label.clone(),
+                    target: Self::remote(*connection_id, label.clone(), *protocol, "/"),
+                });
+                let mut acc = String::new();
+                for part in remote_path.split('/').filter(|s| !s.is_empty()) {
+                    acc.push('/');
+                    acc.push_str(part);
+                    out.push(BreadcrumbSegment {
+                        label: part.to_string(),
+                        target: Self::remote(*connection_id, label.clone(), *protocol, &acc),
+                    });
+                }
+            }
             Self::Search { query, .. } => {
                 out.push(BreadcrumbSegment {
                     label: format!("Search: {query}"),
@@ -250,6 +343,11 @@ impl Location {
         }
         if trimmed.eq_ignore_ascii_case("home") || trimmed.eq_ignore_ascii_case("this pc") {
             return Some(Self::Home);
+        }
+        if (trimmed.starts_with("smb://") || trimmed.starts_with("SMB://"))
+            && let Some(unc) = normalize_smb_share_path(trimmed)
+        {
+            return Some(Self::local(unc));
         }
 
         let expanded = expand_path_shortcuts(trimmed);

@@ -2,7 +2,8 @@ use std::ops::Range;
 use std::path::PathBuf;
 
 use gpui_kit::{
-    Context, ExternalPaths, MouseButton, MouseDownEvent, ObjectFit, Render, SharedString, Window,
+    Context, ExternalPaths, MouseButton, MouseDownEvent, ObjectFit, Pixels, Point, Render,
+    SharedString, Window,
     assets::IconName as LucideIcon,
     component::{
         Icon, Sizable as _, Size, StyledExt as _, h_flex, scroll::ScrollableElement as _, v_flex,
@@ -19,6 +20,125 @@ use crate::ui::context_menu::ContextMenuTarget;
 use crate::ui::workspace::{ColumnDivider, Workspace, is_valid_internal_drop_target};
 
 const LIST_MARQUEE_GUTTER_PX: f32 = 44.0;
+const DETAILS_MIN_NAME_PX: f32 = 160.0;
+const DETAILS_MIN_MODIFIED_PX: f32 = 118.0;
+const DETAILS_MIN_TYPE_PX: f32 = 84.0;
+const DETAILS_MIN_SIZE_PX: f32 = 72.0;
+const DETAILS_ROW_CHROME_PX: f32 = 28.0;
+
+/// Responsive column visibility and pixel widths for Details view so `Name` never collides with
+/// `Date Modified`, `Type`, or `Size` in narrow split panes or when the Inspector/Sidebar is open.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DetailsColumnLayout {
+    pub show_modified: bool,
+    pub show_type: bool,
+    pub show_size: bool,
+    pub mod_w: f32,
+    pub type_w: f32,
+    pub size_w: f32,
+    pub gutter_w: f32,
+}
+
+pub fn compute_details_column_layout(
+    pane_width: f32,
+    pref_mod: f32,
+    pref_type: f32,
+    pref_size: f32,
+) -> DetailsColumnLayout {
+    let avail = (pane_width - DETAILS_ROW_CHROME_PX).max(100.0);
+    let full_need = DETAILS_MIN_NAME_PX + pref_mod + pref_type + pref_size + LIST_MARQUEE_GUTTER_PX;
+    if avail >= full_need {
+        return DetailsColumnLayout {
+            show_modified: true,
+            show_type: true,
+            show_size: true,
+            mod_w: pref_mod,
+            type_w: pref_type,
+            size_w: pref_size,
+            gutter_w: LIST_MARQUEE_GUTTER_PX,
+        };
+    }
+
+    // Step 1: Fit all 4 columns by reducing the right gutter and smoothly compressing right columns
+    // toward their readable minimums while preserving at least `DETAILS_MIN_NAME_PX` for Name.
+    let compact_gutter = 24.0;
+    let min_all_four = DETAILS_MIN_NAME_PX
+        + DETAILS_MIN_MODIFIED_PX
+        + DETAILS_MIN_TYPE_PX
+        + DETAILS_MIN_SIZE_PX
+        + compact_gutter;
+    if avail >= min_all_four {
+        let budget = (avail - DETAILS_MIN_NAME_PX - compact_gutter).max(0.0);
+        let min_sum = DETAILS_MIN_MODIFIED_PX + DETAILS_MIN_TYPE_PX + DETAILS_MIN_SIZE_PX;
+        let pref_sum = pref_mod + pref_type + pref_size;
+        let extra = (budget - min_sum).max(0.0);
+        let span = (pref_sum - min_sum).max(1.0);
+        let t = (extra / span).clamp(0.0, 1.0);
+        let mod_w = (DETAILS_MIN_MODIFIED_PX + (pref_mod - DETAILS_MIN_MODIFIED_PX) * t).floor();
+        let type_w = (DETAILS_MIN_TYPE_PX + (pref_type - DETAILS_MIN_TYPE_PX) * t).floor();
+        let size_w = (DETAILS_MIN_SIZE_PX + (pref_size - DETAILS_MIN_SIZE_PX) * t).floor();
+        return DetailsColumnLayout {
+            show_modified: true,
+            show_type: true,
+            show_size: true,
+            mod_w,
+            type_w,
+            size_w,
+            gutter_w: compact_gutter,
+        };
+    }
+
+    // Step 2: Hide `Type` first when a split pane + side panel leaves limited width.
+    let mod_size_gutter = 20.0;
+    let min_mod_size =
+        DETAILS_MIN_NAME_PX + DETAILS_MIN_MODIFIED_PX + DETAILS_MIN_SIZE_PX + mod_size_gutter;
+    if avail >= min_mod_size {
+        let budget = (avail - DETAILS_MIN_NAME_PX - mod_size_gutter).max(0.0);
+        let min_sum = DETAILS_MIN_MODIFIED_PX + DETAILS_MIN_SIZE_PX;
+        let pref_sum = pref_mod + pref_size;
+        let extra = (budget - min_sum).max(0.0);
+        let span = (pref_sum - min_sum).max(1.0);
+        let t = (extra / span).clamp(0.0, 1.0);
+        let mod_w = (DETAILS_MIN_MODIFIED_PX + (pref_mod - DETAILS_MIN_MODIFIED_PX) * t).floor();
+        let size_w = (DETAILS_MIN_SIZE_PX + (pref_size - DETAILS_MIN_SIZE_PX) * t).floor();
+        return DetailsColumnLayout {
+            show_modified: true,
+            show_type: false,
+            show_size: true,
+            mod_w,
+            type_w: 0.0,
+            size_w,
+            gutter_w: mod_size_gutter,
+        };
+    }
+
+    // Step 3: Hide `Date Modified`, keeping `Name` + `Size`.
+    let size_gutter = 16.0;
+    let min_size_only = DETAILS_MIN_NAME_PX + DETAILS_MIN_SIZE_PX + size_gutter;
+    if avail >= min_size_only {
+        let size_w = pref_size.min((avail - DETAILS_MIN_NAME_PX - size_gutter).max(DETAILS_MIN_SIZE_PX));
+        return DetailsColumnLayout {
+            show_modified: false,
+            show_type: false,
+            show_size: true,
+            mod_w: 0.0,
+            type_w: 0.0,
+            size_w: size_w.floor(),
+            gutter_w: size_gutter,
+        };
+    }
+
+    // Step 4: Ultra-narrow fallback — `Name` only.
+    DetailsColumnLayout {
+        show_modified: false,
+        show_type: false,
+        show_size: false,
+        mod_w: 0.0,
+        type_w: 0.0,
+        size_w: 0.0,
+        gutter_w: 12.0,
+    }
+}
 
 /// Drag payload for internal file/folder drag & drop (into folders or across Dual-Pane).
 #[derive(Clone)]
@@ -39,12 +159,19 @@ pub struct DraggedArchiveEntries {
 struct DragBadgeView {
     label: SharedString,
     palette: Palette,
+    cursor_offset: Point<Pixels>,
 }
 
 impl Render for DragBadgeView {
     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
         let p = self.palette;
+        // GPUI roots the drag view at `(mouse_position - cursor_offset)`, so shifting by
+        // `cursor_offset + (14, 12)` anchors the pill right next to the mouse cursor regardless
+        // of which column (Name, Date Modified, Type, or Size) initiated the drag.
         h_flex()
+            .relative()
+            .left(self.cursor_offset.x + px(14.))
+            .top(self.cursor_offset.y + px(12.))
             .px_2p5()
             .py_1()
             .gap_1p5()
@@ -400,13 +527,29 @@ pub fn render_details_view(
     let is_loading = model.loading;
     let error = model.error.clone();
     let (col_mod_w, col_type_w, col_size_w) = ws.details_column_widths();
+    let measured_w: f32 = pane_ui
+        .scroll_handle
+        .0
+        .borrow()
+        .base_handle
+        .bounds()
+        .size
+        .width
+        .into();
+    let pane_w = if measured_w > 60.0 {
+        measured_w
+    } else {
+        ws.estimated_pane_width(tab.model.split_enabled)
+    };
+    let layout = compute_details_column_layout(pane_w, col_mod_w, col_type_w, col_size_w);
     let active_divider = ws.column_resize.as_ref().map(|r| r.divider);
     let pane_dir = model.location.as_local_path().map(|path| path.to_path_buf());
     let list_id = match side {
         PaneSide::Left => "details-list-left",
         PaneSide::Right => "details-list-right",
     };
-
+    let native_drop_active = ws.native_drop_hover_side == Some(side)
+        && matches!(model.location, Location::Local(_) | Location::Remote { .. });
     let pane_dir_drag = pane_dir.clone();
     let pane_dir_has_local = pane_dir.is_some();
     let pane_dir_int = pane_dir.clone();
@@ -417,6 +560,9 @@ pub fn render_details_view(
         .size_full()
         .bg(solid(p.bg_base))
         .overflow_hidden()
+        .when(native_drop_active, |el| {
+            el.border_1().border_color(solid(p.accent_primary))
+        })
         .drag_over::<DraggedEntries>(move |style, drag, _, _| {
             if pane_dir_drag
                 .as_ref()
@@ -444,6 +590,8 @@ pub fn render_details_view(
         .on_drop(cx.listener(move |this, drag: &DraggedEntries, window, cx| {
             if let Some(ref dest) = pane_dir_int {
                 this.handle_dropped_paths(drag.paths.clone(), dest.clone(), false, window, cx);
+            } else {
+                this.handle_dropped_paths_into_pane(side, drag.paths.clone(), window, cx);
             }
         }))
         .on_drop(cx.listener(move |this, drag: &DraggedArchiveEntries, window, cx| {
@@ -460,6 +608,8 @@ pub fn render_details_view(
         .on_drop(cx.listener(move |this, ext: &ExternalPaths, window, cx| {
             if let Some(ref dest) = pane_dir_ext {
                 this.handle_dropped_paths(ext.paths().to_vec(), dest.clone(), true, window, cx);
+            } else {
+                this.handle_dropped_paths_into_pane(side, ext.paths().to_vec(), window, cx);
             }
         }))
         .on_mouse_down(
@@ -475,7 +625,7 @@ pub fn render_details_view(
                 .w_full()
                 .h(px(34.))
                 .pl(px(6.))
-                .pr(px(LIST_MARQUEE_GUTTER_PX))
+                .pr(px(layout.gutter_w))
                 .flex_shrink_0()
                 .bg(solid(p.bg_elevated))
                 .border_b_1()
@@ -486,6 +636,7 @@ pub fn render_details_view(
                         .h_full()
                         .px_2p5()
                         .items_center()
+                        .overflow_hidden()
                         .child(sort_header_cell(
                             side,
                             "Name",
@@ -496,60 +647,66 @@ pub fn render_details_view(
                             p,
                             cx,
                         ))
-                        .child(resizable_header_column(
-                            side,
-                            ColumnDivider::NameModified,
-                            active_divider == Some(ColumnDivider::NameModified),
-                            col_mod_w,
-                            sort_header_cell(
+                        .when(layout.show_modified, |el| {
+                            el.child(resizable_header_column(
                                 side,
-                                "Date Modified",
-                                SortColumn::Modified,
-                                sort,
-                                None,
-                                false,
+                                ColumnDivider::NameModified,
+                                active_divider == Some(ColumnDivider::NameModified),
+                                layout.mod_w,
+                                sort_header_cell(
+                                    side,
+                                    "Date Modified",
+                                    SortColumn::Modified,
+                                    sort,
+                                    None,
+                                    false,
+                                    p,
+                                    cx,
+                                ),
                                 p,
                                 cx,
-                            ),
-                            p,
-                            cx,
-                        ))
-                        .child(resizable_header_column(
-                            side,
-                            ColumnDivider::ModifiedType,
-                            active_divider == Some(ColumnDivider::ModifiedType),
-                            col_type_w,
-                            sort_header_cell(
+                            ))
+                        })
+                        .when(layout.show_type, |el| {
+                            el.child(resizable_header_column(
                                 side,
-                                "Type",
-                                SortColumn::Type,
-                                sort,
-                                None,
-                                false,
+                                ColumnDivider::ModifiedType,
+                                active_divider == Some(ColumnDivider::ModifiedType),
+                                layout.type_w,
+                                sort_header_cell(
+                                    side,
+                                    "Type",
+                                    SortColumn::Type,
+                                    sort,
+                                    None,
+                                    false,
+                                    p,
+                                    cx,
+                                ),
                                 p,
                                 cx,
-                            ),
-                            p,
-                            cx,
-                        ))
-                        .child(resizable_header_column(
-                            side,
-                            ColumnDivider::TypeSize,
-                            active_divider == Some(ColumnDivider::TypeSize),
-                            col_size_w,
-                            sort_header_cell(
+                            ))
+                        })
+                        .when(layout.show_size, |el| {
+                            el.child(resizable_header_column(
                                 side,
-                                "Size",
-                                SortColumn::Size,
-                                sort,
-                                None,
-                                true,
+                                ColumnDivider::TypeSize,
+                                active_divider == Some(ColumnDivider::TypeSize),
+                                layout.size_w,
+                                sort_header_cell(
+                                    side,
+                                    "Size",
+                                    SortColumn::Size,
+                                    sort,
+                                    None,
+                                    true,
+                                    p,
+                                    cx,
+                                ),
                                 p,
                                 cx,
-                            ),
-                            p,
-                            cx,
-                        )),
+                            ))
+                        }),
                 ),
         )
         .child(if row_count == 0 {
@@ -604,6 +761,22 @@ fn render_details_rows(
     let Some(tab) = ws.active_tab() else {
         return Vec::new();
     };
+    let measured_w: f32 = tab
+        .pane_ui(side)
+        .scroll_handle
+        .0
+        .borrow()
+        .base_handle
+        .bounds()
+        .size
+        .width
+        .into();
+    let pane_w = if measured_w > 60.0 {
+        measured_w
+    } else {
+        ws.estimated_pane_width(tab.model.split_enabled)
+    };
+    let layout = compute_details_column_layout(pane_w, col_mod_w, col_type_w, col_size_w);
     let model = tab.model.pane(side);
 
     range
@@ -667,18 +840,20 @@ fn render_details_rows(
                     }
                 })
                 .when_some(drag_payload, |el, payload| {
-                    el.on_drag(payload, move |drag, _, _, cx| {
+                    el.on_drag(payload, move |drag, cursor_offset, _, cx| {
                         cx.new(|_| DragBadgeView {
                             label: drag.label.clone(),
                             palette: p,
+                            cursor_offset,
                         })
                     })
                 })
                 .when_some(archive_drag_payload, |el, payload| {
-                    el.on_drag(payload, move |drag, _, _, cx| {
+                    el.on_drag(payload, move |drag, cursor_offset, _, cx| {
                         cx.new(|_| DragBadgeView {
                             label: drag.label.clone(),
                             palette: p,
+                            cursor_offset,
                         })
                     })
                 })
@@ -755,6 +930,7 @@ fn render_details_rows(
                     h_flex()
                         .flex_1()
                         .min_w_0()
+                        .overflow_hidden()
                         .pr_2()
                         .gap_2()
                         .items_center()
@@ -788,44 +964,53 @@ fn render_details_rows(
                             )
                         }),
                 )
-                .child(
-                    div()
-                        .w(px(col_mod_w))
-                        .flex_shrink_0()
-                        .pl_2()
-                        .truncate()
-                        .text_xs()
-                        .text_color(solid(p.text_secondary))
-                        .child(modified),
-                )
-                .child(
-                    div()
-                        .w(px(col_type_w))
-                        .flex_shrink_0()
-                        .pl_2()
-                        .truncate()
-                        .text_xs()
-                        .text_color(solid(p.text_muted))
-                        .child(type_label),
-                )
-                .child(
-                    div()
-                        .w(px(col_size_w))
-                        .flex_shrink_0()
-                        .pl_2()
-                        .text_right()
-                        .truncate()
-                        .text_xs()
-                        .text_color(solid(p.text_secondary))
-                        .child(size_label),
-                );
+                .when(layout.show_modified, |el| {
+                    el.child(
+                        div()
+                            .w(px(layout.mod_w))
+                            .flex_shrink_0()
+                            .overflow_hidden()
+                            .pl_2()
+                            .truncate()
+                            .text_xs()
+                            .text_color(solid(p.text_secondary))
+                            .child(modified),
+                    )
+                })
+                .when(layout.show_type, |el| {
+                    el.child(
+                        div()
+                            .w(px(layout.type_w))
+                            .flex_shrink_0()
+                            .overflow_hidden()
+                            .pl_2()
+                            .truncate()
+                            .text_xs()
+                            .text_color(solid(p.text_muted))
+                            .child(type_label),
+                    )
+                })
+                .when(layout.show_size, |el| {
+                    el.child(
+                        div()
+                            .w(px(layout.size_w))
+                            .flex_shrink_0()
+                            .overflow_hidden()
+                            .pl_2()
+                            .text_right()
+                            .truncate()
+                            .text_xs()
+                            .text_color(solid(p.text_secondary))
+                            .child(size_label),
+                    )
+                });
 
             Some(
                 div()
                     .w_full()
                     .h(px(32.))
                     .pl(px(6.))
-                    .pr(px(LIST_MARQUEE_GUTTER_PX))
+                    .pr(px(layout.gutter_w))
                     .bg(solid(p.bg_base))
                     .child(row)
                     .into_any_element(),
@@ -856,6 +1041,8 @@ pub fn render_grid_view(
         PaneSide::Left => "grid-list-left",
         PaneSide::Right => "grid-list-right",
     };
+    let native_drop_active = ws.native_drop_hover_side == Some(side)
+        && matches!(model.location, Location::Local(_) | Location::Remote { .. });
     let pane_dir_drag = pane_dir.clone();
     let pane_dir_has_local = pane_dir.is_some();
     let pane_dir_int = pane_dir.clone();
@@ -866,6 +1053,9 @@ pub fn render_grid_view(
         .size_full()
         .bg(solid(p.bg_base))
         .overflow_hidden()
+        .when(native_drop_active, |el| {
+            el.border_1().border_color(solid(p.accent_primary))
+        })
         .drag_over::<DraggedEntries>(move |style, drag, _, _| {
             if pane_dir_drag
                 .as_ref()
@@ -893,6 +1083,8 @@ pub fn render_grid_view(
         .on_drop(cx.listener(move |this, drag: &DraggedEntries, window, cx| {
             if let Some(ref dest) = pane_dir_int {
                 this.handle_dropped_paths(drag.paths.clone(), dest.clone(), false, window, cx);
+            } else {
+                this.handle_dropped_paths_into_pane(side, drag.paths.clone(), window, cx);
             }
         }))
         .on_drop(cx.listener(move |this, drag: &DraggedArchiveEntries, window, cx| {
@@ -909,6 +1101,8 @@ pub fn render_grid_view(
         .on_drop(cx.listener(move |this, ext: &ExternalPaths, window, cx| {
             if let Some(ref dest) = pane_dir_ext {
                 this.handle_dropped_paths(ext.paths().to_vec(), dest.clone(), true, window, cx);
+            } else {
+                this.handle_dropped_paths_into_pane(side, ext.paths().to_vec(), window, cx);
             }
         }))
         .on_mouse_down(
@@ -1118,18 +1312,20 @@ fn render_grid_rows(
                                 }
                             })
                             .when_some(drag_payload, |el, payload| {
-                                el.on_drag(payload, move |drag, _, _, cx| {
+                                el.on_drag(payload, move |drag, cursor_offset, _, cx| {
                                     cx.new(|_| DragBadgeView {
                                         label: drag.label.clone(),
                                         palette: p,
+                                        cursor_offset,
                                     })
                                 })
                             })
                             .when_some(archive_drag_payload, |el, payload| {
-                                el.on_drag(payload, move |drag, _, _, cx| {
+                                el.on_drag(payload, move |drag, cursor_offset, _, cx| {
                                     cx.new(|_| DragBadgeView {
                                         label: drag.label.clone(),
                                         palette: p,
+                                        cursor_offset,
                                     })
                                 })
                             })
@@ -1251,6 +1447,8 @@ pub fn render_compact_view(
         PaneSide::Left => "compact-list-left",
         PaneSide::Right => "compact-list-right",
     };
+    let native_drop_active = ws.native_drop_hover_side == Some(side)
+        && matches!(model.location, Location::Local(_) | Location::Remote { .. });
     let pane_dir_drag = pane_dir.clone();
     let pane_dir_has_local = pane_dir.is_some();
     let pane_dir_int = pane_dir.clone();
@@ -1261,6 +1459,9 @@ pub fn render_compact_view(
         .size_full()
         .bg(solid(p.bg_base))
         .overflow_hidden()
+        .when(native_drop_active, |el| {
+            el.border_1().border_color(solid(p.accent_primary))
+        })
         .drag_over::<DraggedEntries>(move |style, drag, _, _| {
             if pane_dir_drag
                 .as_ref()
@@ -1288,6 +1489,8 @@ pub fn render_compact_view(
         .on_drop(cx.listener(move |this, drag: &DraggedEntries, window, cx| {
             if let Some(ref dest) = pane_dir_int {
                 this.handle_dropped_paths(drag.paths.clone(), dest.clone(), false, window, cx);
+            } else {
+                this.handle_dropped_paths_into_pane(side, drag.paths.clone(), window, cx);
             }
         }))
         .on_drop(cx.listener(move |this, drag: &DraggedArchiveEntries, window, cx| {
@@ -1304,6 +1507,8 @@ pub fn render_compact_view(
         .on_drop(cx.listener(move |this, ext: &ExternalPaths, window, cx| {
             if let Some(ref dest) = pane_dir_ext {
                 this.handle_dropped_paths(ext.paths().to_vec(), dest.clone(), true, window, cx);
+            } else {
+                this.handle_dropped_paths_into_pane(side, ext.paths().to_vec(), window, cx);
             }
         }))
         .on_mouse_down(
@@ -1430,18 +1635,20 @@ fn render_compact_rows(
                     }
                 })
                 .when_some(drag_payload, |el, payload| {
-                    el.on_drag(payload, move |drag, _, _, cx| {
+                    el.on_drag(payload, move |drag, cursor_offset, _, cx| {
                         cx.new(|_| DragBadgeView {
                             label: drag.label.clone(),
                             palette: p,
+                            cursor_offset,
                         })
                     })
                 })
                 .when_some(archive_drag_payload, |el, payload| {
-                    el.on_drag(payload, move |drag, _, _, cx| {
+                    el.on_drag(payload, move |drag, cursor_offset, _, cx| {
                         cx.new(|_| DragBadgeView {
                             label: drag.label.clone(),
                             palette: p,
+                            cursor_offset,
                         })
                     })
                 })
@@ -1641,6 +1848,7 @@ fn sort_header_cell(
         .h_full()
         .gap_1()
         .items_center()
+        .overflow_hidden()
         .cursor_pointer()
         .when(align_right, |el| el.justify_end())
         .map(|el| match width_px {
@@ -1658,7 +1866,7 @@ fn sort_header_cell(
         .on_click(cx.listener(move |this, _, _, cx| {
             this.toggle_sort_column(side, column, cx);
         }))
-        .child(label)
+        .child(div().min_w_0().truncate().child(label))
         .when(is_active, |el| {
             el.child(
                 Icon::new(if descending {
@@ -1721,4 +1929,40 @@ fn render_empty_state(
                 .text_color(solid(p.text_muted))
                 .child(helper),
         )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn details_layout_preserves_name_space_and_hides_secondary_columns_when_narrow() {
+        // Wide single pane shows all 4 columns at full preferred widths.
+        let wide = compute_details_column_layout(1000.0, 164.0, 144.0, 106.0);
+        assert!(wide.show_modified && wide.show_type && wide.show_size);
+        assert_eq!(wide.mod_w, 164.0);
+        assert_eq!(wide.type_w, 144.0);
+        assert_eq!(wide.size_w, 106.0);
+
+        // Medium split pane compresses secondary columns while preserving >= 160px for Name.
+        let mid = compute_details_column_layout(500.0, 164.0, 144.0, 106.0);
+        assert!(mid.show_modified && mid.show_type && mid.show_size);
+        let name_space_mid = 500.0 - DETAILS_ROW_CHROME_PX - mid.gutter_w - mid.mod_w - mid.type_w - mid.size_w;
+        assert!(name_space_mid >= DETAILS_MIN_NAME_PX);
+
+        // Narrow split pane + Inspector/Sidebar hides Type first so Name stays legible.
+        let narrow = compute_details_column_layout(420.0, 164.0, 144.0, 106.0);
+        assert!(narrow.show_modified && !narrow.show_type && narrow.show_size);
+        let name_space_narrow =
+            420.0 - DETAILS_ROW_CHROME_PX - narrow.gutter_w - narrow.mod_w - narrow.size_w;
+        assert!(name_space_narrow >= DETAILS_MIN_NAME_PX);
+
+        // Very narrow pane hides Date Modified too, keeping Name + Size.
+        let very_narrow = compute_details_column_layout(310.0, 164.0, 144.0, 106.0);
+        assert!(!very_narrow.show_modified && !very_narrow.show_type && very_narrow.show_size);
+
+        // Ultra-narrow pane renders Name only.
+        let tiny = compute_details_column_layout(220.0, 164.0, 144.0, 106.0);
+        assert!(!tiny.show_modified && !tiny.show_type && !tiny.show_size);
+    }
 }

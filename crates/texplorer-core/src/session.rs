@@ -194,7 +194,7 @@ fn sanitize_location(loc: Location) -> Location {
                 Location::Home
             }
         }
-        Location::Search { .. } => Location::Home,
+        Location::Remote { .. } | Location::Search { .. } => Location::Home,
     }
 }
 

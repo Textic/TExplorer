@@ -168,6 +168,13 @@ mod imp {
                 return;
             }
             if let Ok(exe) = std::env::current_exe() {
+                if crate::elevation::is_elevated() {
+                    let parent = exe.parent().unwrap_or_else(|| Path::new("."));
+                    let exe_str = exe.to_string_lossy();
+                    if crate::launch::spawn_as_desktop_user(&exe_str, "", parent).is_ok() {
+                        return;
+                    }
+                }
                 let _ = Command::new(exe)
                     .stdin(Stdio::null())
                     .stdout(Stdio::null())

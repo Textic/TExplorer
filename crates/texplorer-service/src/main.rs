@@ -620,31 +620,33 @@ mod win_service {
                             && let Some(vol) = guard.volumes.get_mut(&drive)
                         {
                             vol.next_usn = new_next;
-                            let mut size_refresh_refs: Vec<u64> = Vec::new();
+                            let mut size_refresh_refs: std::collections::HashSet<u64> =
+                                std::collections::HashSet::new();
                             for delta in deltas {
                                 if let UsnDelta::Upsert {
                                     file_ref, flags, ..
                                 } = &delta
                                     && (*flags & FLAG_IS_DIR) == 0
                                 {
-                                    size_refresh_refs.push(*file_ref);
+                                    size_refresh_refs.insert(*file_ref);
                                 }
                                 vol.apply_usn_delta(delta);
                             }
 
-                            // Refresh file sizes for newly created/modified files while keeping lock brief.
+                            // Refresh file sizes for all unique created/modified files while keeping lock brief.
                             let paths_to_stat: Vec<(u64, String)> = size_refresh_refs
                                 .into_iter()
-                                .take(256)
                                 .filter_map(|r| Some((r, vol.reconstruct_path(r)?)))
                                 .collect();
                             drop(guard);
 
-                            let mut meta_updates = Vec::new();
-                            for (fref, path) in paths_to_stat {
-                                if let Ok(meta) = std::fs::metadata(&path)
-                                    && meta.is_file()
-                                {
+                            let meta_updates: Vec<(u64, u64, i64)> = paths_to_stat
+                                .into_par_iter()
+                                .filter_map(|(fref, path)| {
+                                    let meta = std::fs::metadata(&path).ok()?;
+                                    if !meta.is_file() {
+                                        return None;
+                                    }
                                     let mtime = meta
                                         .modified()
                                         .ok()
@@ -653,9 +655,9 @@ mod win_service {
                                         })
                                         .map(|d| d.as_secs() as i64)
                                         .unwrap_or(0);
-                                    meta_updates.push((fref, meta.len(), mtime));
-                                }
-                            }
+                                    Some((fref, meta.len(), mtime))
+                                })
+                                .collect();
                             if !meta_updates.is_empty()
                                 && let Ok(mut guard) = index.write()
                                 && let Some(vol) = guard.volumes.get_mut(&drive)

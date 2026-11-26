@@ -5,6 +5,7 @@ pub mod global_search;
 pub mod header;
 pub mod inspector;
 pub mod modals;
+pub mod network;
 pub mod pane;
 pub mod quicklook;
 pub mod sidebar;

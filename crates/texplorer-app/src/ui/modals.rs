@@ -16,9 +16,13 @@ use gpui_kit::{
 use texplorer_core::{AccentPreset, PaneSide, SidebarSection, SizeUnit, ThemePreset, ViewMode};
 use texplorer_mft::IndexServiceInstallState;
 use texplorer_platform::DefaultExplorerStatus;
+use uuid::Uuid;
 
 use crate::theme::{
     Palette, RADIUS_CONTROL, RADIUS_ROW, full_hit_input, known_folder_icon, soft_tint, solid,
+};
+use crate::ui::network::{
+    NetworkConnectModalState, P2pModalState, render_network_connect_modal, render_p2p_modal,
 };
 use crate::ui::sidebar::{DraggedQuickAccessItem, DraggedSidebarSection, SidebarDragGhost};
 use crate::ui::workspace::Workspace;
@@ -75,7 +79,7 @@ impl SettingsCategory {
     }
 }
 
-/// Modal dialog state for Settings and quick file prompts.
+/// Modal dialog state for Settings, Network connections, P2P transfers, and quick file prompts.
 #[derive(Clone)]
 pub enum ActiveModal {
     Settings,
@@ -89,6 +93,8 @@ pub enum ActiveModal {
         side: PaneSide,
         paths: Vec<PathBuf>,
     },
+    NetworkConnect(NetworkConnectModalState),
+    P2p(P2pModalState),
 }
 
 #[derive(Clone)]
@@ -96,6 +102,16 @@ pub enum TextPromptKind {
     NewFolder { side: PaneSide, parent: PathBuf },
     NewFile { side: PaneSide, parent: PathBuf },
     Rename { side: PaneSide, target: PathBuf },
+    RemoteNewFolder {
+        side: PaneSide,
+        connection_id: Uuid,
+        parent_remote_path: String,
+    },
+    RemoteRename {
+        side: PaneSide,
+        connection_id: Uuid,
+        remote_path: String,
+    },
 }
 
 pub fn render_active_modal(
@@ -115,6 +131,10 @@ pub fn render_active_modal(
         ActiveModal::ConfirmPermanentDelete { paths, .. } => {
             render_delete_confirm_card(paths, p, cx).into_any_element()
         }
+        ActiveModal::NetworkConnect(form) => {
+            render_network_connect_modal(ws, form, p, cx).into_any_element()
+        }
+        ActiveModal::P2p(state) => render_p2p_modal(ws, state, p, cx).into_any_element(),
     };
 
     div()
@@ -803,6 +823,7 @@ fn render_settings_card(
                                         SidebarSection::QuickAccess => LucideIcon::Folder,
                                         SidebarSection::Pinned => LucideIcon::Pin,
                                         SidebarSection::Drives => LucideIcon::HardDrive,
+                                        SidebarSection::Network => LucideIcon::Network,
                                         SidebarSection::LinuxWsl => LucideIcon::Terminal,
                                     };
                                     let drag_payload = DraggedSidebarSection {
@@ -824,10 +845,11 @@ fn render_settings_card(
                                         .border_1()
                                         .border_color(solid(p.border_subtle))
                                         .hover(move |s| s.border_color(solid(p.border)))
-                                        .on_drag(drag_payload, move |drag, _, _, cx| {
+                                        .on_drag(drag_payload, move |drag, cursor_offset, _, cx| {
                                             cx.new(|_| SidebarDragGhost {
                                                 label: drag.label.clone(),
                                                 palette: p,
+                                                cursor_offset,
                                             })
                                         })
                                         .drag_over::<DraggedSidebarSection>(
@@ -955,10 +977,11 @@ fn render_settings_card(
                                         .border_1()
                                         .border_color(solid(p.border_subtle))
                                         .hover(move |s| s.border_color(solid(p.border)))
-                                        .on_drag(drag_payload, move |drag, _, _, cx| {
+                                        .on_drag(drag_payload, move |drag, cursor_offset, _, cx| {
                                             cx.new(|_| SidebarDragGhost {
                                                 label: drag.label.clone(),
                                                 palette: p,
+                                                cursor_offset,
                                             })
                                         })
                                         .drag_over::<DraggedQuickAccessItem>(
