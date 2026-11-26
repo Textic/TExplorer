@@ -13,7 +13,7 @@ use gpui_kit::{
 use texplorer_core::Location;
 
 use crate::theme::{
-    Palette, RADIUS_CONTROL, drive_kind_icon, known_folder_icon, soft_tint, solid, usage_bar_color,
+    Palette, RADIUS_CONTROL, drive_kind_icon, known_folder_icon, solid, usage_bar_color,
 };
 use crate::ui::context_menu::ContextMenuTarget;
 use crate::ui::workspace::Workspace;
@@ -284,16 +284,15 @@ pub fn render_sidebar(ws: &Workspace, cx: &mut Context<Workspace>) -> impl IntoE
                             )),
                     )
                 })
-                // Compact Drives section (name + subtle usage bar, without free-GB subtitle)
+                // Compact Drives section (flat rows matching Quick Access, with slim usage bar)
                 .child(
                     v_flex()
-                        .gap_1()
+                        .gap_0p5()
                         .child(
                             h_flex()
                                 .w_full()
                                 .items_center()
                                 .justify_between()
-                                .px_1()
                                 .child(section_label("DRIVES", p))
                                 .child(
                                     Button::new("sb-refresh-drives")
@@ -318,28 +317,22 @@ pub fn render_sidebar(ws: &Workspace, cx: &mut Context<Workspace>) -> impl IntoE
                             let frac = vol.used_fraction();
                             let bar_hex = usage_bar_color(frac, p);
                             let title: SharedString = vol.display_name().into();
-                            let fs_badge: SharedString = vol.file_system.clone().into();
                             let vol_mid = vol.root_path.clone();
                             let vol_ctx = vol.clone();
 
-                            v_flex()
+                            h_flex()
                                 .id(("sb-drive", i))
                                 .w_full()
-                                .px_2()
-                                .py_1p5()
-                                .gap_1()
+                                .h(px(36.))
+                                .px_2p5()
+                                .gap_2()
+                                .items_center()
                                 .rounded(px(RADIUS_CONTROL))
                                 .cursor_pointer()
                                 .bg(if active {
                                     solid(p.bg_elevated)
                                 } else {
-                                    solid(p.bg_base)
-                                })
-                                .border_1()
-                                .border_color(if active {
-                                    solid(p.accent_primary)
-                                } else {
-                                    solid(p.border_subtle)
+                                    gpui_kit::transparent_black()
                                 })
                                 .hover(move |s| s.bg(solid(p.bg_elevated)))
                                 .on_mouse_down(
@@ -365,60 +358,44 @@ pub fn render_sidebar(ws: &Workspace, cx: &mut Context<Workspace>) -> impl IntoE
                                     }),
                                 )
                                 .child(
-                                    h_flex()
-                                        .items_center()
-                                        .justify_between()
-                                        .gap_1()
-                                        .child(
-                                            h_flex()
-                                                .flex_1()
-                                                .min_w_0()
-                                                .items_center()
-                                                .gap_1p5()
-                                                .child(
-                                                    Icon::new(drive_kind_icon(vol.kind))
-                                                        .xsmall()
-                                                        .text_color(if active {
-                                                            solid(p.accent_primary)
-                                                        } else {
-                                                            solid(p.text_secondary)
-                                                        }),
-                                                )
-                                                .child(
-                                                    div()
-                                                        .flex_1()
-                                                        .min_w_0()
-                                                        .truncate()
-                                                        .text_xs()
-                                                        .font_medium()
-                                                        .text_color(solid(p.text_primary))
-                                                        .child(title),
-                                                ),
-                                        )
-                                        .when(!vol.file_system.is_empty(), |el| {
-                                            el.child(
-                                                div()
-                                                    .px_1()
-                                                    .rounded(px(3.))
-                                                    .bg(soft_tint(p.accent_primary, 0.12))
-                                                    .text_color(solid(p.accent_primary))
-                                                    .text_size(px(11.))
-                                                    .child(fs_badge),
-                                            )
+                                    Icon::new(drive_kind_icon(vol.kind))
+                                        .xsmall()
+                                        .text_color(if active {
+                                            solid(p.accent_primary)
+                                        } else {
+                                            solid(p.text_secondary)
                                         }),
                                 )
                                 .child(
-                                    div()
-                                        .w_full()
-                                        .h(px(3.))
-                                        .rounded(px(2.))
-                                        .bg(solid(p.border_subtle))
-                                        .overflow_hidden()
+                                    v_flex()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .gap(px(3.))
                                         .child(
                                             div()
-                                                .h_full()
-                                                .w(relative(frac))
-                                                .bg(solid(bar_hex)),
+                                                .w_full()
+                                                .truncate()
+                                                .text_xs()
+                                                .text_color(if active {
+                                                    solid(p.text_primary)
+                                                } else {
+                                                    solid(p.text_secondary)
+                                                })
+                                                .child(title),
+                                        )
+                                        .child(
+                                            div()
+                                                .w_full()
+                                                .h(px(2.))
+                                                .rounded(px(1.))
+                                                .bg(solid(p.border_subtle))
+                                                .overflow_hidden()
+                                                .child(
+                                                    div()
+                                                        .h_full()
+                                                        .w(relative(frac))
+                                                        .bg(solid(bar_hex)),
+                                                ),
                                         ),
                                 )
                         })),

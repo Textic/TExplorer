@@ -28,6 +28,10 @@ enum ShellJob {
         screen_y: i32,
         on_done: MenuCallback,
     },
+    ShowProperties {
+        path: PathBuf,
+        on_done: MenuCallback,
+    },
 }
 
 /// Handle to the background COM STA worker thread.
@@ -68,6 +72,10 @@ impl ShellWorker {
                             let res = invoke_native_context_menu(&paths, screen_x, screen_y);
                             on_done(res);
                         }
+                        ShellJob::ShowProperties { path, on_done } => {
+                            let res = crate::launch::show_properties_dialog(&path);
+                            on_done(res);
+                        }
                     }
                 }
 
@@ -106,6 +114,18 @@ impl ShellWorker {
             paths,
             screen_x,
             screen_y,
+            on_done: Box::new(on_done),
+        });
+    }
+
+    /// Shows the native Windows Properties dialog for `path` on the COM STA thread.
+    pub fn show_properties(
+        &self,
+        path: PathBuf,
+        on_done: impl FnOnce(Result<(), String>) + Send + 'static,
+    ) {
+        let _ = self.tx.send(ShellJob::ShowProperties {
+            path,
             on_done: Box::new(on_done),
         });
     }

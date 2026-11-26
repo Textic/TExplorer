@@ -342,7 +342,11 @@ pub fn render_global_search_modal(
                                             })
                                             .on_click(cx.listener(|this, _, window, cx| {
                                                 this.close_global_search(window, cx);
-                                                this.open_settings_modal(window, cx);
+                                                this.open_settings_category(
+                                                    crate::ui::modals::SettingsCategory::Search,
+                                                    window,
+                                                    cx,
+                                                );
                                             }))
                                             .child("Setup MFT Service"),
                                     )

@@ -1,13 +1,31 @@
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
-/// Opens a file or folder with the OS default handler.
+/// Opens a file or folder with the OS default handler (safe to invoke from background threads).
 pub fn open_item(path: &Path) -> Result<(), String> {
     #[cfg(target_os = "windows")]
     {
         use std::os::windows::ffi::OsStrExt;
+        use windows::Win32::System::Com::{
+            COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE, CoInitializeEx, CoUninitialize,
+        };
         use windows_sys::Win32::UI::Shell::ShellExecuteW;
         use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+
+        let com_inited = unsafe {
+            CoInitializeEx(None, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE).is_ok()
+        };
+        struct ComGuard(bool);
+        impl Drop for ComGuard {
+            fn drop(&mut self) {
+                if self.0 {
+                    unsafe {
+                        CoUninitialize();
+                    }
+                }
+            }
+        }
+        let _com_guard = ComGuard(com_inited);
 
         let verb: Vec<u16> = "open\0".encode_utf16().collect();
         let file: Vec<u16> = path
@@ -75,6 +93,9 @@ pub fn reveal_in_windows_explorer(path: &Path) -> Result<(), String> {
         };
         Command::new("explorer.exe")
             .raw_arg(arg)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
             .spawn()
             .map(|_| ())
             .map_err(|e| format!("Failed to launch Windows Explorer: {e}"))
@@ -97,14 +118,27 @@ pub fn open_terminal_here(path: &Path, preferred_cmd: &str) -> Result<(), String
     {
         let preferred = preferred_cmd.trim();
         if (preferred.is_empty() || preferred.eq_ignore_ascii_case("wt.exe") || preferred.eq_ignore_ascii_case("wt"))
-            && Command::new("wt.exe").arg("-d").arg(dir).spawn().is_ok()
+            && Command::new("wt.exe")
+                .arg("-d")
+                .arg(dir)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .is_ok()
         {
             return Ok(());
         }
         if !preferred.is_empty()
             && !preferred.eq_ignore_ascii_case("wt.exe")
             && !preferred.eq_ignore_ascii_case("wt")
-            && Command::new(preferred).current_dir(dir).spawn().is_ok()
+            && Command::new(preferred)
+                .current_dir(dir)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .is_ok()
         {
             return Ok(());
         }
@@ -113,6 +147,9 @@ pub fn open_terminal_here(path: &Path, preferred_cmd: &str) -> Result<(), String
             .arg("-NoExit")
             .arg("-Command")
             .arg(format!("Set-Location -LiteralPath '{escaped}'"))
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
             .spawn()
             .map(|_| ())
             .map_err(|e| format!("Failed to launch terminal: {e}"))
@@ -141,13 +178,24 @@ pub fn open_in_editor(path: &Path, editor_cmd: &str) -> Result<(), String> {
     {
         use std::os::windows::process::CommandExt;
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        if Command::new(cmd).arg(path).spawn().is_ok() {
+        if Command::new(cmd)
+            .arg(path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .creation_flags(CREATE_NO_WINDOW)
+            .spawn()
+            .is_ok()
+        {
             return Ok(());
         }
-        // Handle `.cmd` shims such as VS Code's `code.cmd`.
+        // Handle `.cmd` shims such as VS Code's `code.cmd` without leaking console output.
         Command::new("cmd.exe")
             .args(["/C", cmd])
             .arg(path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
             .creation_flags(CREATE_NO_WINDOW)
             .spawn()
             .map(|_| ())
