@@ -16,6 +16,8 @@ pub use network::{
     NetworkConnection, NetworkProtocol, ParsedNetworkUri, SshAuthMode, join_remote_path,
     normalize_remote_path, normalize_smb_share_path, parse_network_uri,
 };
-pub use session::{AppSession, SavedPaneState, SavedTabState, WindowGeometry};
+pub use session::{
+    AppSession, DisplayArea, SavedPaneState, SavedTabState, WindowGeometry, resolve_window_restore,
+};
 pub use settings::{AccentPreset, AppSettings, IconStyle, SidebarSection, SizeUnit, ThemePreset};
 pub use workspace_model::{PaneModel, PaneSide, SelectionSet, TabModel};

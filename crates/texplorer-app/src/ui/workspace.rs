@@ -418,6 +418,7 @@ pub struct Workspace {
     pub hash_verify_input: Entity<InputState>,
     pub hash_verify_text: String,
     _hash_verify_sub: Subscription,
+    _window_bounds_sub: Subscription,
     pub lock_target: Option<PathBuf>,
     pub lock_status: FileLockStatus,
     lock_generation: u64,
@@ -517,6 +518,10 @@ impl Workspace {
             },
         );
 
+        let window_bounds_sub = cx.observe_window_bounds(window, |this, window, cx| {
+            this.capture_window_geometry(window, Some(cx));
+        });
+
         let mut ws = Self {
             focus_handle: cx.focus_handle(),
             settings,
@@ -562,6 +567,7 @@ impl Workspace {
             hash_verify_input,
             hash_verify_text: String::new(),
             _hash_verify_sub: hash_verify_sub,
+            _window_bounds_sub: window_bounds_sub,
             lock_target: None,
             lock_status: FileLockStatus::NotChecked,
             lock_generation: 0,
@@ -2055,17 +2061,22 @@ impl Workspace {
         }
     }
 
-    fn capture_window_geometry(&mut self, window: &Window) {
+    fn capture_window_geometry(&mut self, window: &Window, cx: Option<&Context<Self>>) {
         let (rect, maximized) = match window.window_bounds() {
             WindowBounds::Windowed(r) => (r, false),
             WindowBounds::Maximized(r) | WindowBounds::Fullscreen(r) => (r, true),
         };
+        let display_uuid = cx
+            .and_then(|cx| window.display(cx))
+            .and_then(|d| d.uuid().ok())
+            .or_else(|| self.last_window_geometry.and_then(|g| g.display_uuid));
         let geom = WindowGeometry {
             x: f32::from(rect.origin.x),
             y: f32::from(rect.origin.y),
             width: f32::from(rect.size.width),
             height: f32::from(rect.size.height),
             maximized,
+            display_uuid,
         };
         if geom.is_valid() {
             self.last_window_geometry = Some(geom);
@@ -2074,7 +2085,7 @@ impl Workspace {
 
     fn save_session(&mut self, window: Option<&Window>) {
         if let Some(w) = window {
-            self.capture_window_geometry(w);
+            self.capture_window_geometry(w, None);
         }
         self.persist_session_snapshot();
     }
@@ -7291,7 +7302,7 @@ impl Render for Workspace {
         for stale in self.stale_gpu_images.drain(..) {
             let _ = window.drop_image(stale);
         }
-        self.capture_window_geometry(window);
+        self.capture_window_geometry(window, Some(cx));
         let p = self.palette();
         let is_split = self.active_tab().is_some_and(|t| t.model.split_enabled);
 

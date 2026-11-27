@@ -12,7 +12,7 @@ use gpui_kit::{
     assets::{Assets, icon_assets},
     *,
 };
-use texplorer_core::{AppSession, AppSettings};
+use texplorer_core::{AppSession, AppSettings, DisplayArea, resolve_window_restore};
 use texplorer_platform::{
     DefaultExplorerStatus, LaunchIntent, delegate_to_windows_explorer, enable_default_explorer,
     ensure_win_e_daemon_running, is_app_instance_running, parse_cli_args,
@@ -253,24 +253,48 @@ fn main() {
                 KeyBinding::new("ctrl-q", Quit, Some("TExplorerWorkspace")),
             ]);
 
-            let bounds = initial_session
+            let displays = cx.displays();
+            let primary_id = cx.primary_display().map(|d| d.id());
+            let display_areas: Vec<DisplayArea> = displays
+                .iter()
+                .map(|d| {
+                    let b = d.bounds();
+                    let vb = d.visible_bounds();
+                    DisplayArea {
+                        uuid: d.uuid().ok(),
+                        is_primary: Some(d.id()) == primary_id,
+                        x: f32::from(b.origin.x),
+                        y: f32::from(b.origin.y),
+                        width: f32::from(b.size.width),
+                        height: f32::from(b.size.height),
+                        visible_x: f32::from(vb.origin.x),
+                        visible_y: f32::from(vb.origin.y),
+                        visible_width: f32::from(vb.size.width),
+                        visible_height: f32::from(vb.size.height),
+                    }
+                })
+                .collect();
+
+            let (display_id, bounds) = initial_session
                 .as_ref()
                 .and_then(|s| s.window)
-                .filter(|g| g.is_valid())
-                .map(|g| {
+                .and_then(|saved| resolve_window_restore(saved, &display_areas))
+                .map(|(idx, g)| {
                     let rect = Bounds::new(
                         point(px(g.x), px(g.y)),
                         size(px(g.width), px(g.height)),
                     );
-                    if g.maximized {
+                    let wb = if g.maximized {
                         WindowBounds::Maximized(rect)
                     } else {
                         WindowBounds::Windowed(rect)
-                    }
+                    };
+                    (Some(displays[idx].id()), wb)
                 })
-                .unwrap_or_else(|| WindowBounds::centered(size(px(1440.), px(900.)), cx));
+                .unwrap_or_else(|| (None, WindowBounds::centered(size(px(1440.), px(900.)), cx)));
             let options = WindowOptions {
                 window_bounds: Some(bounds),
+                display_id,
                 titlebar: Some(TitlebarOptions {
                     title: None,
                     appears_transparent: true,

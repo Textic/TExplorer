@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 use crate::entry::{SortSpec, ViewMode};
 use crate::location::Location;
@@ -34,7 +35,7 @@ pub struct SavedTabState {
     pub right: Option<SavedPaneState>,
 }
 
-/// Persisted desktop window bounds and maximized state.
+/// Persisted desktop window bounds, maximized state, and owning display identifier.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct WindowGeometry {
     pub x: f32,
@@ -43,6 +44,118 @@ pub struct WindowGeometry {
     pub height: f32,
     #[serde(default)]
     pub maximized: bool,
+    #[serde(default)]
+    pub display_uuid: Option<Uuid>,
+}
+
+/// Minimal descriptor of an attached OS display in logical pixels for multi-monitor window restore.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DisplayArea {
+    pub uuid: Option<Uuid>,
+    pub is_primary: bool,
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
+    pub visible_x: f32,
+    pub visible_y: f32,
+    pub visible_width: f32,
+    pub visible_height: f32,
+}
+
+impl DisplayArea {
+    fn contains_point(self, px: f32, py: f32) -> bool {
+        px >= self.x && px < self.x + self.width && py >= self.y && py < self.y + self.height
+    }
+
+    fn clamp_geometry(self, saved: WindowGeometry) -> WindowGeometry {
+        let max_w = self.visible_width.max(640.0);
+        let max_h = self.visible_height.max(420.0);
+        let width = saved.width.clamp(640.0, max_w);
+        let height = saved.height.clamp(420.0, max_h);
+        let max_x = self.visible_x + (self.visible_width - width).max(0.0);
+        let max_y = self.visible_y + (self.visible_height - height).max(0.0);
+        let x = saved.x.clamp(self.visible_x, max_x);
+        let y = saved.y.clamp(self.visible_y, max_y);
+        WindowGeometry {
+            x,
+            y,
+            width,
+            height,
+            maximized: saved.maximized,
+            display_uuid: self.uuid,
+        }
+    }
+
+    fn center_geometry(self, saved: WindowGeometry) -> WindowGeometry {
+        let max_w = self.visible_width.max(640.0);
+        let max_h = self.visible_height.max(420.0);
+        let width = saved.width.clamp(640.0, max_w);
+        let height = saved.height.clamp(420.0, max_h);
+        let x = self.visible_x + ((self.visible_width - width) * 0.5).max(0.0);
+        let y = self.visible_y + ((self.visible_height - height) * 0.5).max(0.0);
+        WindowGeometry {
+            x,
+            y,
+            width,
+            height,
+            maximized: saved.maximized,
+            display_uuid: self.uuid,
+        }
+    }
+}
+
+/// Resolves which attached display should host a restored window and adjusts its geometry if the
+/// original monitor was resized or disconnected so GPUI never rejects off-primary coordinates and
+/// falls back to stretched `default_bounds()`.
+pub fn resolve_window_restore(
+    saved: WindowGeometry,
+    displays: &[DisplayArea],
+) -> Option<(usize, WindowGeometry)> {
+    if !saved.is_valid() || displays.is_empty() {
+        return None;
+    }
+
+    let center_x = saved.x + saved.width * 0.5;
+    let center_y = saved.y + saved.height * 0.5;
+
+    // 1. Exact UUID match when the saved center is also inside that display.
+    if let Some(target_uuid) = saved.display_uuid
+        && let Some(idx) = displays
+            .iter()
+            .position(|d| d.uuid == Some(target_uuid) && d.contains_point(center_x, center_y))
+    {
+        return Some((idx, saved));
+    }
+
+    // 2. For maximized windows moved between monitors (e.g. Win+Shift+Arrow), the OS may keep
+    //    `rcNormalPosition` on the previous monitor while `display_uuid` tracks the active monitor.
+    if saved.maximized
+        && let Some(target_uuid) = saved.display_uuid
+        && let Some(idx) = displays.iter().position(|d| d.uuid == Some(target_uuid))
+    {
+        return Some((idx, displays[idx].center_geometry(saved)));
+    }
+
+    // 3. Match whichever attached display contains the saved window center (handles secondary
+    //    monitors with negative X/Y coordinates even for legacy session files without display_uuid).
+    if let Some(idx) = displays
+        .iter()
+        .position(|d| d.contains_point(center_x, center_y))
+    {
+        return Some((idx, saved));
+    }
+
+    // 4. Saved display still exists, but window drifted outside its current bounds (e.g. resolution change).
+    if let Some(target_uuid) = saved.display_uuid
+        && let Some(idx) = displays.iter().position(|d| d.uuid == Some(target_uuid))
+    {
+        return Some((idx, displays[idx].clamp_geometry(saved)));
+    }
+
+    // 5. Original monitor was disconnected: re-center cleanly on the primary display preserving size.
+    let primary_idx = displays.iter().position(|d| d.is_primary).unwrap_or(0);
+    Some((primary_idx, displays[primary_idx].center_geometry(saved)))
 }
 
 impl WindowGeometry {
@@ -249,6 +362,7 @@ mod tests {
                 width: 1440.0,
                 height: 900.0,
                 maximized: false,
+                display_uuid: None,
             }),
         };
 
@@ -271,7 +385,76 @@ mod tests {
             width: 100.0,
             height: 100.0,
             maximized: false,
+            display_uuid: None,
         };
         assert!(!bad_geom.is_valid());
+    }
+
+    #[test]
+    fn resolves_multi_monitor_restore_including_negative_secondary_and_disconnect() {
+        let id_primary = Uuid::from_u128(1);
+        let id_left = Uuid::from_u128(2);
+        let primary = DisplayArea {
+            uuid: Some(id_primary),
+            is_primary: true,
+            x: 0.0,
+            y: 0.0,
+            width: 1920.0,
+            height: 1080.0,
+            visible_x: 0.0,
+            visible_y: 0.0,
+            visible_width: 1920.0,
+            visible_height: 1040.0,
+        };
+        let left_monitor = DisplayArea {
+            uuid: Some(id_left),
+            is_primary: false,
+            x: -1920.0,
+            y: 0.0,
+            width: 1920.0,
+            height: 1080.0,
+            visible_x: -1920.0,
+            visible_y: 0.0,
+            visible_width: 1920.0,
+            visible_height: 1040.0,
+        };
+        let dual = [primary, left_monitor];
+
+        // Window closed on left secondary monitor (negative X), even without display_uuid saved.
+        let on_left = WindowGeometry {
+            x: -1700.0,
+            y: 90.0,
+            width: 1360.0,
+            height: 860.0,
+            maximized: false,
+            display_uuid: None,
+        };
+        let (idx, restored) = resolve_window_restore(on_left, &dual).unwrap();
+        assert_eq!(idx, 1);
+        assert_eq!(restored.x, -1700.0);
+        assert_eq!(restored.width, 1360.0);
+        assert_eq!(restored.height, 860.0);
+
+        // Maximized window shifted to left monitor whose normal rect still points to primary.
+        let max_on_left = WindowGeometry {
+            x: 180.0,
+            y: 80.0,
+            width: 1400.0,
+            height: 860.0,
+            maximized: true,
+            display_uuid: Some(id_left),
+        };
+        let (idx_max, restored_max) = resolve_window_restore(max_on_left, &dual).unwrap();
+        assert_eq!(idx_max, 1);
+        assert!(restored_max.maximized);
+        assert!(restored_max.x < 0.0);
+
+        // Secondary monitor unplugged: re-centers on primary keeping user's 1360x860 size.
+        let (idx_fb, restored_fb) = resolve_window_restore(on_left, &[primary]).unwrap();
+        assert_eq!(idx_fb, 0);
+        assert_eq!(restored_fb.width, 1360.0);
+        assert_eq!(restored_fb.height, 860.0);
+        assert_eq!(restored_fb.x, 280.0);
+        assert_eq!(restored_fb.y, 90.0);
     }
 }
