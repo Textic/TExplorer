@@ -7,6 +7,7 @@ license.workspace = true
 description = "Read-only NTFS Master File Table ($MFT) parser, live USN Journal tracker, compact in-RAM index, Everything-style query engine, and Named Pipe IPC protocol"
 
 [dependencies]
+rayon.workspace = true
 regex.workspace = true
 serde.workspace = true
 serde_json.workspace = true

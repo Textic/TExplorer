@@ -15,6 +15,7 @@ use texplorer_core::{Location, PaneSide, ViewMode};
 use crate::theme::{
     Palette, RADIUS_CONTROL, RADIUS_ROW, format_size, full_hit_input, soft_tint, solid,
 };
+use crate::ui::disk_analyzer::render_disk_analyzer;
 use crate::ui::views::{
     render_compact_view, render_details_view, render_grid_view, render_home_view,
 };
@@ -43,6 +44,8 @@ pub fn render_pane(
     let view_mode = model.view_mode;
     let show_hidden = model.show_hidden;
     let is_home = model.location == Location::Home;
+    let is_disk_analyzer = model.location == Location::DiskAnalyzer;
+    let is_special_view = is_home || is_disk_analyzer;
     let total_visible = model.filtered_indices.len();
     let selected_count = model.selection.len();
     let selected_bytes = model.selected_bytes;
@@ -165,6 +168,8 @@ pub fn render_pane(
 
     let body = if is_home {
         render_home_view(ws, side, cx).into_any_element()
+    } else if is_disk_analyzer {
+        render_disk_analyzer(ws, side, cx).into_any_element()
     } else {
         match view_mode {
             ViewMode::Details => render_details_view(ws, side, cx).into_any_element(),
@@ -280,7 +285,7 @@ pub fn render_pane(
                 // Breadcrumbs / Editable Address Input
                 .child(address_bar)
                 // Inline quick filter input (borderless inside single outer container)
-                .when(!is_home, |el| {
+                .when(!is_special_view, |el| {
                     el.child(
                         h_flex()
                             .w(px(186.))
@@ -341,7 +346,7 @@ pub fn render_pane(
                     )
                 })
                 // View mode segmented buttons & Hidden files toggle
-                .when(!is_home, |el| {
+                .when(!is_special_view, |el| {
                     el.child(
                         h_flex()
                             .flex_shrink_0()
@@ -418,7 +423,7 @@ pub fn render_pane(
         // Main scrollable / virtualized body
         .child(div().flex_1().min_h_0().w_full().overflow_hidden().child(body))
         // Compact inline pane footer (only for directory views or error states)
-        .when(!is_home || pane_error.is_some(), |el| {
+        .when(!is_special_view || pane_error.is_some(), |el| {
             let summary: SharedString = if let Some(err) = pane_error {
                 err.into()
             } else if is_loading {

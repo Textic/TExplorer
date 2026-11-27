@@ -17,7 +17,7 @@ use texplorer_core::{FileEntry, Location};
 /// volume and quick-access cards instead of tabular file rows.
 pub fn list_location(location: &Location) -> Result<Vec<FileEntry>, String> {
     match location {
-        Location::Home => Ok(Vec::new()),
+        Location::Home | Location::DiskAnalyzer => Ok(Vec::new()),
         Location::Local(path) => local::list_local_dir(path),
         Location::Archive {
             archive_path,

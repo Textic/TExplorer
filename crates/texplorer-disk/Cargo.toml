@@ -1,0 +1,20 @@
+[package]
+name = "texplorer-disk"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Arena-backed disk space tree, squarified GPU treemap layout, and hybrid MFT/parallel filesystem scanner for TExplorer"
+
+[dependencies]
+bitflags.workspace = true
+rayon.workspace = true
+texplorer-core = { path = "../texplorer-core" }
+texplorer-mft = { path = "../texplorer-mft" }
+texplorer-platform = { path = "../texplorer-platform" }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+] }

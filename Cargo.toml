@@ -7,13 +7,14 @@ members = [
     "crates/texplorer-net",
     "crates/texplorer-ops",
     "crates/texplorer-mft",
+    "crates/texplorer-disk",
     "crates/texplorer-service",
     "crates/texplorer-app",
 ]
 default-members = ["crates/texplorer-app"]
 
 [workspace.package]
-version = "0.8.1"
+version = "0.9.0"
 edition = "2024"
 authors = ["Textic"]
 license = "MIT"

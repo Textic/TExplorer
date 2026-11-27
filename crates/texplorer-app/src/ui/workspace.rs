@@ -29,6 +29,9 @@ use texplorer_core::{
     SshAuthMode, TabModel, ThemePreset, ViewMode, VolumeInfo, WindowGeometry, join_remote_path,
     normalize_remote_path, normalize_smb_share_path, parse_network_uri, sort_entries,
 };
+use texplorer_disk::{
+    DiskScanEvent, DiskScanTarget, DiskSortColumn, NodeId, spawn_disk_scan,
+};
 use texplorer_mft::{
     IndexServiceInstallState, IndexServiceStatus, install_service_elevated,
     query_live_service_status, query_service_install_state, rebuild_index_via_service,
@@ -80,6 +83,7 @@ use crate::ui::command_palette::{
     render_command_palette_modal,
 };
 use crate::ui::context_menu::{ContextMenuState, ContextMenuTarget, render_context_menu};
+use crate::ui::disk_analyzer::{DiskAnalyzerState, DiskAnalyzerTab, DiskTrashConfirm};
 use crate::ui::global_search::{GlobalSearchState, render_global_search_modal};
 use crate::ui::header::render_header;
 use crate::ui::inspector::{HashInspectState, render_inspector};
@@ -260,6 +264,17 @@ enum BgEvent {
     P2pPickedSendPaths(Result<Vec<PathBuf>, String>),
     P2pPickedDestDir(Result<Option<PathBuf>, String>),
     NetworkPickedKeyPath(Result<Vec<PathBuf>, String>),
+    DiskScan {
+        generation: u64,
+        event: DiskScanEvent,
+    },
+    DiskPickedFolder(Result<Option<PathBuf>, String>),
+    DiskTrashFinished {
+        node_id: NodeId,
+        path: PathBuf,
+        name: String,
+        result: Result<(), String>,
+    },
     P2p(P2pEvent),
     NativeDrop(NativeDropEvent),
 }
@@ -447,6 +462,7 @@ pub struct Workspace {
     pub active_p2p_share: Option<ActiveP2pShare>,
     pub incoming_p2p_offers: Vec<IncomingP2pOffer>,
     pub active_p2p_transfers: Vec<ActiveP2pTransferUi>,
+    pub disk_analyzer: DiskAnalyzerState,
     bg_tx: UnboundedSender<BgEvent>,
 }
 
@@ -521,6 +537,7 @@ impl Workspace {
         let window_bounds_sub = cx.observe_window_bounds(window, |this, window, cx| {
             this.capture_window_geometry(window, Some(cx));
         });
+        let disk_analyzer = DiskAnalyzerState::new(window, cx);
 
         let mut ws = Self {
             focus_handle: cx.focus_handle(),
@@ -596,6 +613,7 @@ impl Workspace {
             active_p2p_share: None,
             incoming_p2p_offers: Vec::new(),
             active_p2p_transfers: Vec::new(),
+            disk_analyzer,
             bg_tx,
         };
 
@@ -1603,6 +1621,107 @@ impl Workspace {
                     }
                 }
             },
+            BgEvent::DiskScan { generation, event } => {
+                if generation != self.disk_analyzer.scan_generation {
+                    return;
+                }
+                match event {
+                    DiskScanEvent::Progress(prog) => {
+                        self.disk_analyzer.progress = Some(prog);
+                        cx.notify();
+                    }
+                    DiskScanEvent::Finished { tree, elapsed_ms } => {
+                        let root_id = tree.root;
+                        self.disk_analyzer.scanning = false;
+                        self.disk_analyzer.progress = None;
+                        self.disk_analyzer.error = None;
+                        self.disk_analyzer.elapsed_ms = elapsed_ms;
+                        self.disk_analyzer.tree = Some(tree);
+                        self.disk_analyzer.tree_version =
+                            self.disk_analyzer.tree_version.wrapping_add(1);
+                        self.disk_analyzer.expanded.clear();
+                        self.disk_analyzer.expanded.insert(root_id);
+                        self.disk_analyzer.selected_node = Some(root_id);
+                        self.disk_analyzer.treemap_root = Some(root_id);
+                        self.disk_analyzer.treemap_hovered = None;
+                        self.disk_analyzer.list_hovered = None;
+                        self.disk_analyzer.confirm_trash = None;
+                        let show_hidden = self.settings.show_hidden_files;
+                        self.disk_analyzer.rebuild_views(show_hidden);
+                        cx.notify();
+                    }
+                    DiskScanEvent::Cancelled => {
+                        self.disk_analyzer.scanning = false;
+                        self.disk_analyzer.progress = None;
+                        cx.notify();
+                    }
+                    DiskScanEvent::Failed(err) => {
+                        self.disk_analyzer.scanning = false;
+                        self.disk_analyzer.progress = None;
+                        self.disk_analyzer.error = Some(err.clone());
+                        self.show_toast(err, ToastKind::Error, window, cx);
+                        cx.notify();
+                    }
+                }
+            }
+            BgEvent::DiskPickedFolder(res) => match res {
+                Ok(Some(folder)) => {
+                    self.start_disk_scan(DiskScanTarget::Folder(folder), cx);
+                }
+                Ok(None) => {}
+                Err(err) => {
+                    self.show_toast(err, ToastKind::Error, window, cx);
+                }
+            },
+            BgEvent::DiskTrashFinished {
+                node_id,
+                path,
+                name,
+                result,
+            } => {
+                self.disk_analyzer.trashing = false;
+                self.disk_analyzer.confirm_trash = None;
+                match result {
+                    Ok(()) => {
+                        if let Some(ref mut tree_arc) = self.disk_analyzer.tree {
+                            let tree_mut = Arc::make_mut(tree_arc);
+                            tree_mut.remove_subtree_soft(node_id);
+                            self.disk_analyzer.tree_version =
+                                self.disk_analyzer.tree_version.wrapping_add(1);
+                            if self.disk_analyzer.selected_node == Some(node_id) {
+                                self.disk_analyzer.selected_node = Some(tree_mut.root);
+                            }
+                            if self.disk_analyzer.treemap_root == Some(node_id) {
+                                self.disk_analyzer.treemap_root = Some(tree_mut.root);
+                            }
+                        }
+                        self.disk_analyzer.treemap_hovered = None;
+                        self.disk_analyzer.list_hovered = None;
+                        let show_hidden = self.settings.show_hidden_files;
+                        self.disk_analyzer.rebuild_views(show_hidden);
+                        if let Some(parent) = path.parent() {
+                            self.mark_fresh_disk_sizes(parent);
+                            self.invalidate_folder_sizes_under(parent);
+                            self.refresh_panes_showing(parent, cx);
+                        }
+                        self.show_toast(
+                            format!("Moved \"{name}\" to Recycle Bin"),
+                            ToastKind::Success,
+                            window,
+                            cx,
+                        );
+                    }
+                    Err(err) => {
+                        self.show_toast(
+                            format!("Failed moving \"{name}\" to Recycle Bin: {err}"),
+                            ToastKind::Error,
+                            window,
+                            cx,
+                        );
+                    }
+                }
+                cx.notify();
+            }
         }
     }
 
@@ -2324,13 +2443,11 @@ impl Workspace {
         let Some(tab_id) = self.active_tab().map(|t| t.model.id) else {
             return;
         };
-        if self
-            .active_tab()
-            .is_some_and(|t| t.model.pane(side).location == Location::Home)
-        {
-            self.refresh_volumes(cx);
-        } else {
-            self.reload_pane_by_id(tab_id, side, cx);
+        let loc = self.active_tab().map(|t| t.model.pane(side).location.clone());
+        match loc {
+            Some(Location::Home) => self.refresh_volumes(cx),
+            Some(Location::DiskAnalyzer) => self.rescan_disk_analyzer(cx),
+            _ => self.reload_pane_by_id(tab_id, side, cx),
         }
     }
 
@@ -2348,7 +2465,7 @@ impl Workspace {
         let location = pane.location.clone();
         let sort = pane.sort;
 
-        if location == Location::Home {
+        if matches!(location, Location::Home | Location::DiskAnalyzer) {
             pane.entries.clear();
             pane.filtered_indices.clear();
             pane.selection.clear();
@@ -7285,8 +7402,472 @@ async fn smol_sleep(duration: Duration) {
     let _ = rx.await;
 }
 
+impl Workspace {
+    /// Opens the built-in Disk Space Analyzer view and optionally starts scanning `target`.
+    pub fn open_disk_analyzer(
+        &mut self,
+        target: Option<DiskScanTarget>,
+        open_in_new_tab: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(existing_idx) = self.tabs.iter().position(|t| {
+            t.model.left.location == Location::DiskAnalyzer
+                || t.model
+                    .right
+                    .as_ref()
+                    .is_some_and(|r| r.location == Location::DiskAnalyzer)
+        }) {
+            self.select_tab(existing_idx, window, cx);
+            if let Some(tab) = self.tabs.get_mut(existing_idx) {
+                if tab.model.left.location == Location::DiskAnalyzer {
+                    tab.model.active_pane = PaneSide::Left;
+                } else if tab.model.split_enabled
+                    && tab
+                        .model
+                        .right
+                        .as_ref()
+                        .is_some_and(|r| r.location == Location::DiskAnalyzer)
+                {
+                    tab.model.active_pane = PaneSide::Right;
+                }
+            }
+        } else if open_in_new_tab && self.settings.show_tabs {
+            self.open_new_tab(Location::DiskAnalyzer, window, cx);
+        } else {
+            self.navigate_active_pane(Location::DiskAnalyzer, window, cx);
+        }
+
+        if let Some(scan_target) = target {
+            self.start_disk_scan(scan_target, cx);
+        }
+        cx.notify();
+    }
+
+    /// Opens Disk Space Analyzer targeting the currently active local folder (or volume root).
+    pub fn open_disk_analyzer_for_active_folder(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let local_path = self
+            .active_tab()
+            .and_then(|t| t.model.active_pane_ref().location.as_local_path())
+            .map(Path::to_path_buf);
+
+        let target = local_path.map(|path| {
+            if let Some(vol) = self.volumes.iter().find(|v| v.root_path == path) {
+                DiskScanTarget::Volume(vol.clone())
+            } else {
+                DiskScanTarget::Folder(path)
+            }
+        });
+        self.open_disk_analyzer(target, self.settings.show_tabs, window, cx);
+    }
+
+    /// Starts (or restarts) a background disk space analysis for `target`.
+    pub fn start_disk_scan(&mut self, target: DiskScanTarget, cx: &mut Context<Self>) {
+        self.disk_analyzer.cancel.store(true, Ordering::Relaxed);
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.disk_analyzer.cancel = Arc::clone(&cancel);
+        self.disk_analyzer.scan_generation = self.disk_analyzer.scan_generation.wrapping_add(1);
+        let generation = self.disk_analyzer.scan_generation;
+
+        self.disk_analyzer.target = Some(target.clone());
+        self.disk_analyzer.scanning = true;
+        self.disk_analyzer.progress = None;
+        self.disk_analyzer.error = None;
+        self.disk_analyzer.confirm_trash = None;
+
+        let volumes = self.volumes.clone();
+        let tx = self.bg_tx.clone();
+        spawn_disk_scan(target, volumes, cancel, move |event| {
+            let _ = tx.unbounded_send(BgEvent::DiskScan { generation, event });
+        });
+        cx.notify();
+    }
+
+    pub fn rescan_disk_analyzer(&mut self, cx: &mut Context<Self>) {
+        if let Some(target) = self.disk_analyzer.target.clone() {
+            self.start_disk_scan(target, cx);
+        }
+    }
+
+    pub fn cancel_disk_scan(&mut self, cx: &mut Context<Self>) {
+        self.disk_analyzer.cancel.store(true, Ordering::Relaxed);
+        self.disk_analyzer.scanning = false;
+        self.disk_analyzer.progress = None;
+        cx.notify();
+    }
+
+    pub fn pick_disk_analyzer_folder(&mut self, cx: &mut Context<Self>) {
+        let initial_dir = match &self.disk_analyzer.target {
+            Some(DiskScanTarget::Folder(p)) => Some(p.clone()),
+            Some(DiskScanTarget::Volume(v)) => Some(v.root_path.clone()),
+            _ => None,
+        };
+        let tx = self.bg_tx.clone();
+        tokio_runtime().spawn(async move {
+            let res = tokio::task::spawn_blocking(move || {
+                pick_folder_dialog("Select Folder to Analyze", initial_dir.as_deref())
+            })
+            .await
+            .unwrap_or_else(|e| Err(format!("Folder picker failed: {e}")));
+            let _ = tx.unbounded_send(BgEvent::DiskPickedFolder(res));
+        });
+        cx.notify();
+    }
+
+    pub fn set_disk_analyzer_tab(&mut self, tab: DiskAnalyzerTab, cx: &mut Context<Self>) {
+        if self.disk_analyzer.active_tab != tab {
+            self.disk_analyzer.active_tab = tab;
+            cx.notify();
+        }
+    }
+
+    pub fn set_disk_sort_column(&mut self, col: DiskSortColumn, cx: &mut Context<Self>) {
+        if self.disk_analyzer.sort.column == col {
+            self.disk_analyzer.sort.descending = !self.disk_analyzer.sort.descending;
+        } else {
+            self.disk_analyzer.sort.column = col;
+            self.disk_analyzer.sort.descending = col != DiskSortColumn::Name;
+        }
+        let show_hidden = self.settings.show_hidden_files;
+        self.disk_analyzer.rebuild_views(show_hidden);
+        cx.notify();
+    }
+
+    pub fn toggle_disk_treemap(&mut self, cx: &mut Context<Self>) {
+        self.disk_analyzer.show_treemap = !self.disk_analyzer.show_treemap;
+        cx.notify();
+    }
+
+    pub fn toggle_disk_denied_only(&mut self, cx: &mut Context<Self>) {
+        self.disk_analyzer.denied_only = !self.disk_analyzer.denied_only;
+        let show_hidden = self.settings.show_hidden_files;
+        self.disk_analyzer.rebuild_views(show_hidden);
+        cx.notify();
+    }
+
+    pub fn set_disk_ext_filter(
+        &mut self,
+        ext: Option<String>,
+        switch_to_files: bool,
+        cx: &mut Context<Self>,
+    ) {
+        self.disk_analyzer.ext_filter = ext;
+        if switch_to_files {
+            self.disk_analyzer.active_tab = DiskAnalyzerTab::TopFiles;
+        }
+        let show_hidden = self.settings.show_hidden_files;
+        self.disk_analyzer.rebuild_views(show_hidden);
+        cx.notify();
+    }
+
+    pub fn clear_disk_filter(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.disk_analyzer.filter_query.clear();
+        let input = self.disk_analyzer.filter_input.clone();
+        input.update(cx, |s, cx| s.set_value("", window, cx));
+        let show_hidden = self.settings.show_hidden_files;
+        self.disk_analyzer.rebuild_views(show_hidden);
+        cx.notify();
+    }
+
+    pub fn toggle_disk_node_expand(&mut self, id: NodeId, cx: &mut Context<Self>) {
+        if !self.disk_analyzer.expanded.remove(&id) {
+            self.disk_analyzer.expanded.insert(id);
+        }
+        let show_hidden = self.settings.show_hidden_files;
+        self.disk_analyzer.rebuild_views(show_hidden);
+        cx.notify();
+    }
+
+    pub fn select_disk_node(
+        &mut self,
+        id: NodeId,
+        reveal_in_tree: bool,
+        cx: &mut Context<Self>,
+    ) {
+        self.disk_analyzer.selected_node = Some(id);
+        self.disk_analyzer.confirm_trash = None;
+        if reveal_in_tree {
+            self.disk_analyzer.expand_ancestors_of(id);
+            let show_hidden = self.settings.show_hidden_files;
+            self.disk_analyzer.rebuild_views(show_hidden);
+            if let Some(pos) = self
+                .disk_analyzer
+                .visible_rows
+                .iter()
+                .position(|r| r.id == id)
+            {
+                self.disk_analyzer
+                    .tree_scroll
+                    .scroll_to_item(pos, ScrollStrategy::Center);
+            }
+        }
+        cx.notify();
+    }
+
+    pub fn set_disk_list_hovered(&mut self, id: Option<NodeId>, cx: &mut Context<Self>) {
+        if self.disk_analyzer.list_hovered != id {
+            self.disk_analyzer.list_hovered = id;
+            cx.notify();
+        }
+    }
+
+    pub fn set_disk_treemap_root(&mut self, id: NodeId, cx: &mut Context<Self>) {
+        let Some(tree) = &self.disk_analyzer.tree else {
+            return;
+        };
+        let target_dir = match tree.get(id) {
+            Some(n) if n.is_dir() => id,
+            Some(n) => n.parent.unwrap_or(tree.root),
+            None => tree.root,
+        };
+        self.disk_analyzer.treemap_root = Some(target_dir);
+        self.disk_analyzer.treemap_hovered = None;
+        cx.notify();
+    }
+
+    pub fn disk_treemap_zoom_up(&mut self, cx: &mut Context<Self>) {
+        let Some(tree) = &self.disk_analyzer.tree else {
+            return;
+        };
+        let cur = self.disk_analyzer.treemap_root.unwrap_or(tree.root);
+        if cur != tree.root
+            && let Some(parent) = tree.get(cur).and_then(|n| n.parent)
+        {
+            self.disk_analyzer.treemap_root = Some(parent);
+            self.disk_analyzer.treemap_hovered = None;
+            cx.notify();
+        }
+    }
+
+    pub fn handle_disk_treemap_hover(&mut self, pos: Point<Pixels>, cx: &mut Context<Self>) {
+        let hit = {
+            let cache = self.disk_analyzer.treemap_cache.borrow();
+            let lx = f32::from(pos.x) - f32::from(cache.origin.x);
+            let ly = f32::from(pos.y) - f32::from(cache.origin.y);
+            cache.layout.hit_test(lx, ly)
+        };
+        if self.disk_analyzer.treemap_hovered != hit {
+            self.disk_analyzer.treemap_hovered = hit;
+            cx.notify();
+        }
+    }
+
+    pub fn clear_disk_treemap_hover(&mut self, cx: &mut Context<Self>) {
+        if self.disk_analyzer.treemap_hovered.is_some() {
+            self.disk_analyzer.treemap_hovered = None;
+            cx.notify();
+        }
+    }
+
+    pub fn handle_disk_treemap_click(
+        &mut self,
+        pos: Point<Pixels>,
+        click_count: usize,
+        cx: &mut Context<Self>,
+    ) {
+        let hit = {
+            let cache = self.disk_analyzer.treemap_cache.borrow();
+            let lx = f32::from(pos.x) - f32::from(cache.origin.x);
+            let ly = f32::from(pos.y) - f32::from(cache.origin.y);
+            cache.layout.hit_test(lx, ly)
+        };
+        let Some(nid) = hit else {
+            return;
+        };
+        if click_count >= 2 {
+            self.set_disk_treemap_root(nid, cx);
+            self.select_disk_node(nid, true, cx);
+        } else {
+            self.select_disk_node(nid, true, cx);
+        }
+    }
+
+    pub fn handle_disk_treemap_right_click(&mut self, pos: Point<Pixels>, cx: &mut Context<Self>) {
+        let hit = {
+            let cache = self.disk_analyzer.treemap_cache.borrow();
+            let lx = f32::from(pos.x) - f32::from(cache.origin.x);
+            let ly = f32::from(pos.y) - f32::from(cache.origin.y);
+            cache.layout.hit_test(lx, ly)
+        };
+        if let Some(nid) = hit {
+            self.open_disk_node_context_menu(nid, pos, cx);
+        } else {
+            self.disk_treemap_zoom_up(cx);
+        }
+    }
+
+    pub fn open_disk_node_context_menu(
+        &mut self,
+        node_id: NodeId,
+        pos: Point<Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(tree) = &self.disk_analyzer.tree else {
+            return;
+        };
+        let Some(node) = tree.get(node_id) else {
+            return;
+        };
+        let is_dir = node.is_dir();
+        let path = tree.full_path(node_id);
+        let root_id = tree.root;
+        let current_tm_root = self.disk_analyzer.treemap_root.unwrap_or(root_id);
+        let can_zoom_in = is_dir && node_id != current_tm_root;
+        let can_zoom_out = current_tm_root != root_id;
+        let can_delete = node_id != root_id && path.is_some();
+
+        self.disk_analyzer.selected_node = Some(node_id);
+        self.open_context_menu(
+            pos,
+            ContextMenuTarget::DiskNode {
+                node_id,
+                path,
+                is_dir,
+                can_zoom_in,
+                can_zoom_out,
+                can_delete,
+            },
+            cx,
+        );
+    }
+
+    pub fn reveal_disk_node_in_explorer(
+        &mut self,
+        id: NodeId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(tree) = &self.disk_analyzer.tree else {
+            return;
+        };
+        let Some(path) = tree.full_path(id) else {
+            return;
+        };
+        let is_dir = tree.get(id).is_some_and(|n| n.is_dir());
+
+        if is_dir {
+            let target = Location::local(path);
+            if self.settings.show_tabs {
+                self.open_new_tab(target, window, cx);
+            } else {
+                self.navigate_active_pane(target, window, cx);
+            }
+        } else {
+            let file_name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned());
+            let parent = path
+                .parent()
+                .map(Location::local)
+                .unwrap_or(Location::Home);
+            if self.settings.show_tabs {
+                self.open_tab_with_selection(parent, file_name, window, cx);
+            } else {
+                if let Some(tab) = self.active_tab_mut() {
+                    tab.model.active_pane_mut().pending_select_name = file_name;
+                }
+                self.navigate_active_pane(parent, window, cx);
+            }
+        }
+    }
+
+    pub fn open_disk_node_item(
+        &mut self,
+        id: NodeId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(tree) = &self.disk_analyzer.tree else {
+            return;
+        };
+        let Some(path) = tree.full_path(id) else {
+            return;
+        };
+        let is_dir = tree.get(id).is_some_and(|n| n.is_dir());
+        if is_dir {
+            self.reveal_disk_node_in_explorer(id, window, cx);
+        } else if let Err(err) = open_item(&path) {
+            self.show_toast(err, ToastKind::Error, window, cx);
+        }
+    }
+
+    pub fn copy_disk_node_path(&mut self, id: NodeId, cx: &mut Context<Self>) {
+        let Some(path) = self
+            .disk_analyzer
+            .tree
+            .as_ref()
+            .and_then(|t| t.full_path(id))
+        else {
+            return;
+        };
+        self.copy_text_to_clipboard(&path.display().to_string(), "Path copied", cx);
+    }
+
+    pub fn prompt_trash_disk_node(&mut self, id: NodeId, cx: &mut Context<Self>) {
+        let Some(tree) = &self.disk_analyzer.tree else {
+            return;
+        };
+        if id == tree.root {
+            return;
+        }
+        let Some(node) = tree.get(id) else {
+            return;
+        };
+        let Some(path) = tree.full_path(id) else {
+            return;
+        };
+        self.disk_analyzer.confirm_trash = Some(DiskTrashConfirm {
+            node_id: id,
+            path,
+            name: node.name.to_string(),
+            is_dir: node.is_dir(),
+            size_bytes: node.logical_size,
+        });
+        cx.notify();
+    }
+
+    pub fn cancel_trash_disk_node(&mut self, cx: &mut Context<Self>) {
+        if !self.disk_analyzer.trashing {
+            self.disk_analyzer.confirm_trash = None;
+            cx.notify();
+        }
+    }
+
+    pub fn confirm_trash_disk_node(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        let Some(confirm) = self.disk_analyzer.confirm_trash.clone() else {
+            return;
+        };
+        if self.disk_analyzer.trashing {
+            return;
+        }
+        self.disk_analyzer.trashing = true;
+        let tx = self.bg_tx.clone();
+        let node_id = confirm.node_id;
+        let path = confirm.path.clone();
+        let name = confirm.name.clone();
+        tokio_runtime().spawn(async move {
+            let path_for_trash = path.clone();
+            let result = tokio::task::spawn_blocking(move || move_to_trash(&[path_for_trash]))
+                .await
+                .unwrap_or_else(|e| Err(format!("Recycle Bin task panicked: {e}")));
+            let _ = tx.unbounded_send(BgEvent::DiskTrashFinished {
+                node_id,
+                path,
+                name,
+                result,
+            });
+        });
+        cx.notify();
+    }
+}
+
 impl Drop for Workspace {
     fn drop(&mut self) {
+        self.disk_analyzer.cancel.store(true, Ordering::Relaxed);
         self.persist_session_snapshot();
     }
 }

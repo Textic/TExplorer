@@ -1,13 +1,13 @@
 //! Compact in-RAM multi-volume NTFS index with live USN incremental updates,
 //! fast Everything-style search, and O(1) folder size lookup.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
 use crate::mft_raw::{MergedMftEntry, NTFS_ROOT_RECORD_ID};
 use crate::protocol::{
-    FLAG_IS_DIR, FLAG_IS_SYMLINK, FolderSizeEntry, IndexServiceStatus, IndexedVolumeStatus,
-    SearchHit, SearchResponse,
+    ExportedMftNode, FLAG_IS_DIR, FLAG_IS_SYMLINK, FolderSizeEntry, IndexServiceStatus,
+    IndexedVolumeStatus, SearchHit, SearchResponse,
 };
 use crate::query::{ParsedQuery, QueryCandidate, parse_query};
 use crate::usn::UsnDelta;
@@ -478,6 +478,104 @@ impl VolumeIndex {
             }
         }
     }
+
+    /// Exports the full volume (or a resolved subdirectory subtree) in topological DFS order so
+    /// Disk Space Analyzer can reconstruct its arena tree in linear `O(N)` time without needing
+    /// direct `$MFT` privileges. Every node's `parent_idx` strictly precedes its own stream index.
+    pub fn export_dfs_nodes_from(
+        &self,
+        start_ref: u64,
+        root_label: String,
+        cluster_size: u64,
+    ) -> Vec<ExportedMftNode> {
+        let cluster = cluster_size.max(512);
+        let est_cap = if start_ref == NTFS_ROOT_RECORD_ID {
+            self.nodes.len()
+        } else {
+            self.dir_sizes
+                .get(&start_ref)
+                .map(|s| (s.files + s.folders + 1) as usize)
+                .unwrap_or(256)
+                .min(self.nodes.len())
+        };
+        let mut out = Vec::with_capacity(est_cap);
+        let mut visited: HashSet<u64> = HashSet::with_capacity(est_cap);
+
+        let root_modified = self
+            .nodes
+            .get(&start_ref)
+            .map(|n| n.modified_secs)
+            .unwrap_or(0);
+        visited.insert(start_ref);
+        out.push(ExportedMftNode {
+            parent_idx: u32::MAX,
+            logical_size: 0,
+            allocated_size: 0,
+            modified_secs: root_modified,
+            flags: FLAG_IS_DIR,
+            name: root_label,
+        });
+
+        let mut stack: Vec<(u64, u32, u16)> = vec![(start_ref, 0, 0)];
+        while let Some((dir_ref, parent_stream_idx, depth)) = stack.pop() {
+            if depth >= 128 {
+                continue;
+            }
+            let Some(kids) = self.children.get(&dir_ref) else {
+                continue;
+            };
+            for &kid_ref in kids {
+                if !visited.insert(kid_ref) {
+                    continue;
+                }
+                let Some(node) = self.nodes.get(&kid_ref) else {
+                    continue;
+                };
+                let name = self.node_name(node);
+                if name.is_empty() {
+                    continue;
+                }
+                let is_dir = node.is_dir();
+                let is_symlink = node.is_symlink();
+                let (logical_size, allocated_size) = if is_dir || is_symlink || node.size == 0 {
+                    (0, 0)
+                } else {
+                    let rem = node.size % cluster;
+                    let alloc = if rem == 0 {
+                        node.size
+                    } else {
+                        node.size.saturating_add(cluster - rem)
+                    };
+                    (node.size, alloc)
+                };
+
+                let stream_idx = out.len() as u32;
+                out.push(ExportedMftNode {
+                    parent_idx: parent_stream_idx,
+                    logical_size,
+                    allocated_size,
+                    modified_secs: node.modified_secs,
+                    flags: node.flags,
+                    name: name.to_string(),
+                });
+
+                if is_dir && !is_symlink {
+                    stack.push((kid_ref, stream_idx, depth + 1));
+                }
+            }
+        }
+
+        out
+    }
+
+    /// Exports the full in-RAM volume hierarchy from NTFS root `#5`.
+    pub fn export_dfs_nodes(&self, cluster_size: u64) -> Vec<ExportedMftNode> {
+        self.export_dfs_nodes_from(
+            NTFS_ROOT_RECORD_ID,
+            format!("{}:\\", self.drive_letter),
+            cluster_size,
+        )
+    }
 }
 
 /// Multi-volume RAM index managed by `texplorer-service`.
@@ -607,6 +705,42 @@ impl MultiVolumeIndex {
             })
             .collect()
     }
+
+    /// Exports an indexed NTFS volume (or a scoped subfolder subtree) in DFS stream order.
+    pub fn export_volume_tree(
+        &self,
+        drive_letter: char,
+        scope_path: Option<&str>,
+        cluster_size: u64,
+    ) -> Result<Vec<ExportedMftNode>, String> {
+        let upper = drive_letter.to_ascii_uppercase();
+        let Some(vol) = self.volumes.get(&upper) else {
+            if !self.ready && self.indexing {
+                return Err("NTFS MFT index is still initializing...".to_string());
+            }
+            return Err(format!("Volume {upper}: is not in the MFT index."));
+        };
+        if let Some(scope) = scope_path
+            && !scope.trim().is_empty()
+        {
+            let start_ref = vol
+                .resolve_path_to_ref(scope)
+                .ok_or_else(|| format!("Folder \"{scope}\" was not found in MFT index."))?;
+            let Some(node) = vol.nodes.get(&start_ref) else {
+                return Err(format!("Folder \"{scope}\" is missing in MFT index."));
+            };
+            if !node.is_dir() || node.is_symlink() {
+                return Err(format!("Path \"{scope}\" is not a direct NTFS directory."));
+            }
+            let root_label = if start_ref == NTFS_ROOT_RECORD_ID {
+                format!("{upper}:\\")
+            } else {
+                vol.node_name(node).to_string()
+            };
+            return Ok(vol.export_dfs_nodes_from(start_ref, root_label, cluster_size));
+        }
+        Ok(vol.export_dfs_nodes(cluster_size))
+    }
 }
 
 #[cfg(test)]
@@ -685,5 +819,20 @@ mod tests {
         let res = multi.search("ext:rs size:>1kb", Some(r"X:\Projects"), 50);
         assert_eq!(res.hits.len(), 2);
         assert!(res.from_mft);
+
+        let exported = multi.export_volume_tree('x', None, 4096).unwrap();
+        assert_eq!(exported[0].parent_idx, u32::MAX);
+        assert_eq!(exported[0].name, r"X:\");
+        assert!(exported.len() >= 4);
+        for (idx, node) in exported.iter().enumerate().skip(1) {
+            assert!((node.parent_idx as usize) < idx);
+        }
+
+        let scoped = multi
+            .export_volume_tree('x', Some(r"X:\Projects\TExplorer"), 4096)
+            .unwrap();
+        assert_eq!(scoped[0].parent_idx, u32::MAX);
+        assert_eq!(scoped[0].name, "TExplorer");
+        assert_eq!(scoped.len(), 3);
     }
 }

@@ -20,6 +20,8 @@ use crate::ui::workspace::Workspace;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PaletteCommand {
     GlobalSearch,
+    OpenDiskAnalyzer,
+    AnalyzeActiveFolder,
     BulkRename,
     QuickLook,
     ComputeChecksums,
@@ -75,6 +77,22 @@ pub fn all_palette_items() -> Vec<PaletteItem> {
             shortcut: Some("Ctrl+K"),
             icon: LucideIcon::Search,
             cmd: PaletteCommand::GlobalSearch,
+        },
+        PaletteItem {
+            id: "cp-disk-analyzer",
+            category: "Tools",
+            title: "Open Disk Space Analyzer",
+            shortcut: None,
+            icon: LucideIcon::HardDrive,
+            cmd: PaletteCommand::OpenDiskAnalyzer,
+        },
+        PaletteItem {
+            id: "cp-analyze-active-folder",
+            category: "Tools",
+            title: "Analyze Active Folder Space",
+            shortcut: None,
+            icon: LucideIcon::HardDrive,
+            cmd: PaletteCommand::AnalyzeActiveFolder,
         },
         PaletteItem {
             id: "cp-bulk-rename",
@@ -364,6 +382,10 @@ pub fn execute_palette_command(
 
     match cmd {
         PaletteCommand::GlobalSearch => ws.open_global_search(window, cx),
+        PaletteCommand::OpenDiskAnalyzer => {
+            ws.open_disk_analyzer(None, ws.settings.show_tabs, window, cx);
+        }
+        PaletteCommand::AnalyzeActiveFolder => ws.open_disk_analyzer_for_active_folder(window, cx),
         PaletteCommand::BulkRename => ws.open_bulk_rename_for_pane(side, window, cx),
         PaletteCommand::QuickLook => ws.toggle_quicklook(cx),
         PaletteCommand::ComputeChecksums => ws.compute_checksums_for_selection(cx),

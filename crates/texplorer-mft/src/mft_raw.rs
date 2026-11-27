@@ -596,15 +596,23 @@ pub fn scan_volume_mft_entries(
             }
 
             let usable = ((got as usize) / record_size) * record_size;
-            for chunk in buf[..usable].chunks_exact_mut(record_size) {
-                let rec_id = current_record_id;
-                current_record_id += 1;
-                if !apply_usa_fixup(chunk, bytes_per_sector) {
-                    continue;
-                }
-                if let Some(parsed) = parse_mft_record(chunk, rec_id) {
-                    parsed_records.push(parsed);
-                }
+            let base_rec_id = current_record_id;
+            let count_in_batch = (usable / record_size) as u64;
+            current_record_id += count_in_batch;
+
+            {
+                use rayon::prelude::*;
+                let batch_parsed: Vec<ParsedMftRecord> = buf[..usable]
+                    .par_chunks_exact_mut(record_size)
+                    .enumerate()
+                    .filter_map(|(i, chunk)| {
+                        if !apply_usa_fixup(chunk, bytes_per_sector) {
+                            return None;
+                        }
+                        parse_mft_record(chunk, base_rec_id + i as u64)
+                    })
+                    .collect();
+                parsed_records.extend(batch_parsed);
             }
 
             disk_offset += usable as u64;

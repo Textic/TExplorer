@@ -100,6 +100,7 @@ pub fn render_header(
                             Location::Home => LucideIcon::House,
                             Location::Archive { .. } => LucideIcon::FileArchive,
                             Location::Search { .. } => LucideIcon::Search,
+                            Location::DiskAnalyzer => LucideIcon::HardDrive,
                             _ => LucideIcon::Folder,
                         };
 
