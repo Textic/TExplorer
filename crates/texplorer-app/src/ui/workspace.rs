@@ -450,6 +450,7 @@ pub struct Workspace {
     type_ahead_buf: String,
     type_ahead_at: Instant,
     last_window_geometry: Option<WindowGeometry>,
+    last_window_title: String,
     pub marquee: Option<MarqueeSelection>,
     pub column_resize: Option<ColumnResizeState>,
     entry_claimed_mouse_down: bool,
@@ -601,6 +602,7 @@ impl Workspace {
             type_ahead_buf: String::new(),
             type_ahead_at: Instant::now() - Duration::from_secs(5),
             last_window_geometry: initial_window_geom,
+            last_window_title: "TExplorer".to_string(),
             marquee: None,
             column_resize: None,
             entry_claimed_mouse_down: false,
@@ -2199,6 +2201,24 @@ impl Workspace {
         };
         if geom.is_valid() {
             self.last_window_geometry = Some(geom);
+        }
+    }
+
+    fn sync_window_title(&mut self, window: &mut Window) {
+        let desired = match self.active_tab().map(|t| t.model.active_pane_ref().location.clone()) {
+            Some(Location::Home) | None => "TExplorer".to_string(),
+            Some(loc) => {
+                let tab_title = loc.tab_title();
+                if tab_title.is_empty() || tab_title.eq_ignore_ascii_case("Home") {
+                    "TExplorer".to_string()
+                } else {
+                    format!("TExplorer - {tab_title}")
+                }
+            }
+        };
+        if self.last_window_title != desired {
+            window.set_window_title(&desired);
+            self.last_window_title = desired;
         }
     }
 
@@ -7884,6 +7904,7 @@ impl Render for Workspace {
             let _ = window.drop_image(stale);
         }
         self.capture_window_geometry(window, Some(cx));
+        self.sync_window_title(window);
         let p = self.palette();
         let is_split = self.active_tab().is_some_and(|t| t.model.split_enabled);
 

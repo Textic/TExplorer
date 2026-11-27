@@ -296,7 +296,7 @@ fn main() {
                 window_bounds: Some(bounds),
                 display_id,
                 titlebar: Some(TitlebarOptions {
-                    title: None,
+                    title: Some("TExplorer".into()),
                     appears_transparent: true,
                     traffic_light_position: Some(point(px(9.), px(9.))),
                 }),
