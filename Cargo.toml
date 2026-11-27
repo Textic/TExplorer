@@ -13,7 +13,7 @@ members = [
 default-members = ["crates/texplorer-app"]
 
 [workspace.package]
-version = "0.7.2"
+version = "0.8.0"
 edition = "2024"
 authors = ["Textic"]
 license = "MIT"

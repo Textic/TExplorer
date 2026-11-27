@@ -34,6 +34,10 @@ pub enum NativeDropEvent {
         paths: Vec<PathBuf>,
         /// Temporary staging folder owned by TExplorer that should be deleted after transfer finishes.
         stage_dir: Option<PathBuf>,
+        /// `true` when this drop originated from TExplorer's own outbound `SHDoDragDrop` loop.
+        from_self_drag: bool,
+        /// `true` when the user held `Ctrl` at drop time (explicit copy intent).
+        ctrl_held: bool,
     },
 }
 
@@ -117,10 +121,10 @@ mod imp {
     use windows::Win32::System::DataExchange::RegisterClipboardFormatW;
     use windows::Win32::System::Memory::{GlobalLock, GlobalSize, GlobalUnlock};
     use windows::Win32::System::Ole::{
-        CF_HDROP, DROPEFFECT, DROPEFFECT_COPY, DROPEFFECT_NONE, IDropTarget, IDropTarget_Impl,
-        RegisterDragDrop, ReleaseStgMedium, RevokeDragDrop,
+        CF_HDROP, DROPEFFECT, DROPEFFECT_COPY, DROPEFFECT_MOVE, DROPEFFECT_NONE, IDropTarget,
+        IDropTarget_Impl, RegisterDragDrop, ReleaseStgMedium, RevokeDragDrop,
     };
-    use windows::Win32::System::SystemServices::MODIFIERKEYS_FLAGS;
+    use windows::Win32::System::SystemServices::{MK_CONTROL, MODIFIERKEYS_FLAGS};
     use windows::Win32::UI::Shell::{
         CLSID_DragDropHelper, DragQueryFileW, FD_ATTRIBUTES, FILEDESCRIPTORW, FILEGROUPDESCRIPTORW,
         HDROP, IDropTargetHelper,
@@ -187,7 +191,7 @@ mod imp {
         fn DragEnter(
             &self,
             pdataobj: Option<&IDataObject>,
-            _grfkeystate: MODIFIERKEYS_FLAGS,
+            grfkeystate: MODIFIERKEYS_FLAGS,
             pt: &POINTL,
             pdweffect: *mut DROPEFFECT,
         ) -> windows_core::Result<()> {
@@ -196,10 +200,14 @@ mod imp {
             };
             let can_accept = self.query_supported(data_obj);
             self.accepted.set(can_accept);
-            let effect = if can_accept {
-                DROPEFFECT_COPY
-            } else {
+            let ctrl_held = (grfkeystate.0 & MK_CONTROL.0) != 0;
+            let from_self = crate::ole_drag::is_outbound_drag_active();
+            let effect = if !can_accept {
                 DROPEFFECT_NONE
+            } else if from_self && !ctrl_held {
+                DROPEFFECT_MOVE
+            } else {
+                DROPEFFECT_COPY
             };
             if !pdweffect.is_null() {
                 unsafe {
@@ -221,15 +229,19 @@ mod imp {
 
         fn DragOver(
             &self,
-            _grfkeystate: MODIFIERKEYS_FLAGS,
+            grfkeystate: MODIFIERKEYS_FLAGS,
             pt: &POINTL,
             pdweffect: *mut DROPEFFECT,
         ) -> windows_core::Result<()> {
             let can_accept = self.accepted.get();
-            let effect = if can_accept {
-                DROPEFFECT_COPY
-            } else {
+            let ctrl_held = (grfkeystate.0 & MK_CONTROL.0) != 0;
+            let from_self = crate::ole_drag::is_outbound_drag_active();
+            let effect = if !can_accept {
                 DROPEFFECT_NONE
+            } else if from_self && !ctrl_held {
+                DROPEFFECT_MOVE
+            } else {
+                DROPEFFECT_COPY
             };
             if !pdweffect.is_null() {
                 unsafe {
@@ -263,11 +275,13 @@ mod imp {
         fn Drop(
             &self,
             pdataobj: Option<&IDataObject>,
-            _grfkeystate: MODIFIERKEYS_FLAGS,
+            grfkeystate: MODIFIERKEYS_FLAGS,
             pt: &POINTL,
             pdweffect: *mut DROPEFFECT,
         ) -> windows_core::Result<()> {
             let was_accepted = self.accepted.replace(false);
+            let from_self_drag = crate::ole_drag::is_outbound_drag_active();
+            let ctrl_held = (grfkeystate.0 & MK_CONTROL.0) != 0;
             let Some(data_obj) = pdataobj else {
                 return Err(Error::from(E_INVALIDARG));
             };
@@ -299,10 +313,12 @@ mod imp {
                 }
             });
 
-            let effect = if extracted.is_some() {
-                DROPEFFECT_COPY
-            } else {
+            let effect = if extracted.is_none() {
                 DROPEFFECT_NONE
+            } else if from_self_drag && !ctrl_held {
+                DROPEFFECT_MOVE
+            } else {
+                DROPEFFECT_COPY
             };
             if !pdweffect.is_null() {
                 unsafe {
@@ -322,6 +338,8 @@ mod imp {
                     client_y,
                     paths,
                     stage_dir,
+                    from_self_drag,
+                    ctrl_held,
                 });
             } else {
                 (self.on_event)(NativeDropEvent::Left);

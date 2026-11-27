@@ -834,6 +834,52 @@ pub fn render_details_view(
         .into_any_element()
 }
 
+#[allow(clippy::too_many_arguments)]
+fn render_row_entry_icon(
+    sys_icon: Option<std::sync::Arc<gpui_kit::RenderImage>>,
+    fallback_icon: LucideIcon,
+    icon_hex: u32,
+    px_size: f32,
+    small: bool,
+    is_hidden: bool,
+    is_cut: bool,
+    p: Palette,
+) -> gpui_kit::AnyElement {
+    if let Some(render_img) = sys_icon {
+        div()
+            .w(px(px_size))
+            .h(px(px_size))
+            .flex()
+            .flex_shrink_0()
+            .items_center()
+            .justify_center()
+            .opacity(if is_cut {
+                0.45
+            } else if is_hidden {
+                0.65
+            } else {
+                1.0
+            })
+            .child(
+                img(render_img)
+                    .w(px(px_size))
+                    .h(px(px_size))
+                    .object_fit(ObjectFit::Contain),
+            )
+            .into_any_element()
+    } else {
+        let icon = Icon::new(fallback_icon);
+        let sized = if small { icon.small() } else { icon.xsmall() };
+        sized
+            .text_color(if is_hidden || is_cut {
+                solid(p.text_muted)
+            } else {
+                solid(icon_hex)
+            })
+            .into_any_element()
+    }
+}
+
 fn render_details_rows(
     ws: &mut Workspace,
     side: PaneSide,
@@ -863,13 +909,31 @@ fn render_details_rows(
         ws.estimated_pane_width(tab.model.split_enabled)
     };
     let layout = compute_details_column_layout(pane_w, col_mod_w, col_type_w, col_size_w);
-    let model = tab.model.pane(side);
 
-    range
-        .filter_map(|vis_idx| {
-            let entry = model.visible_entry(vis_idx)?;
-            let selected = model.selection.contains(vis_idx);
-            let is_cursor = model.selection.cursor == Some(vis_idx);
+    let mut visible_items = Vec::with_capacity(range.len());
+    {
+        let model = tab.model.pane(side);
+        for vis_idx in range {
+            if let Some(entry) = model.visible_entry(vis_idx) {
+                visible_items.push((
+                    vis_idx,
+                    entry.clone(),
+                    model.selection.contains(vis_idx),
+                    model.selection.cursor == Some(vis_idx),
+                ));
+            }
+        }
+    }
+
+    let mut sys_icons = Vec::with_capacity(visible_items.len());
+    for (_, entry, _, _) in &visible_items {
+        sys_icons.push(ws.get_or_request_entry_icon(entry, 32));
+    }
+
+    visible_items
+        .into_iter()
+        .zip(sys_icons)
+        .map(|((vis_idx, entry, selected, is_cursor), sys_icon)| {
             let (icon, icon_hex) = file_kind_visual(entry.kind, p);
             let is_hidden = entry.is_hidden();
             let local_path = entry.location.as_local_path().map(|path| path.to_path_buf());
@@ -892,7 +956,7 @@ fn render_details_rows(
             };
 
             let drag_payload = build_drag_payload(ws, side, local_path.as_ref(), &entry.name);
-            let archive_drag_payload = build_archive_drag_payload(ws, side, entry);
+            let archive_drag_payload = build_archive_drag_payload(ws, side, &entry);
             let drop_dir_int = if is_dir { local_path.clone() } else { None };
             let drop_dir_ext = drop_dir_int.clone();
             let drop_dir_arch = drop_dir_int.clone();
@@ -926,9 +990,7 @@ fn render_details_rows(
                     }
                 })
                 .when_some(drag_payload, |el, payload| {
-                    let outbound_slot = ws.active_local_drag_paths.clone();
                     el.on_drag(payload, move |drag, cursor_offset, _, cx| {
-                        *outbound_slot.borrow_mut() = Some(drag.paths.clone());
                         cx.new(|_| DragBadgeView {
                             label: drag.label.clone(),
                             palette: p,
@@ -1022,13 +1084,16 @@ fn render_details_rows(
                         .pr_2()
                         .gap_2()
                         .items_center()
-                        .child(
-                            Icon::new(icon).small().text_color(if is_hidden || is_cut {
-                                solid(p.text_muted)
-                            } else {
-                                solid(icon_hex)
-                            }),
-                        )
+                        .child(render_row_entry_icon(
+                            sys_icon,
+                            icon,
+                            icon_hex,
+                            16.0,
+                            true,
+                            is_hidden,
+                            is_cut,
+                            p,
+                        ))
                         .child(
                             div()
                                 .flex_1()
@@ -1093,16 +1158,14 @@ fn render_details_rows(
                     )
                 });
 
-            Some(
-                div()
-                    .w_full()
-                    .h(px(32.))
-                    .pl(px(6.))
-                    .pr(px(layout.gutter_w))
-                    .bg(solid(p.bg_base))
-                    .child(row)
-                    .into_any_element(),
-            )
+            div()
+                .w_full()
+                .h(px(32.))
+                .pl(px(6.))
+                .pr(px(layout.gutter_w))
+                .bg(solid(p.bg_base))
+                .child(row)
+                .into_any_element()
         })
         .collect()
 }
@@ -1275,14 +1338,26 @@ fn render_grid_rows(
         }
     }
 
-    // Resolve or enqueue native Windows Shell thumbnails strictly for the visible viewport range.
+    // Resolve or enqueue native Windows Shell thumbnails/icons strictly for the visible viewport range.
+    let icon_style = ws.settings.icon_style;
     let mut thumbs: Vec<Option<std::sync::Arc<gpui_kit::RenderImage>>> =
         Vec::with_capacity(visible_items.len());
     for (_, entry, _) in &visible_items {
-        let thumb = if !entry.is_dir()
-            && let Some(local) = entry.location.as_local_path()
-        {
-            ws.get_or_request_thumbnail(local, entry.modified_secs, 96)
+        let thumb = if entry.is_dir() {
+            if icon_style.uses_system_folder_icons() {
+                ws.get_or_request_entry_icon(entry, 48)
+            } else {
+                None
+            }
+        } else if let Some(local) = entry.location.as_local_path() {
+            ws.get_or_request_thumbnail(
+                local,
+                entry.modified_secs,
+                96,
+                icon_style.uses_system_file_icons(),
+            )
+        } else if icon_style.uses_system_file_icons() {
+            ws.get_or_request_entry_icon(entry, 48)
         } else {
             None
         };
@@ -1400,9 +1475,7 @@ fn render_grid_rows(
                                 }
                             })
                             .when_some(drag_payload, |el, payload| {
-                                let outbound_slot = ws.active_local_drag_paths.clone();
                                 el.on_drag(payload, move |drag, cursor_offset, _, cx| {
-                                    *outbound_slot.borrow_mut() = Some(drag.paths.clone());
                                     cx.new(|_| DragBadgeView {
                                         label: drag.label.clone(),
                                         palette: p,
@@ -1676,16 +1749,31 @@ fn render_compact_rows(
     let p = ws.palette();
     let unit = ws.settings.size_unit;
 
-    let Some(tab) = ws.active_tab() else {
-        return Vec::new();
-    };
-    let model = tab.model.pane(side);
+    let mut visible_items = Vec::with_capacity(range.len());
+    if let Some(tab) = ws.active_tab() {
+        let model = tab.model.pane(side);
+        for vis_idx in range {
+            if let Some(entry) = model.visible_entry(vis_idx) {
+                visible_items.push((
+                    vis_idx,
+                    entry.clone(),
+                    model.selection.contains(vis_idx),
+                ));
+            }
+        }
+    }
 
-    range
-        .filter_map(|vis_idx| {
-            let entry = model.visible_entry(vis_idx)?;
-            let selected = model.selection.contains(vis_idx);
+    let mut sys_icons = Vec::with_capacity(visible_items.len());
+    for (_, entry, _) in &visible_items {
+        sys_icons.push(ws.get_or_request_entry_icon(entry, 32));
+    }
+
+    visible_items
+        .into_iter()
+        .zip(sys_icons)
+        .map(|((vis_idx, entry, selected), sys_icon)| {
             let (icon, icon_hex) = file_kind_visual(entry.kind, p);
+            let is_hidden = entry.is_hidden();
             let local_path = entry.location.as_local_path().map(|path| path.to_path_buf());
             let is_cut = local_path.as_ref().is_some_and(|path| ws.is_path_cut(path));
             let name: SharedString = entry.name.clone().into();
@@ -1695,7 +1783,7 @@ fn render_compact_rows(
                 .unwrap_or_default()
                 .into();
             let drag_payload = build_drag_payload(ws, side, local_path.as_ref(), &entry.name);
-            let archive_drag_payload = build_archive_drag_payload(ws, side, entry);
+            let archive_drag_payload = build_archive_drag_payload(ws, side, &entry);
 
             let row = h_flex()
                 .id((
@@ -1725,9 +1813,7 @@ fn render_compact_rows(
                     }
                 })
                 .when_some(drag_payload, |el, payload| {
-                    let outbound_slot = ws.active_local_drag_paths.clone();
                     el.on_drag(payload, move |drag, cursor_offset, _, cx| {
-                        *outbound_slot.borrow_mut() = Some(drag.paths.clone());
                         cx.new(|_| DragBadgeView {
                             label: drag.label.clone(),
                             palette: p,
@@ -1757,11 +1843,16 @@ fn render_compact_rows(
                         this.handle_entry_right_click(side, vis_idx, ev, cx);
                     }),
                 )
-                .child(Icon::new(icon).xsmall().text_color(if is_cut {
-                    solid(p.text_muted)
-                } else {
-                    solid(icon_hex)
-                }))
+                .child(render_row_entry_icon(
+                    sys_icon,
+                    icon,
+                    icon_hex,
+                    15.0,
+                    false,
+                    is_hidden,
+                    is_cut,
+                    p,
+                ))
                 .child(
                     div()
                         .flex_1()
@@ -1782,16 +1873,14 @@ fn render_compact_rows(
                         .child(size),
                 );
 
-            Some(
-                div()
-                    .w_full()
-                    .h(px(28.))
-                    .pl(px(6.))
-                    .pr(px(LIST_MARQUEE_GUTTER_PX))
-                    .bg(solid(p.bg_base))
-                    .child(row)
-                    .into_any_element(),
-            )
+            div()
+                .w_full()
+                .h(px(28.))
+                .pl(px(6.))
+                .pr(px(LIST_MARQUEE_GUTTER_PX))
+                .bg(solid(p.bg_base))
+                .child(row)
+                .into_any_element()
         })
         .collect()
 }

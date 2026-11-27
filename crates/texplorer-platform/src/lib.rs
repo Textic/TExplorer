@@ -5,6 +5,7 @@ pub mod com_shell;
 pub mod credentials;
 pub mod default_explorer;
 pub mod dialogs;
+pub mod elevated_fs;
 pub mod elevation;
 pub mod launch;
 pub mod locks;
@@ -20,7 +21,7 @@ pub mod watcher;
 pub mod win_e_hook;
 
 pub use clipboard::{ClipboardFiles, get_clipboard_files, set_clipboard_files};
-pub use com_shell::{RawBgraImage, ShellWorker, cursor_screen_pos};
+pub use com_shell::{RawBgraImage, ShellWorker, SystemIconRequest, cursor_screen_pos};
 pub use credentials::{delete_network_password, load_network_password, save_network_password};
 pub use default_explorer::{
     DefaultExplorerStatus, delegate_to_windows_explorer, enable_default_explorer,
@@ -28,10 +29,14 @@ pub use default_explorer::{
     should_delegate_to_windows_explorer,
 };
 pub use dialogs::{pick_files_dialog, pick_folder_dialog};
+pub use elevated_fs::{
+    ElevatedOpError, elevated_delete_paths, elevated_new_item, elevated_rename_item,
+    elevated_transfer_paths, is_access_denied_message,
+};
 pub use elevation::is_elevated;
 pub use launch::{
-    delete_permanently, move_to_trash, open_in_editor, open_item, open_terminal_here,
-    reveal_in_windows_explorer, show_properties_dialog, spawn_as_desktop_user,
+    delete_permanently, delete_permanently_batch, move_to_trash, open_in_editor, open_item,
+    open_terminal_here, reveal_in_windows_explorer, show_properties_dialog, spawn_as_desktop_user,
 };
 pub use locks::{FileLockStatus, LockingProcess, inspect_file_lock};
 pub use network_share::{connect_smb_share, disconnect_smb_share};

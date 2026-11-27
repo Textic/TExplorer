@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
 use gpui_kit::{
-    Context, Entity, KeyDownEvent, MouseButton, MouseDownEvent, SharedString,
+    Context, Entity, KeyDownEvent, MouseButton, MouseDownEvent, ObjectFit, SharedString,
     UniformListScrollHandle,
     assets::IconName as LucideIcon,
     component::{
@@ -14,7 +14,7 @@ use gpui_kit::{
         input::{Input, InputState},
         v_flex,
     },
-    div, prelude::*, px, uniform_list,
+    div, img, prelude::*, px, uniform_list,
 };
 use texplorer_core::{FileEntry, SearchScope};
 use texplorer_mft::IndexServiceInstallState;
@@ -464,15 +464,25 @@ fn render_search_result_rows(
 ) -> Vec<gpui_kit::AnyElement> {
     let p = ws.palette();
     let unit = ws.settings.size_unit;
-    let Some(state) = ws.global_search.as_ref() else {
-        return Vec::new();
-    };
-    let selected_idx = state.selected_idx;
+    let mut visible_items = Vec::with_capacity(range.len());
+    if let Some(state) = ws.global_search.as_ref() {
+        let selected_idx = state.selected_idx;
+        for idx in range {
+            if let Some(entry) = state.results.get(idx) {
+                visible_items.push((idx, entry.clone(), idx == selected_idx));
+            }
+        }
+    }
 
-    range
-        .filter_map(|idx| {
-            let entry = state.results.get(idx)?;
-            let selected = idx == selected_idx;
+    let mut sys_icons = Vec::with_capacity(visible_items.len());
+    for (_, entry, _) in &visible_items {
+        sys_icons.push(ws.get_or_request_entry_icon(entry, 32));
+    }
+
+    visible_items
+        .into_iter()
+        .zip(sys_icons)
+        .map(|((idx, entry, selected), sys_icon)| {
             let (icon, icon_hex) = file_kind_visual(entry.kind, p);
             let name: SharedString = entry.name.clone().into();
             let parent_dir: SharedString = entry
@@ -490,116 +500,135 @@ fn render_search_result_rows(
             let loc_open = entry.location.clone();
             let is_dir = entry.is_dir();
             let reveal_path = entry.location.as_local_path().map(|path| path.to_path_buf());
-
-            Some(
-                h_flex()
-                    .id(("gs-row", idx))
-                    .w_full()
-                    .h(px(50.))
-                    .px_3()
-                    .gap_2p5()
+            let row_icon = if let Some(render_img) = sys_icon {
+                div()
+                    .w(px(16.))
+                    .h(px(16.))
+                    .flex()
+                    .flex_shrink_0()
                     .items_center()
-                    .cursor_pointer()
-                    .bg(if selected {
-                        soft_tint(p.accent_primary, if p.is_dark { 0.16 } else { 0.12 })
+                    .justify_center()
+                    .child(
+                        img(render_img)
+                            .w(px(16.))
+                            .h(px(16.))
+                            .object_fit(ObjectFit::Contain),
+                    )
+                    .into_any_element()
+            } else {
+                Icon::new(icon)
+                    .small()
+                    .text_color(solid(icon_hex))
+                    .into_any_element()
+            };
+
+            h_flex()
+                .id(("gs-row", idx))
+                .w_full()
+                .h(px(50.))
+                .px_3()
+                .gap_2p5()
+                .items_center()
+                .cursor_pointer()
+                .bg(if selected {
+                    soft_tint(p.accent_primary, if p.is_dark { 0.16 } else { 0.12 })
+                } else {
+                    solid(p.bg_base)
+                })
+                .border_b_1()
+                .border_color(if selected {
+                    solid(p.accent_primary)
+                } else {
+                    solid(p.border_subtle)
+                })
+                .hover(move |s| {
+                    if selected {
+                        s
                     } else {
-                        solid(p.bg_base)
-                    })
-                    .border_b_1()
-                    .border_color(if selected {
-                        solid(p.accent_primary)
-                    } else {
-                        solid(p.border_subtle)
-                    })
-                    .hover(move |s| {
-                        if selected {
-                            s
-                        } else {
-                            s.bg(solid(p.bg_hover))
+                        s.bg(solid(p.bg_hover))
+                    }
+                })
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, ev: &MouseDownEvent, window, cx| {
+                        if let Some(gs) = this.global_search.as_mut() {
+                            gs.selected_idx = idx;
                         }
-                    })
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(move |this, ev: &MouseDownEvent, window, cx| {
-                            if let Some(gs) = this.global_search.as_mut() {
-                                gs.selected_idx = idx;
-                            }
-                            if ev.click_count >= 2 {
-                                this.close_global_search(window, cx);
-                                this.open_location_or_file(loc_open.clone(), is_dir, window, cx);
-                            } else {
-                                cx.notify();
-                            }
-                        }),
-                    )
-                    .child(Icon::new(icon).small().text_color(solid(icon_hex)))
-                    .child(
-                        v_flex()
-                            .flex_1()
-                            .min_w_0()
-                            .gap_0p5()
-                            .child(
-                                div()
-                                    .truncate()
-                                    .text_xs()
-                                    .font_semibold()
-                                    .text_color(solid(p.text_primary))
-                                    .child(name),
-                            )
-                            .child(
-                                div()
-                                    .truncate()
-                                    .text_size(px(12.))
-                                    .text_color(solid(p.text_muted))
-                                    .child(parent_dir),
-                            ),
-                    )
-                    .child(
-                        v_flex()
-                            .flex_shrink_0()
-                            .items_end()
-                            .gap_0p5()
-                            .child(
-                                div()
-                                    .text_size(px(13.))
-                                    .text_color(solid(p.text_secondary))
-                                    .child(size_label),
-                            )
-                            .child(
-                                div()
-                                    .text_size(px(12.))
-                                    .text_color(solid(p.text_muted))
-                                    .child(mod_label),
-                            ),
-                    )
-                    .when_some(reveal_path, |el, path| {
-                        el.child(
+                        if ev.click_count >= 2 {
+                            this.close_global_search(window, cx);
+                            this.open_location_or_file(loc_open.clone(), is_dir, window, cx);
+                        } else {
+                            cx.notify();
+                        }
+                    }),
+                )
+                .child(row_icon)
+                .child(
+                    v_flex()
+                        .flex_1()
+                        .min_w_0()
+                        .gap_0p5()
+                        .child(
                             div()
-                                .id(("gs-reveal", idx))
-                                .w(px(24.))
-                                .h(px(24.))
-                                .flex()
-                                .flex_shrink_0()
-                                .items_center()
-                                .justify_center()
-                                .rounded(px(RADIUS_CONTROL))
-                                .text_color(solid(p.text_muted))
-                                .hover(move |s| {
-                                    s.bg(solid(p.bg_elevated))
-                                        .text_color(solid(p.accent_primary))
-                                })
-                                .on_mouse_down(
-                                    MouseButton::Left,
-                                    cx.listener(move |this, _: &MouseDownEvent, window, cx| {
-                                        window.prevent_default();
-                                        this.reveal_search_hit_in_pane(&path, window, cx);
-                                    }),
-                                )
-                                .child(Icon::new(LucideIcon::FolderOpen).xsmall()),
+                                .truncate()
+                                .text_xs()
+                                .font_semibold()
+                                .text_color(solid(p.text_primary))
+                                .child(name),
                         )
-                    })
-                    .into_any_element(),
-            )
+                        .child(
+                            div()
+                                .truncate()
+                                .text_size(px(12.))
+                                .text_color(solid(p.text_muted))
+                                .child(parent_dir),
+                        ),
+                )
+                .child(
+                    v_flex()
+                        .flex_shrink_0()
+                        .items_end()
+                        .gap_0p5()
+                        .child(
+                            div()
+                                .text_size(px(13.))
+                                .text_color(solid(p.text_secondary))
+                                .child(size_label),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(12.))
+                                .text_color(solid(p.text_muted))
+                                .child(mod_label),
+                        ),
+                )
+                .when_some(reveal_path, |el, path| {
+                    el.child(
+                        div()
+                            .id(("gs-reveal", idx))
+                            .w(px(24.))
+                            .h(px(24.))
+                            .flex()
+                            .flex_shrink_0()
+                            .items_center()
+                            .justify_center()
+                            .rounded(px(RADIUS_CONTROL))
+                            .text_color(solid(p.text_muted))
+                            .hover(move |s| {
+                                s.bg(solid(p.bg_elevated))
+                                    .text_color(solid(p.accent_primary))
+                            })
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(move |this, _: &MouseDownEvent, window, cx| {
+                                    window.prevent_default();
+                                    this.reveal_search_hit_in_pane(&path, window, cx);
+                                }),
+                            )
+                            .child(Icon::new(LucideIcon::FolderOpen).xsmall()),
+                    )
+                })
+                .into_any_element()
         })
         .collect()
 }

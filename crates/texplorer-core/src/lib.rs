@@ -17,5 +17,5 @@ pub use network::{
     normalize_remote_path, normalize_smb_share_path, parse_network_uri,
 };
 pub use session::{AppSession, SavedPaneState, SavedTabState, WindowGeometry};
-pub use settings::{AccentPreset, AppSettings, SidebarSection, SizeUnit, ThemePreset};
+pub use settings::{AccentPreset, AppSettings, IconStyle, SidebarSection, SizeUnit, ThemePreset};
 pub use workspace_model::{PaneModel, PaneSide, SelectionSet, TabModel};

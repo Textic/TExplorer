@@ -34,7 +34,7 @@ pub enum HashInspectState {
 
 /// Renders the collapsible right-hand Preview & Inspector panel (`Alt+P`) with live inline preview,
 /// streaming SHA-256/MD5 checksums + verification, and Windows Restart Manager file-lock detection.
-pub fn render_inspector(ws: &Workspace, cx: &mut Context<Workspace>) -> impl IntoElement {
+pub fn render_inspector(ws: &mut Workspace, cx: &mut Context<Workspace>) -> impl IntoElement {
     let p = ws.palette();
     let unit = ws.settings.size_unit;
     let active_pane = ws.active_tab().map(|t| t.model.active_pane_ref());
@@ -114,6 +114,7 @@ pub fn render_inspector(ws: &Workspace, cx: &mut Context<Workspace>) -> impl Int
                 .into_any_element(),
             Some(entry) => {
                 let (icon, icon_hex) = file_kind_visual(entry.kind, p);
+                let sys_icon = ws.get_or_request_entry_icon(&entry, 48);
                 let name: SharedString = entry.name.clone().into();
                 let type_label: SharedString = entry.type_label.clone().into();
                 let path_str: SharedString = entry.location.display_path().into();
@@ -143,6 +144,7 @@ pub fn render_inspector(ws: &Workspace, cx: &mut Context<Workspace>) -> impl Int
                     render_inline_preview(
                         &ws.preview_payload,
                         ws.preview_generation,
+                        sys_icon,
                         icon,
                         icon_hex,
                         unit,
@@ -150,7 +152,7 @@ pub fn render_inspector(ws: &Workspace, cx: &mut Context<Workspace>) -> impl Int
                     )
                     .into_any_element()
                 } else {
-                    render_icon_box(icon, icon_hex).into_any_element()
+                    render_icon_box(sys_icon, icon, icon_hex).into_any_element()
                 };
 
                 let mut attr_badges: Vec<&'static str> = Vec::new();
@@ -684,9 +686,11 @@ fn hash_digest_row(
         )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_inline_preview(
     payload: &PreviewPayload,
     preview_gen: u64,
+    sys_icon: Option<std::sync::Arc<gpui_kit::RenderImage>>,
     fallback_icon: LucideIcon,
     fallback_hex: u32,
     unit: texplorer_core::SizeUnit,
@@ -824,7 +828,7 @@ fn render_inline_preview(
         } => v_flex()
             .items_center()
             .gap_1p5()
-            .child(render_icon_box(fallback_icon, fallback_hex))
+            .child(render_icon_box(sys_icon, fallback_icon, fallback_hex))
             .child(
                 div()
                     .text_size(px(13.))
@@ -835,20 +839,41 @@ fn render_inline_preview(
                     )),
             )
             .into_any_element(),
-        _ => render_icon_box(fallback_icon, fallback_hex).into_any_element(),
+        _ => render_icon_box(sys_icon, fallback_icon, fallback_hex).into_any_element(),
     }
 }
 
-fn render_icon_box(icon: LucideIcon, icon_hex: u32) -> impl IntoElement {
-    div()
-        .w(px(52.))
-        .h(px(52.))
-        .flex()
-        .items_center()
-        .justify_center()
-        .rounded(px(RADIUS_ROW))
-        .bg(soft_tint(icon_hex, 0.14))
-        .child(Icon::new(icon).large().text_color(solid(icon_hex)))
+fn render_icon_box(
+    sys_icon: Option<std::sync::Arc<gpui_kit::RenderImage>>,
+    icon: LucideIcon,
+    icon_hex: u32,
+) -> impl IntoElement {
+    if let Some(render_img) = sys_icon {
+        div()
+            .w(px(52.))
+            .h(px(52.))
+            .flex()
+            .items_center()
+            .justify_center()
+            .child(
+                img(render_img)
+                    .w(px(44.))
+                    .h(px(44.))
+                    .object_fit(ObjectFit::Contain),
+            )
+            .into_any_element()
+    } else {
+        div()
+            .w(px(52.))
+            .h(px(52.))
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded(px(RADIUS_ROW))
+            .bg(soft_tint(icon_hex, 0.14))
+            .child(Icon::new(icon).large().text_color(solid(icon_hex)))
+            .into_any_element()
+    }
 }
 
 fn meta_row(label: &'static str, value: SharedString, p: Palette) -> impl IntoElement {

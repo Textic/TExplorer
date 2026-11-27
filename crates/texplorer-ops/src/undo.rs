@@ -1,6 +1,8 @@
 use std::path::{Path, PathBuf};
 
-use texplorer_platform::move_to_trash;
+use texplorer_platform::{
+    ElevatedOpError, elevated_rename_item, elevated_transfer_paths, is_elevated, move_to_trash,
+};
 use uuid::Uuid;
 
 /// Reversible filesystem transaction recorded for `Ctrl+Z` / `Ctrl+Y`.
@@ -53,7 +55,7 @@ impl UndoAction {
                 if from.exists() {
                     return Err(format!("Cannot undo rename: \"{}\" already exists.", from.display()));
                 }
-                std::fs::rename(to, from)
+                rename_with_elevation(to, from)
                     .map_err(|e| format!("Failed to undo rename: {e}"))?;
                 Ok(Some(Self::Rename {
                     from: from.clone(),
@@ -83,9 +85,20 @@ impl UndoAction {
                     if let Some(parent) = orig.parent() {
                         let _ = std::fs::create_dir_all(parent);
                     }
-                    if std::fs::rename(dest, orig).is_err() {
-                        copy_recursively_simple(dest, orig)?;
-                        remove_path_simple(dest)?;
+                    match std::fs::rename(dest, orig) {
+                        Ok(()) => {}
+                        Err(e)
+                            if (e.kind() == std::io::ErrorKind::PermissionDenied
+                                || e.raw_os_error() == Some(5))
+                                && !is_elevated() =>
+                        {
+                            elevated_transfer_paths(true, &[(dest.clone(), orig.clone())])
+                                .map_err(ElevatedOpError::into_message)?;
+                        }
+                        Err(_) => {
+                            copy_recursively_simple(dest, orig)?;
+                            remove_path_simple(dest)?;
+                        }
                     }
                     undone.push((orig.clone(), dest.clone()));
                 }
@@ -131,7 +144,7 @@ impl UndoAction {
                         to.display()
                     ));
                 }
-                std::fs::rename(from, to)
+                rename_with_elevation(from, to)
                     .map_err(|e| format!("Failed to redo rename: {e}"))?;
                 Ok(self.clone())
             }
@@ -234,6 +247,28 @@ fn remove_path_simple(path: &std::path::Path) -> Result<(), String> {
     } else {
         std::fs::remove_file(path)
             .map_err(|e| format!("Failed removing \"{}\": {e}", path.display()))
+    }
+}
+
+fn rename_with_elevation(from: &Path, to: &Path) -> Result<(), String> {
+    match std::fs::rename(from, to) {
+        Ok(()) => Ok(()),
+        Err(e)
+            if (e.kind() == std::io::ErrorKind::PermissionDenied || e.raw_os_error() == Some(5))
+                && !is_elevated() =>
+        {
+            if from.parent() == to.parent()
+                && let Some(new_name) = to.file_name().and_then(|n| n.to_str())
+            {
+                elevated_rename_item(from, new_name)
+                    .map(|_| ())
+                    .map_err(ElevatedOpError::into_message)
+            } else {
+                elevated_transfer_paths(true, &[(from.to_path_buf(), to.to_path_buf())])
+                    .map_err(ElevatedOpError::into_message)
+            }
+        }
+        Err(e) => Err(e.to_string()),
     }
 }
 

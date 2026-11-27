@@ -13,7 +13,9 @@ use gpui_kit::{
     },
     div, prelude::*, px,
 };
-use texplorer_core::{AccentPreset, PaneSide, SidebarSection, SizeUnit, ThemePreset, ViewMode};
+use texplorer_core::{
+    AccentPreset, IconStyle, PaneSide, SidebarSection, SizeUnit, ThemePreset, ViewMode,
+};
 use texplorer_mft::IndexServiceInstallState;
 use texplorer_platform::DefaultExplorerStatus;
 use uuid::Uuid;
@@ -612,6 +614,61 @@ fn render_settings_card(
                                     )
                             }),
                         )),
+                )
+                // File & Folder Icon Style selector
+                .child(
+                    v_flex()
+                        .p_3()
+                        .gap_2()
+                        .border_b_1()
+                        .border_color(solid(p.border_subtle))
+                        .child(setting_label(
+                            "File & Folder Icons",
+                            match ws.settings.icon_style {
+                                IconStyle::SystemFiles => {
+                                    "Windows system icons for files (DLL, EXE, PDF, etc.) while keeping TExplorer vector folders."
+                                }
+                                IconStyle::SystemAll => {
+                                    "Native Windows icons for both files and folders (including custom folder icons)."
+                                }
+                                IconStyle::Minimal => {
+                                    "Built-in minimalist vector icons for all files and folders."
+                                }
+                            },
+                            p,
+                        ))
+                        .child(
+                            h_flex()
+                                .flex_wrap()
+                                .gap_1p5()
+                                .child(choice_pill(
+                                    "icon-style-sys-files",
+                                    "System Files",
+                                    ws.settings.icon_style == IconStyle::SystemFiles,
+                                    p,
+                                    cx.listener(|this, _, _, cx| {
+                                        this.set_icon_style(IconStyle::SystemFiles, cx);
+                                    }),
+                                ))
+                                .child(choice_pill(
+                                    "icon-style-sys-all",
+                                    "System (+ Windows Folders)",
+                                    ws.settings.icon_style == IconStyle::SystemAll,
+                                    p,
+                                    cx.listener(|this, _, _, cx| {
+                                        this.set_icon_style(IconStyle::SystemAll, cx);
+                                    }),
+                                ))
+                                .child(choice_pill(
+                                    "icon-style-minimal",
+                                    "Minimal",
+                                    ws.settings.icon_style == IconStyle::Minimal,
+                                    p,
+                                    cx.listener(|this, _, _, cx| {
+                                        this.set_icon_style(IconStyle::Minimal, cx);
+                                    }),
+                                )),
+                        ),
                 )
                 // Size unit
                 .child(

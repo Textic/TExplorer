@@ -182,6 +182,40 @@ impl SizeUnit {
     }
 }
 
+/// File and folder icon rendering mode across file lists, Grid view, Global Search, and Inspector.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum IconStyle {
+    /// Native Windows shell icons for files (`.dll`, `.exe`, `.lnk`, `.pdf`, etc.),
+    /// while preserving TExplorer's built-in minimalist vector icons for folders.
+    #[default]
+    SystemFiles,
+    /// Native Windows shell icons for both files and folders (including custom `desktop.ini`
+    /// and Windows special folders).
+    SystemAll,
+    /// Built-in minimalist Lucide vector icons for all files and folders.
+    Minimal,
+}
+
+impl IconStyle {
+    pub const ALL: [Self; 3] = [Self::SystemFiles, Self::SystemAll, Self::Minimal];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::SystemFiles => "System Files",
+            Self::SystemAll => "All System",
+            Self::Minimal => "Minimal",
+        }
+    }
+
+    pub fn uses_system_file_icons(self) -> bool {
+        matches!(self, Self::SystemFiles | Self::SystemAll)
+    }
+
+    pub fn uses_system_folder_icons(self) -> bool {
+        matches!(self, Self::SystemAll)
+    }
+}
+
 /// Configurable top-level navigation categories rendered in the left sidebar.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -230,6 +264,7 @@ impl SidebarSection {
 pub struct AppSettings {
     pub theme: ThemePreset,
     pub accent: AccentPreset,
+    pub icon_style: IconStyle,
     pub size_unit: SizeUnit,
     pub default_view_mode: ViewMode,
     pub show_tabs: bool,
@@ -267,6 +302,7 @@ impl Default for AppSettings {
         Self {
             theme: ThemePreset::FilesSystem,
             accent: AccentPreset::FilesBlue,
+            icon_style: IconStyle::SystemFiles,
             size_unit: SizeUnit::Binary,
             default_view_mode: ViewMode::Details,
             show_tabs: true,
@@ -754,6 +790,12 @@ mod tests {
             show_hidden_files: true,
             ..Default::default()
         };
+        assert_eq!(settings.icon_style, IconStyle::SystemFiles);
+        assert!(settings.icon_style.uses_system_file_icons());
+        assert!(!settings.icon_style.uses_system_folder_icons());
+        settings.icon_style = IconStyle::SystemAll;
+        assert!(settings.icon_style.uses_system_file_icons());
+        assert!(settings.icon_style.uses_system_folder_icons());
         assert!(settings.quicklook_video_muted);
         assert_eq!(settings.quicklook_video_volume, 70);
         settings.quicklook_video_muted = false;

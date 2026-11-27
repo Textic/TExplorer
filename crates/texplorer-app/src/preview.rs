@@ -15,9 +15,9 @@ use image::{
     imageops::FilterType,
 };
 use smallvec::{SmallVec, smallvec};
-use texplorer_core::FileKind;
+use texplorer_core::{EntryFlags, FileEntry, FileKind, IconStyle};
 use texplorer_platform::{
-    RawBgraImage, RenderedPdfPage, ShellWorker, render_pdf_page_from_bytes,
+    RawBgraImage, RenderedPdfPage, ShellWorker, SystemIconRequest, render_pdf_page_from_bytes,
     render_pdf_page_from_path,
 };
 
@@ -25,12 +25,179 @@ pub const PDF_PREVIEW_MAX_DIM: u32 = 1400;
 
 use crate::theme::{Palette, solid};
 
-/// Cache key uniquely identifying a rendered thumbnail by path, timestamp, and pixel dimension.
+/// Cache key uniquely identifying a rendered thumbnail by path, timestamp, pixel dimension,
+/// and whether Shell icon fallback was permitted.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ThumbnailKey {
     pub path: PathBuf,
     pub modified_secs: i64,
     pub size_px: i32,
+    pub icon_fallback: bool,
+}
+
+/// Cache key uniquely identifying a native Windows system icon.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum SystemIconKey {
+    /// Per-file or special/custom folder icon (`.exe`, `.lnk`, `.ico`, `.url`, `desktop.ini`).
+    Path {
+        path: PathBuf,
+        modified_secs: i64,
+        size_px: i32,
+    },
+    /// Extension-shared Windows file-type icon (e.g. `"dll"`, `"pdf"`, `""`).
+    Extension { ext: String, size_px: i32 },
+    /// Standard generic Windows folder icon.
+    GenericFolder { size_px: i32 },
+}
+
+/// Extensions whose Windows Shell icon can differ per file rather than being shared by file type.
+const PER_FILE_ICON_EXTENSIONS: &[&str] = &[
+    "exe",
+    "lnk",
+    "ico",
+    "cur",
+    "ani",
+    "url",
+    "scr",
+    "cpl",
+    "msc",
+    "appref-ms",
+    "pif",
+    "library-ms",
+];
+
+/// Determines the deduplicated cache key and platform lookup request for `entry` under
+/// `icon_style`, or returns `None` when TExplorer's built-in Lucide icon should be rendered.
+pub fn resolve_system_icon_target(
+    entry: &FileEntry,
+    icon_style: IconStyle,
+    size_px: i32,
+) -> Option<(SystemIconKey, SystemIconRequest)> {
+    if entry.is_dir() {
+        if !icon_style.uses_system_folder_icons() {
+            return None;
+        }
+        // Windows only reads `desktop.ini` custom/special folder icons (Desktop, Downloads,
+        // Pictures, OneDrive, custom folders) on directories marked READONLY or SYSTEM.
+        // All regular folders share a single cached generic Windows folder icon.
+        let may_have_custom_icon = entry.flags.intersects(
+            EntryFlags::IS_READONLY | EntryFlags::IS_SYSTEM | EntryFlags::IS_SYMLINK,
+        );
+        if may_have_custom_icon
+            && let Some(local) = entry.location.as_local_path()
+        {
+            let path = local.to_path_buf();
+            return Some((
+                SystemIconKey::Path {
+                    path: path.clone(),
+                    modified_secs: entry.modified_secs,
+                    size_px,
+                },
+                SystemIconRequest::Path(path),
+            ));
+        }
+        return Some((
+            SystemIconKey::GenericFolder { size_px },
+            SystemIconRequest::GenericFolder,
+        ));
+    }
+
+    if !icon_style.uses_system_file_icons() {
+        return None;
+    }
+
+    let ext_lower = entry.extension.trim().to_ascii_lowercase();
+    let per_file = PER_FILE_ICON_EXTENSIONS.contains(&ext_lower.as_str())
+        || entry.flags.contains(EntryFlags::IS_SYMLINK);
+    if per_file
+        && let Some(local) = entry.location.as_local_path()
+    {
+        let path = local.to_path_buf();
+        return Some((
+            SystemIconKey::Path {
+                path: path.clone(),
+                modified_secs: entry.modified_secs,
+                size_px,
+            },
+            SystemIconRequest::Path(path),
+        ));
+    }
+
+    Some((
+        SystemIconKey::Extension {
+            ext: ext_lower.clone(),
+            size_px,
+        },
+        SystemIconRequest::Extension(ext_lower),
+    ))
+}
+
+/// Bounded in-memory cache of native Windows system icons (`RenderImage`s) preventing duplicate
+/// COM STA lookups and returning evicted GPU images for clean disposal.
+pub struct SystemIconCache {
+    max_entries: usize,
+    entries: HashMap<SystemIconKey, Option<Arc<RenderImage>>>,
+    order: VecDeque<SystemIconKey>,
+    in_flight: HashSet<SystemIconKey>,
+}
+
+impl Default for SystemIconCache {
+    fn default() -> Self {
+        Self::new(600)
+    }
+}
+
+impl SystemIconCache {
+    pub fn new(max_entries: usize) -> Self {
+        Self {
+            max_entries,
+            entries: HashMap::with_capacity(max_entries),
+            order: VecDeque::with_capacity(max_entries),
+            in_flight: HashSet::new(),
+        }
+    }
+
+    /// Returns `Some(Some(img))` if cached, `Some(None)` if lookup failed, or `None` if uncached.
+    pub fn get(&self, key: &SystemIconKey) -> Option<&Option<Arc<RenderImage>>> {
+        self.entries.get(key)
+    }
+
+    /// Marks `key` as in-flight if neither cached nor already requested.
+    pub fn try_mark_in_flight(&mut self, key: SystemIconKey) -> bool {
+        if self.entries.contains_key(&key) || self.in_flight.contains(&key) {
+            return false;
+        }
+        self.in_flight.insert(key);
+        true
+    }
+
+    /// Stores a completed icon lookup and returns any evicted `RenderImage` so the caller can
+    /// release its GPU texture via `window.drop_image`.
+    pub fn insert(
+        &mut self,
+        key: SystemIconKey,
+        image: Option<Arc<RenderImage>>,
+    ) -> Option<Arc<RenderImage>> {
+        self.in_flight.remove(&key);
+        if let Some(slot) = self.entries.get_mut(&key) {
+            return std::mem::replace(slot, image);
+        }
+        let mut evicted_img = None;
+        while self.entries.len() >= self.max_entries {
+            if let Some(oldest) = self.order.pop_front() {
+                if let Some(old_val) = self.entries.remove(&oldest)
+                    && old_val.is_some()
+                {
+                    evicted_img = old_val;
+                }
+            } else {
+                break;
+            }
+        }
+        self.order.push_back(key.clone());
+        self.entries.insert(key, image);
+        evicted_img
+    }
 }
 
 /// Bounded in-memory LRU-ish thumbnail store preventing duplicate COM Shell lookups.
@@ -381,7 +548,7 @@ pub fn load_preview_blocking(
 
     // 4. Native Windows Shell high-resolution thumbnail (videos, PDFs, Office docs, EXEs, SVGs, etc.).
     let (tx, rx) = mpsc::channel();
-    shell_worker.request_thumbnail(path.clone(), 384, move |raw| {
+    shell_worker.request_thumbnail(path.clone(), 384, true, move |raw| {
         let _ = tx.send(raw);
     });
     if let Ok(Some(raw)) = rx.recv()
@@ -989,5 +1156,106 @@ mod tests {
         assert_eq!(render_img.frame_count(), 2);
         assert!(render_img.delay(0).numer_denom_ms().0 >= 70);
         assert_eq!(render_img.delay(1).numer_denom_ms(), (100, 1));
+    }
+
+    #[test]
+    fn resolves_system_icon_targets_by_icon_style_and_entry_kind() {
+        use texplorer_core::{Location, NetworkProtocol};
+
+        let make_entry = |name: &str, ext: &str, loc: Location, flags: EntryFlags, kind: FileKind| {
+            FileEntry {
+                location: loc,
+                name: name.to_string(),
+                extension: ext.to_string(),
+                size: if flags.contains(EntryFlags::IS_DIR) {
+                    None
+                } else {
+                    Some(1024)
+                },
+                modified_secs: 100,
+                created_secs: 100,
+                flags,
+                kind,
+                type_label: String::new(),
+            }
+        };
+
+        let dll = make_entry(
+            "kernel32.dll",
+            "dll",
+            Location::local(r"C:\Windows\System32\kernel32.dll"),
+            EntryFlags::empty(),
+            FileKind::Other,
+        );
+        let exe = make_entry(
+            "app.exe",
+            "exe",
+            Location::local(r"C:\Apps\app.exe"),
+            EntryFlags::empty(),
+            FileKind::Executable,
+        );
+        let remote_exe = make_entry(
+            "tool.exe",
+            "exe",
+            Location::Remote {
+                connection_id: uuid::Uuid::nil(),
+                protocol: NetworkProtocol::Sftp,
+                label: "VPS".to_string(),
+                remote_path: "/opt/tool.exe".to_string(),
+            },
+            EntryFlags::empty(),
+            FileKind::Executable,
+        );
+        let plain_dir = make_entry(
+            "Projects",
+            "",
+            Location::local(r"C:\Projects"),
+            EntryFlags::IS_DIR,
+            FileKind::Folder,
+        );
+        let special_dir = make_entry(
+            "Downloads",
+            "",
+            Location::local(r"C:\Users\Demo\Downloads"),
+            EntryFlags::IS_DIR | EntryFlags::IS_READONLY,
+            FileKind::Folder,
+        );
+
+        // Minimal mode: built-in icons everywhere.
+        assert!(resolve_system_icon_target(&dll, IconStyle::Minimal, 32).is_none());
+        assert!(resolve_system_icon_target(&plain_dir, IconStyle::Minimal, 32).is_none());
+
+        // SystemFiles (default): extension-cached DLL, per-path local EXE, extension-cached remote EXE,
+        // built-in Lucide icons for all folders.
+        assert!(matches!(
+            resolve_system_icon_target(&dll, IconStyle::SystemFiles, 32),
+            Some((
+                SystemIconKey::Extension { ref ext, size_px: 32 },
+                SystemIconRequest::Extension(ref req_ext)
+            )) if ext == "dll" && req_ext == "dll"
+        ));
+        assert!(matches!(
+            resolve_system_icon_target(&exe, IconStyle::SystemFiles, 32),
+            Some((SystemIconKey::Path { size_px: 32, .. }, SystemIconRequest::Path(_)))
+        ));
+        assert!(matches!(
+            resolve_system_icon_target(&remote_exe, IconStyle::SystemFiles, 32),
+            Some((
+                SystemIconKey::Extension { ref ext, size_px: 32 },
+                SystemIconRequest::Extension(ref req_ext)
+            )) if ext == "exe" && req_ext == "exe"
+        ));
+        assert!(resolve_system_icon_target(&plain_dir, IconStyle::SystemFiles, 32).is_none());
+        assert!(resolve_system_icon_target(&special_dir, IconStyle::SystemFiles, 32).is_none());
+
+        // SystemAll: generic folder icon for standard dirs, per-path icon for READONLY/SYSTEM dirs.
+        assert!(matches!(
+            resolve_system_icon_target(&plain_dir, IconStyle::SystemAll, 32),
+            Some((SystemIconKey::GenericFolder { size_px: 32 }, SystemIconRequest::GenericFolder))
+        ));
+        assert!(matches!(
+            resolve_system_icon_target(&special_dir, IconStyle::SystemAll, 32),
+            Some((SystemIconKey::Path { size_px: 32, .. }, SystemIconRequest::Path(_)))
+        ));
     }
 }

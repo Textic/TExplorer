@@ -4,6 +4,8 @@
 //! applications such as Google Chrome, Edge, Discord, Telegram, VS Code, Desktop, and Windows
 //! Explorer with full native Shell formats (`CF_HDROP`, Shell IDList Array, drag icons, and OS cursors).
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
 /// Result of a native outbound Windows OLE drag operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NativeDragOutcome {
@@ -11,6 +13,15 @@ pub enum NativeDragOutcome {
     Moved,
     Linked,
     Cancelled,
+}
+
+static OUTBOUND_DRAG_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+/// Returns `true` while this process is actively executing an outbound `SHDoDragDrop` loop.
+/// Checked synchronously by `NativeDropTarget::Drop` so dragging a file out of TExplorer and
+/// dropping it back onto the same TExplorer window never races with async channel delivery.
+pub fn is_outbound_drag_active() -> bool {
+    OUTBOUND_DRAG_ACTIVE.load(Ordering::Acquire)
 }
 
 #[cfg(target_os = "windows")]
@@ -27,16 +38,33 @@ mod imp {
     };
     use windows::Win32::System::SystemServices::{MK_LBUTTON, MODIFIERKEYS_FLAGS};
     use windows::Win32::UI::Input::KeyboardAndMouse::{
-        GetAsyncKeyState, ReleaseCapture, VK_LBUTTON,
+        GetAsyncKeyState, ReleaseCapture, VK_LBUTTON, VK_RBUTTON,
     };
     use windows::Win32::UI::Shell::Common::ITEMIDLIST;
     use windows::Win32::UI::Shell::{
         BHID_DataObject, ILCreateFromPathW, ILFree, SHCreateShellItemArrayFromIDLists,
         SHDoDragDrop,
     };
+    use windows::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_SWAPBUTTON};
     use windows_core::{HRESULT, PCWSTR, implement};
 
-    use super::NativeDragOutcome;
+    use super::{NativeDragOutcome, OUTBOUND_DRAG_ACTIVE};
+    use std::sync::atomic::Ordering;
+
+    struct OutboundDragGuard;
+
+    impl OutboundDragGuard {
+        fn enter() -> Self {
+            OUTBOUND_DRAG_ACTIVE.store(true, Ordering::Release);
+            Self
+        }
+    }
+
+    impl Drop for OutboundDragGuard {
+        fn drop(&mut self) {
+            OUTBOUND_DRAG_ACTIVE.store(false, Ordering::Release);
+        }
+    }
 
     #[implement(IDropSource)]
     struct NativeDropSource;
@@ -100,9 +128,14 @@ mod imp {
             return Ok(NativeDragOutcome::Cancelled);
         }
 
-        // Bail cleanly if the user already released the left mouse button before the task ran.
-        let lbutton_down = unsafe { GetAsyncKeyState(VK_LBUTTON.0 as i32) < 0 };
-        if !lbutton_down {
+        // Bail cleanly if the user already released the primary mouse button before the task ran.
+        let primary_vk = if unsafe { GetSystemMetrics(SM_SWAPBUTTON) } != 0 {
+            VK_RBUTTON.0 as i32
+        } else {
+            VK_LBUTTON.0 as i32
+        };
+        let primary_down = unsafe { GetAsyncKeyState(primary_vk) < 0 };
+        if !primary_down {
             return Ok(NativeDragOutcome::Cancelled);
         }
 
@@ -145,6 +178,7 @@ mod imp {
         }
 
         let allowed = DROPEFFECT_COPY | DROPEFFECT_MOVE | DROPEFFECT_LINK;
+        let _active_guard = OutboundDragGuard::enter();
         let effect = unsafe { SHDoDragDrop(hwnd, &data_object, &drop_source, allowed) }
             .map_err(|e| format!("Windows OLE drag-and-drop failed: {e}"))?;
 

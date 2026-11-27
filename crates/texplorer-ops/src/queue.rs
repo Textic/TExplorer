@@ -283,7 +283,16 @@ impl WorkerState {
 
 enum WorkerStop {
     Cancelled,
+    PermissionDenied(String),
     Failed(String),
+}
+
+fn io_stop(msg: String, err: std::io::Error) -> WorkerStop {
+    if err.kind() == std::io::ErrorKind::PermissionDenied || err.raw_os_error() == Some(5) {
+        WorkerStop::PermissionDenied(msg)
+    } else {
+        WorkerStop::Failed(msg)
+    }
 }
 
 fn futures_executor_block_on_oneshot(
@@ -343,94 +352,121 @@ fn run_transfer_worker(
             )));
         }
 
-        for src in &sources {
-            state.check_pause_or_cancel()?;
-            let Some(name) = src.file_name() else {
+        for idx in 0..sources.len() {
+            let src = &sources[idx];
+            let Some((final_dest, needs_dir_remove)) =
+                resolve_transfer_target(&mut state, kind, src, &dest_dir)?
+            else {
                 continue;
             };
-            let initial_dest = dest_dir.join(name);
+            let name = src
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
 
-            // Guard against copying or moving a directory inside itself.
-            if src.is_dir() && is_same_or_descendant(&dest_dir, src) {
-                return Err(WorkerStop::Failed(format!(
-                    "Cannot {} \"{}\" into itself.",
-                    if kind == TransferKind::Copy {
-                        "copy"
-                    } else {
-                        "move"
-                    },
-                    src.display()
-                )));
-            }
+            let item_res: Result<(), WorkerStop> = (|| {
+                if needs_dir_remove {
+                    fs::remove_dir_all(&final_dest).map_err(|e| {
+                        io_stop(
+                            format!("Failed replacing \"{}\": {e}", final_dest.display()),
+                            e,
+                        )
+                    })?;
+                }
 
-            // Moving onto the exact same path is a harmless no-op.
-            if kind == TransferKind::Move && paths_equal(src, &initial_dest) {
-                continue;
-            }
-
-            // Copying into the same parent auto-renames to `"name (2).ext"` like Windows Explorer.
-            let target_dest = if kind == TransferKind::Copy && paths_equal(src, &initial_dest) {
-                unique_keep_both_path(&initial_dest)
-            } else {
-                initial_dest
-            };
-
-            let src_meta = fs::symlink_metadata(src).map_err(|e| {
-                WorkerStop::Failed(format!("Cannot inspect \"{}\": {e}", src.display()))
-            })?;
-            let is_dir = src_meta.is_dir();
-
-            let final_dest = if target_dest.exists() {
-                if is_dir && target_dest.is_dir() {
-                    // Merging folders resolves conflicts per file inside.
-                    target_dest
-                } else {
-                    match state.resolve_conflict(src, &target_dest, is_dir)? {
-                        ConflictResolution::Overwrite => {
-                            if target_dest.is_dir() {
-                                fs::remove_dir_all(&target_dest).map_err(|e| {
-                                    WorkerStop::Failed(format!(
-                                        "Failed replacing \"{}\": {e}",
-                                        target_dest.display()
-                                    ))
-                                })?;
+                match kind {
+                    TransferKind::Move => {
+                        // Fast-path atomic same-volume rename when destination does not yet exist.
+                        let fast_renamed = if !final_dest.exists() {
+                            match fs::rename(src, &final_dest) {
+                                Ok(()) => true,
+                                Err(e)
+                                    if e.kind() == std::io::ErrorKind::PermissionDenied
+                                        || e.raw_os_error() == Some(5) =>
+                                {
+                                    return Err(WorkerStop::PermissionDenied(format!(
+                                        "Failed moving \"{}\": {e}",
+                                        src.display()
+                                    )));
+                                }
+                                Err(_) => false,
                             }
-                            target_dest
-                        }
-                        ConflictResolution::Skip => {
-                            state.files_done = state.files_done.saturating_add(1);
-                            state.bytes_done = state.bytes_done.saturating_add(src_meta.len());
-                            state.emit_progress(TransferStatus::Running, false);
-                            continue;
-                        }
-                        ConflictResolution::KeepBoth => unique_keep_both_path(&target_dest),
-                        ConflictResolution::Cancel => return Err(WorkerStop::Cancelled),
-                    }
-                }
-            } else {
-                target_dest
-            };
+                        } else {
+                            false
+                        };
 
-            match kind {
-                TransferKind::Move => {
-                    // Fast-path atomic same-volume rename when destination does not yet exist.
-                    if !final_dest.exists() && fs::rename(src, &final_dest).is_ok() {
-                        let (sub_files, sub_bytes) = estimate_totals(std::slice::from_ref(&final_dest));
-                        state.files_done = state.files_done.saturating_add(sub_files.max(1));
-                        state.bytes_done = state.bytes_done.saturating_add(sub_bytes);
-                        state.current_item = name.to_string_lossy().into_owned();
-                        state.emit_progress(TransferStatus::Running, false);
-                        moved_pairs.push((src.clone(), final_dest));
-                    } else {
+                        if fast_renamed {
+                            let (sub_files, sub_bytes) =
+                                estimate_totals(std::slice::from_ref(&final_dest));
+                            state.files_done = state.files_done.saturating_add(sub_files.max(1));
+                            state.bytes_done = state.bytes_done.saturating_add(sub_bytes);
+                            state.current_item = name.clone();
+                            state.emit_progress(TransferStatus::Running, false);
+                            moved_pairs.push((src.clone(), final_dest.clone()));
+                        } else {
+                            copy_entry(&mut state, src, &final_dest)?;
+                            remove_source_after_move(src)?;
+                            moved_pairs.push((src.clone(), final_dest.clone()));
+                        }
+                    }
+                    TransferKind::Copy => {
                         copy_entry(&mut state, src, &final_dest)?;
-                        remove_source_after_move(src)?;
-                        moved_pairs.push((src.clone(), final_dest));
+                        copied_roots.push(final_dest.clone());
                     }
                 }
-                TransferKind::Copy => {
-                    copy_entry(&mut state, src, &final_dest)?;
-                    copied_roots.push(final_dest);
+                Ok(())
+            })();
+
+            match item_res {
+                Ok(()) => {}
+                Err(WorkerStop::PermissionDenied(orig_err))
+                    if !texplorer_platform::is_elevated() =>
+                {
+                    // Collect the denied item plus all remaining items in this job so Windows
+                    // shows a single native UAC prompt (`IFileOperation`) for the entire batch.
+                    let mut elevated_pairs = vec![(src.clone(), final_dest)];
+                    for rem_src in &sources[(idx + 1)..] {
+                        if let Some((rem_dest, _)) =
+                            resolve_transfer_target(&mut state, kind, rem_src, &dest_dir)?
+                        {
+                            elevated_pairs.push((rem_src.clone(), rem_dest));
+                        }
+                    }
+                    state.current_item = "Waiting for Administrator permission...".to_string();
+                    state.emit_progress(TransferStatus::Running, true);
+
+                    match texplorer_platform::elevated_transfer_paths(
+                        kind == TransferKind::Move,
+                        &elevated_pairs,
+                    ) {
+                        Ok(()) => {
+                            for (e_src, e_dst) in elevated_pairs {
+                                match kind {
+                                    TransferKind::Move => moved_pairs.push((e_src, e_dst)),
+                                    TransferKind::Copy => copied_roots.push(e_dst),
+                                }
+                            }
+                            state.files_done = state.files_total;
+                            state.bytes_done = state.bytes_total;
+                            state.emit_progress(TransferStatus::Running, true);
+                            break;
+                        }
+                        Err(texplorer_platform::ElevatedOpError::Cancelled) => {
+                            return Err(WorkerStop::Cancelled);
+                        }
+                        Err(texplorer_platform::ElevatedOpError::Failed(elev_err)) => {
+                            return Err(WorkerStop::Failed(if elev_err.is_empty() {
+                                orig_err
+                            } else {
+                                elev_err
+                            }));
+                        }
+                    }
                 }
+                Err(WorkerStop::PermissionDenied(orig_err)) => {
+                    return Err(WorkerStop::Failed(orig_err));
+                }
+                Err(other) => return Err(other),
             }
         }
         Ok(())
@@ -450,7 +486,9 @@ fn run_transfer_worker(
             (TransferStatus::Completed, undo)
         }
         Err(WorkerStop::Cancelled) => (TransferStatus::Cancelled, None),
-        Err(WorkerStop::Failed(err)) => (TransferStatus::Failed(err), None),
+        Err(WorkerStop::PermissionDenied(err) | WorkerStop::Failed(err)) => {
+            (TransferStatus::Failed(err), None)
+        }
     };
 
     state.ema_speed = 0.0;
@@ -461,21 +499,85 @@ fn run_transfer_worker(
     });
 }
 
+fn resolve_transfer_target(
+    state: &mut WorkerState,
+    kind: TransferKind,
+    src: &Path,
+    dest_dir: &Path,
+) -> Result<Option<(PathBuf, bool)>, WorkerStop> {
+    state.check_pause_or_cancel()?;
+    let Some(name) = src.file_name() else {
+        return Ok(None);
+    };
+    let initial_dest = dest_dir.join(name);
+
+    // Guard against copying or moving a directory inside itself.
+    if src.is_dir() && is_same_or_descendant(dest_dir, src) {
+        return Err(WorkerStop::Failed(format!(
+            "Cannot {} \"{}\" into itself.",
+            if kind == TransferKind::Copy {
+                "copy"
+            } else {
+                "move"
+            },
+            src.display()
+        )));
+    }
+
+    // Moving onto the exact same path is a harmless no-op.
+    if kind == TransferKind::Move && paths_equal(src, &initial_dest) {
+        return Ok(None);
+    }
+
+    // Copying into the same parent auto-renames to `"name (2).ext"` like Windows Explorer.
+    let target_dest = if kind == TransferKind::Copy && paths_equal(src, &initial_dest) {
+        unique_keep_both_path(&initial_dest)
+    } else {
+        initial_dest
+    };
+
+    let src_meta = fs::symlink_metadata(src).map_err(|e| {
+        io_stop(format!("Cannot inspect \"{}\": {e}", src.display()), e)
+    })?;
+    let is_dir = src_meta.is_dir();
+
+    if target_dest.exists() {
+        if is_dir && target_dest.is_dir() {
+            // Merging folders resolves conflicts per file inside.
+            Ok(Some((target_dest, false)))
+        } else {
+            match state.resolve_conflict(src, &target_dest, is_dir)? {
+                ConflictResolution::Overwrite => Ok(Some((target_dest.clone(), target_dest.is_dir()))),
+                ConflictResolution::Skip => {
+                    state.files_done = state.files_done.saturating_add(1);
+                    state.bytes_done = state.bytes_done.saturating_add(src_meta.len());
+                    state.emit_progress(TransferStatus::Running, false);
+                    Ok(None)
+                }
+                ConflictResolution::KeepBoth => Ok(Some((unique_keep_both_path(&target_dest), false))),
+                ConflictResolution::Cancel => Err(WorkerStop::Cancelled),
+            }
+        }
+    } else {
+        Ok(Some((target_dest, false)))
+    }
+}
+
 fn copy_entry(state: &mut WorkerState, src: &Path, dst: &Path) -> Result<(), WorkerStop> {
     state.check_pause_or_cancel()?;
     let meta = fs::symlink_metadata(src)
-        .map_err(|e| WorkerStop::Failed(format!("Failed inspecting \"{}\": {e}", src.display())))?;
+        .map_err(|e| io_stop(format!("Failed inspecting \"{}\": {e}", src.display()), e))?;
 
     if meta.is_dir() {
         fs::create_dir_all(dst).map_err(|e| {
-            WorkerStop::Failed(format!("Failed creating folder \"{}\": {e}", dst.display()))
+            io_stop(format!("Failed creating folder \"{}\": {e}", dst.display()), e)
         })?;
         let entries = fs::read_dir(src).map_err(|e| {
-            WorkerStop::Failed(format!("Failed listing folder \"{}\": {e}", src.display()))
+            io_stop(format!("Failed listing folder \"{}\": {e}", src.display()), e)
         })?;
         for entry in entries {
             let entry = entry.map_err(|e| {
-                WorkerStop::Failed(format!("Failed reading entry in \"{}\": {e}", src.display()))
+                io_stop(format!("Failed reading entry in \"{}\": {e}", src.display()), e)
             })?;
             let child_src = entry.path();
             let child_dst = dst.join(entry.file_name());
@@ -516,29 +618,29 @@ fn copy_file_chunked(state: &mut WorkerState, src: &Path, dst: &Path) -> Result<
     state.emit_progress(TransferStatus::Running, false);
 
     let mut reader = File::open(src)
-        .map_err(|e| WorkerStop::Failed(format!("Failed opening \"{}\": {e}", src.display())))?;
+        .map_err(|e| io_stop(format!("Failed opening \"{}\": {e}", src.display()), e))?;
     let mut writer = File::create(dst)
-        .map_err(|e| WorkerStop::Failed(format!("Failed creating \"{}\": {e}", dst.display())))?;
+        .map_err(|e| io_stop(format!("Failed creating \"{}\": {e}", dst.display()), e))?;
 
     let mut buf = vec![0u8; CHUNK_SIZE];
     loop {
         state.check_pause_or_cancel()?;
-        let read = reader.read(&mut buf).map_err(|e| {
-            WorkerStop::Failed(format!("Failed reading \"{}\": {e}", src.display()))
-        })?;
+        let read = reader
+            .read(&mut buf)
+            .map_err(|e| io_stop(format!("Failed reading \"{}\": {e}", src.display()), e))?;
         if read == 0 {
             break;
         }
-        writer.write_all(&buf[..read]).map_err(|e| {
-            WorkerStop::Failed(format!("Failed writing \"{}\": {e}", dst.display()))
-        })?;
+        writer
+            .write_all(&buf[..read])
+            .map_err(|e| io_stop(format!("Failed writing \"{}\": {e}", dst.display()), e))?;
         state.bytes_done = state.bytes_done.saturating_add(read as u64);
         state.emit_progress(TransferStatus::Running, false);
     }
 
     writer
         .flush()
-        .map_err(|e| WorkerStop::Failed(format!("Failed flushing \"{}\": {e}", dst.display())))?;
+        .map_err(|e| io_stop(format!("Failed flushing \"{}\": {e}", dst.display()), e))?;
     state.files_done = state.files_done.saturating_add(1);
     state.emit_progress(TransferStatus::Running, false);
     Ok(())
@@ -546,11 +648,19 @@ fn copy_file_chunked(state: &mut WorkerState, src: &Path, dst: &Path) -> Result<
 
 fn remove_source_after_move(src: &Path) -> Result<(), WorkerStop> {
     if src.is_dir() {
-        fs::remove_dir_all(src)
-            .map_err(|e| WorkerStop::Failed(format!("Failed cleaning source \"{}\": {e}", src.display())))
+        fs::remove_dir_all(src).map_err(|e| {
+            io_stop(
+                format!("Failed cleaning source \"{}\": {e}", src.display()),
+                e,
+            )
+        })
     } else {
-        fs::remove_file(src)
-            .map_err(|e| WorkerStop::Failed(format!("Failed cleaning source \"{}\": {e}", src.display())))
+        fs::remove_file(src).map_err(|e| {
+            io_stop(
+                format!("Failed cleaning source \"{}\": {e}", src.display()),
+                e,
+            )
+        })
     }
 }
 
