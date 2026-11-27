@@ -340,7 +340,7 @@ pub fn render_inspector(ws: &mut Workspace, cx: &mut Context<Workspace>) -> impl
                                     .label("Copy Path")
                                     .icon(LucideIcon::Copy)
                                     .on_click(cx.listener(move |this, _, _, cx| {
-                                        this.copy_text_to_clipboard(&copy_path, "Path copied", cx);
+                                        this.copy_path_to_clipboard(&copy_path, cx);
                                     })),
                             )
                             .when_some(term_path, |el, path| {

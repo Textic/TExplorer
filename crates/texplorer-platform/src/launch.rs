@@ -80,36 +80,26 @@ pub fn open_item(path: &Path) -> Result<(), String> {
     }
 }
 
-/// Opens the native Windows "Open with" application picker (`SHOpenWithDialog`) for `path`.
+/// Opens the native Windows "Open with -> Choose another app" dialog for `path`, enabling both
+/// **Always** (change default app for extension) and **Just once**.
 ///
-/// Must be called from a dedicated background thread so the modal OS shell picker never blocks
-/// the UI thread or the COM thumbnail worker. Dismissing/cancelling the picker returns `Ok(())`.
+/// Invokes the canonical `"openas"` Shell context verb via `ShellExecuteExW(SEE_MASK_INVOKEIDLIST)`
+/// — the exact path used by Windows Explorer's *"Choose another app"* — and falls back to
+/// `SHOpenWithDialog(OAIF_ALLOW_REGISTRATION | OAIF_REGISTER_EXT | OAIF_EXEC)` if needed.
 pub fn open_with_dialog(path: &Path) -> Result<(), String> {
     #[cfg(target_os = "windows")]
     {
+        use std::os::windows::ffi::OsStrExt;
         use windows::Win32::Foundation::{ERROR_CANCELLED, HWND};
-        use windows::Win32::System::Com::{
-            COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE, CoInitializeEx, CoUninitialize,
-        };
         use windows::Win32::UI::Shell::{
-            OAIF_ALLOW_REGISTRATION, OAIF_EXEC, OPENASINFO, SHOpenWithDialog,
+            OAIF_ALLOW_REGISTRATION, OAIF_EXEC, OAIF_REGISTER_EXT, OPENASINFO, SHOpenWithDialog,
         };
+        use windows_sys::Win32::Foundation::GetLastError;
+        use windows_sys::Win32::UI::Shell::{
+            SEE_MASK_INVOKEIDLIST, SHELLEXECUTEINFOW, ShellExecuteExW,
+        };
+        use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
         use windows_core::{HSTRING, PCWSTR};
-
-        let com_inited = unsafe {
-            CoInitializeEx(None, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE).is_ok()
-        };
-        struct ComGuard(bool);
-        impl Drop for ComGuard {
-            fn drop(&mut self) {
-                if self.0 {
-                    unsafe {
-                        CoUninitialize();
-                    }
-                }
-            }
-        }
-        let _com_guard = ComGuard(com_inited);
 
         let raw = path.to_string_lossy();
         let clean = if let Some(unc) = raw.strip_prefix(r"\\?\UNC\") {
@@ -119,11 +109,35 @@ pub fn open_with_dialog(path: &Path) -> Result<(), String> {
         } else {
             raw.into_owned()
         };
+
+        // 1. Primary path: canonical Shell `"openas"` verb (`SEE_MASK_INVOKEIDLIST`), identical to
+        //    Windows Explorer's "Open with -> Choose another app" (shows Always & Just once).
+        let verb: Vec<u16> = "openas\0".encode_utf16().collect();
+        let file: Vec<u16> = std::ffi::OsStr::new(&clean)
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        let mut sei: SHELLEXECUTEINFOW = unsafe { std::mem::zeroed() };
+        sei.cbSize = std::mem::size_of::<SHELLEXECUTEINFOW>() as u32;
+        sei.fMask = SEE_MASK_INVOKEIDLIST;
+        sei.lpVerb = verb.as_ptr();
+        sei.lpFile = file.as_ptr();
+        sei.nShow = SW_SHOWNORMAL;
+
+        if unsafe { ShellExecuteExW(&mut sei) } != 0 {
+            return Ok(());
+        }
+        let err_code = unsafe { GetLastError() };
+        if err_code == ERROR_CANCELLED.0 {
+            return Ok(());
+        }
+
+        // 2. Fallback: direct `SHOpenWithDialog` with `OAIF_REGISTER_EXT` enabled.
         let wide_path = HSTRING::from(clean);
         let info = OPENASINFO {
             pcszFile: PCWSTR(wide_path.as_ptr()),
             pcszClass: PCWSTR::null(),
-            oaifInFlags: OAIF_ALLOW_REGISTRATION | OAIF_EXEC,
+            oaifInFlags: OAIF_ALLOW_REGISTRATION | OAIF_REGISTER_EXT | OAIF_EXEC,
         };
 
         match unsafe { SHOpenWithDialog(HWND::default(), &info) } {

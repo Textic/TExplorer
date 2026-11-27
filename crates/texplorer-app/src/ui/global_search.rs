@@ -554,7 +554,7 @@ fn render_search_result_rows(
                         if let Some(gs) = this.global_search.as_mut() {
                             gs.selected_idx = idx;
                         }
-                        if ev.click_count >= 2 {
+                        if ev.click_count >= 2 && !ev.modifiers.shift && !ev.modifiers.control {
                             this.close_global_search(window, cx);
                             this.open_location_or_file(loc_open.clone(), is_dir, window, cx);
                         } else {

@@ -1339,7 +1339,7 @@ fn render_tree_rows(
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(move |this, event: &MouseDownEvent, window, cx| {
-                            if event.click_count >= 2 {
+                            if this.register_disk_node_click(node_id, event.click_count) {
                                 if is_dir && row.has_children {
                                     this.toggle_disk_node_expand(node_id, cx);
                                     this.set_disk_treemap_root(node_id, cx);
@@ -2197,7 +2197,7 @@ fn render_top_file_rows(
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(move |this, event: &MouseDownEvent, window, cx| {
-                            if event.click_count >= 2 {
+                            if this.register_disk_node_click(node_id, event.click_count) {
                                 this.reveal_disk_node_in_explorer(node_id, window, cx);
                             } else {
                                 this.select_disk_node(node_id, false, cx);

@@ -58,6 +58,11 @@ enum ShellJob {
         path: PathBuf,
         on_done: MenuCallback,
     },
+    OpenWith {
+        path: PathBuf,
+        on_done: MenuCallback,
+    },
+    RefreshIconCache,
 }
 
 /// Handle to the background COM STA worker thread.
@@ -121,6 +126,13 @@ impl ShellWorker {
                         ShellJob::ShowProperties { path, on_done } => {
                             let res = crate::launch::show_properties_dialog(&path);
                             on_done(res);
+                        }
+                        ShellJob::OpenWith { path, on_done } => {
+                            let res = crate::launch::open_with_dialog(&path);
+                            on_done(res);
+                        }
+                        ShellJob::RefreshIconCache => {
+                            refresh_process_shell_icon_cache();
                         }
                     }
                 }
@@ -208,6 +220,142 @@ impl ShellWorker {
             path,
             on_done: Box::new(on_done),
         });
+    }
+
+    /// Opens the native Windows "Open with -> Choose another app" dialog for `path` on the COM STA thread.
+    pub fn open_with(
+        &self,
+        path: PathBuf,
+        on_done: impl FnOnce(Result<(), String>) + Send + 'static,
+    ) {
+        let _ = self.tx.send(ShellJob::OpenWith {
+            path,
+            on_done: Box::new(on_done),
+        });
+    }
+
+    /// Refreshes the in-process Windows Shell image list cache on the COM STA thread before
+    /// subsequent system icon extractions run.
+    pub fn refresh_icon_cache(&self) {
+        let _ = self.tx.send(ShellJob::RefreshIconCache);
+    }
+}
+
+/// Refreshes the calling process's Shell icon cache (`shell32.dll` `FileIconInit(TRUE)`, ordinal 660)
+/// so `SHGetFileInfoW` / `SHGetImageList` immediately reflect newly changed default app associations.
+#[cfg(target_os = "windows")]
+fn refresh_process_shell_icon_cache() {
+    use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
+
+    let dll: Vec<u16> = "shell32.dll\0".encode_utf16().collect();
+    let hmod = unsafe { GetModuleHandleW(dll.as_ptr()) };
+    if hmod.is_null() {
+        return;
+    }
+    let proc = unsafe { GetProcAddress(hmod, 660usize as *const u8) };
+    if let Some(raw_fn) = proc {
+        type FileIconInitFn = unsafe extern "system" fn(i32) -> i32;
+        let file_icon_init: FileIconInitFn = unsafe { std::mem::transmute(raw_fn) };
+        unsafe {
+            let _ = file_icon_init(1);
+        }
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn refresh_process_shell_icon_cache() {}
+
+/// Spawns a zero-CPU background thread watching Windows per-user file extension associations
+/// (`HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\FileExts`) via asynchronous
+/// `RegNotifyChangeKeyValue` with a trailing-edge debounce, invoking `on_changed` once
+/// `OpenWith.exe` / Windows Settings finishes updating `UserChoice` / `UserChoiceLatest`.
+pub fn watch_file_associations(on_changed: impl Fn() + Send + 'static) {
+    #[cfg(target_os = "windows")]
+    {
+        use windows_sys::Win32::Foundation::{
+            CloseHandle, WAIT_OBJECT_0, WAIT_TIMEOUT,
+        };
+        use windows_sys::Win32::System::Registry::{
+            HKEY, HKEY_CURRENT_USER, KEY_NOTIFY, REG_NOTIFY_CHANGE_LAST_SET,
+            REG_NOTIFY_CHANGE_NAME, RegCloseKey, RegNotifyChangeKeyValue, RegOpenKeyExW,
+        };
+        use windows_sys::Win32::System::Threading::{
+            CreateEventW, INFINITE, WaitForSingleObject,
+        };
+
+        let _ = thread::Builder::new()
+            .name("texplorer-assoc-watch".to_string())
+            .spawn(move || {
+                let subkey: Vec<u16> =
+                    "Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\FileExts\0"
+                        .encode_utf16()
+                        .collect();
+                let mut hkey: HKEY = std::ptr::null_mut();
+                let open_rc = unsafe {
+                    RegOpenKeyExW(
+                        HKEY_CURRENT_USER,
+                        subkey.as_ptr(),
+                        0,
+                        KEY_NOTIFY,
+                        &mut hkey,
+                    )
+                };
+                if open_rc != 0 || hkey.is_null() {
+                    return;
+                }
+
+                // Auto-reset event for zero-CPU async registry notifications + trailing debounce.
+                let event =
+                    unsafe { CreateEventW(std::ptr::null(), 0, 0, std::ptr::null()) };
+                if event.is_null() {
+                    unsafe {
+                        let _ = RegCloseKey(hkey);
+                    }
+                    return;
+                }
+
+                let filter = REG_NOTIFY_CHANGE_NAME | REG_NOTIFY_CHANGE_LAST_SET;
+                let mut armed_rc =
+                    unsafe { RegNotifyChangeKeyValue(hkey, 1, filter, event, 1) };
+
+                while armed_rc == 0 {
+                    // Sleep at 0% CPU until any key/value under FileExts changes.
+                    let wait = unsafe { WaitForSingleObject(event, INFINITE) };
+                    if wait != WAIT_OBJECT_0 {
+                        break;
+                    }
+
+                    // Trailing-edge debounce: immediately re-arm so no write is ever missed, then
+                    // coalesce burst writes from OpenWith.exe (OpenWithList, UserChoice,
+                    // UserChoiceLatest) until 350ms of quiet after the last write.
+                    loop {
+                        armed_rc =
+                            unsafe { RegNotifyChangeKeyValue(hkey, 1, filter, event, 1) };
+                        if armed_rc != 0 {
+                            break;
+                        }
+                        let debounce = unsafe { WaitForSingleObject(event, 350) };
+                        if debounce == WAIT_TIMEOUT {
+                            // Quiet window elapsed and watcher is already armed for future edits.
+                            on_changed();
+                            break;
+                        }
+                        if debounce != WAIT_OBJECT_0 {
+                            armed_rc = 1;
+                            break;
+                        }
+                    }
+                }
+
+                unsafe {
+                    let _ = CloseHandle(event);
+                    let _ = RegCloseKey(hkey);
+                }
+            });
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let _ = on_changed;
     }
 }
 
