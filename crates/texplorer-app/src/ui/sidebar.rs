@@ -5,7 +5,7 @@ use gpui_kit::{
     assets::IconName as LucideIcon,
     component::{
         Icon, IconName, Sizable as _, Size, StyledExt as _,
-        button::{Button, ButtonVariants as _},
+        button::{Button, ButtonCustomVariant, ButtonVariants as _},
         h_flex,
         scroll::ScrollableElement as _,
         v_flex,
@@ -609,19 +609,38 @@ fn render_network_section(
     p: Palette,
     cx: &mut Context<Workspace>,
 ) -> impl IntoElement {
+    let p2p_active = ws.is_p2p_active();
+    let peer_count = ws.p2p_nearby_peers.len();
+
+    let p2p_btn = {
+        let btn = Button::new("sb-net-p2p")
+            .with_size(Size::XSmall)
+            .icon(LucideIcon::Radio)
+            .tooltip(if p2p_active {
+                "P2P Transfer Active — Click to manage or stop sharing"
+            } else {
+                "P2P Transfer (Send / Receive)"
+            })
+            .on_click(cx.listener(|this, _, window, cx| {
+                this.open_p2p_modal_from_sidebar(window, cx);
+            }));
+        if p2p_active {
+            // Always green (semantic status_success) regardless of theme accent color.
+            let active_green = ButtonCustomVariant::new(cx)
+                .color(soft_tint(p.status_success, 0.22))
+                .foreground(solid(p.status_success))
+                .hover(soft_tint(p.status_success, 0.30))
+                .active(soft_tint(p.status_success, 0.38));
+            btn.custom(active_green)
+        } else {
+            btn.ghost()
+        }
+    };
+
     let actions = h_flex()
         .items_center()
         .gap_0p5()
-        .child(
-            Button::new("sb-net-p2p")
-                .with_size(Size::XSmall)
-                .ghost()
-                .icon(LucideIcon::Radio)
-                .tooltip("P2P Transfer (Send / Receive)")
-                .on_click(cx.listener(|this, _, window, cx| {
-                    this.open_p2p_modal_from_sidebar(window, cx);
-                })),
-        )
+        .child(p2p_btn)
         .child(
             Button::new("sb-net-add")
                 .with_size(Size::XSmall)
@@ -633,9 +652,6 @@ fn render_network_section(
                 })),
         )
         .into_any_element();
-
-    let active_share_count = usize::from(ws.active_p2p_share.is_some());
-    let peer_count = ws.p2p_nearby_peers.len();
 
     v_flex()
         .gap_0p5()
@@ -712,7 +728,9 @@ fn render_network_section(
                         .child(
                             Icon::new(LucideIcon::Send)
                                 .xsmall()
-                                .text_color(if active_share_count > 0 || peer_count > 0 {
+                                .text_color(if p2p_active {
+                                    solid(p.status_success)
+                                } else if peer_count > 0 {
                                     solid(p.accent_primary)
                                 } else {
                                     solid(p.text_secondary)
@@ -724,10 +742,14 @@ fn render_network_section(
                                 .min_w_0()
                                 .truncate()
                                 .text_xs()
-                                .text_color(solid(p.text_secondary))
+                                .text_color(if p2p_active {
+                                    solid(p.text_primary)
+                                } else {
+                                    solid(p.text_secondary)
+                                })
                                 .child("P2P Transfer"),
                         )
-                        .when(active_share_count > 0, |row| {
+                        .when(p2p_active, |row| {
                             row.child(
                                 div()
                                     .px_1p5()
@@ -740,7 +762,7 @@ fn render_network_section(
                                     .child("LIVE"),
                             )
                         })
-                        .when(active_share_count == 0 && peer_count > 0, |row| {
+                        .when(!p2p_active && peer_count > 0, |row| {
                             row.child(
                                 div()
                                     .px_1p5()

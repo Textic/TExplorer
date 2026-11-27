@@ -520,15 +520,21 @@ pub fn render_home_view(
                         .gap_2()
                         .child({
                             let active_count = ws.active_p2p_transfers.len();
+                            let p2p_active = ws.is_p2p_active();
                             let peer_count = ws.p2p_nearby_peers.len();
                             let subtitle: SharedString = if active_count > 0 {
                                 format!("{active_count} active encrypted transfer(s)").into()
                             } else if ws.active_p2p_share.is_some() {
-                                "Sharing active • click to view code".into()
+                                "Sharing active • click to view code or stop".into()
                             } else if peer_count > 0 {
                                 format!("{peer_count} nearby PC(s) on LAN • Internet & LAN").into()
                             } else {
                                 "Send & receive encrypted files over LAN or Internet".into()
+                            };
+                            let icon_hex = if p2p_active {
+                                p.status_success
+                            } else {
+                                p.accent_primary
                             };
                             h_flex()
                                 .id(match side {
@@ -544,9 +550,17 @@ pub fn render_home_view(
                                 .cursor_pointer()
                                 .bg(solid(p.bg_surface))
                                 .border_1()
-                                .border_color(solid(p.border_subtle))
+                                .border_color(if p2p_active {
+                                    soft_tint(p.status_success, 0.42)
+                                } else {
+                                    solid(p.border_subtle)
+                                })
                                 .hover(move |s| {
-                                    s.bg(solid(p.bg_elevated)).border_color(solid(p.border))
+                                    s.bg(solid(p.bg_elevated)).border_color(if p2p_active {
+                                        solid(p.status_success)
+                                    } else {
+                                        solid(p.border)
+                                    })
                                 })
                                 .on_mouse_down(
                                     MouseButton::Left,
@@ -563,11 +577,11 @@ pub fn render_home_view(
                                         .items_center()
                                         .justify_center()
                                         .rounded(px(RADIUS_CONTROL))
-                                        .bg(soft_tint(p.accent_primary, 0.12))
+                                        .bg(soft_tint(icon_hex, if p2p_active { 0.16 } else { 0.12 }))
                                         .child(
                                             Icon::new(LucideIcon::Radio)
                                                 .small()
-                                                .text_color(solid(p.accent_primary)),
+                                                .text_color(solid(icon_hex)),
                                         ),
                                 )
                                 .child(
@@ -576,18 +590,40 @@ pub fn render_home_view(
                                         .min_w_0()
                                         .gap_0p5()
                                         .child(
-                                            div()
-                                                .truncate()
-                                                .text_xs()
-                                                .font_semibold()
-                                                .text_color(solid(p.text_primary))
-                                                .child("P2P File Transfer"),
+                                            h_flex()
+                                                .items_center()
+                                                .gap_1p5()
+                                                .child(
+                                                    div()
+                                                        .truncate()
+                                                        .text_xs()
+                                                        .font_semibold()
+                                                        .text_color(solid(p.text_primary))
+                                                        .child("P2P File Transfer"),
+                                                )
+                                                .when(p2p_active, |el| {
+                                                    el.child(
+                                                        div()
+                                                            .px_1p5()
+                                                            .py(px(0.5))
+                                                            .rounded(px(3.))
+                                                            .bg(soft_tint(p.status_success, 0.16))
+                                                            .text_size(px(10.))
+                                                            .font_semibold()
+                                                            .text_color(solid(p.status_success))
+                                                            .child("LIVE"),
+                                                    )
+                                                }),
                                         )
                                         .child(
                                             div()
                                                 .truncate()
                                                 .text_size(px(13.))
-                                                .text_color(solid(p.text_muted))
+                                                .text_color(if p2p_active {
+                                                    solid(p.status_success)
+                                                } else {
+                                                    solid(p.text_muted)
+                                                })
                                                 .child(subtitle),
                                         ),
                                 )
