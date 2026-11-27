@@ -591,6 +591,88 @@ pub fn render_home_view(
                                                 .child(subtitle),
                                         ),
                                 )
+                        })
+                        .child({
+                            let da = &ws.disk_analyzer;
+                            let subtitle: SharedString = if da.scanning {
+                                "Scanning disk usage...".into()
+                            } else if let Some(ref tree) = da.tree
+                                && let Some(ref target) = da.target
+                            {
+                                let sz = tree
+                                    .get(tree.root)
+                                    .map(|r| r.logical_size)
+                                    .unwrap_or(0);
+                                format!(
+                                    "{} • {}",
+                                    target.label(),
+                                    format_size(sz, unit)
+                                )
+                                .into()
+                            } else {
+                                "Visualize folder sizes, Treemap, largest files & extensions".into()
+                            };
+                            h_flex()
+                                .id(match side {
+                                    PaneSide::Left => "home-tool-disk-l",
+                                    PaneSide::Right => "home-tool-disk-r",
+                                })
+                                .w_full()
+                                .min_w_0()
+                                .p_2p5()
+                                .gap_2p5()
+                                .items_center()
+                                .rounded(px(RADIUS_ROW))
+                                .cursor_pointer()
+                                .bg(solid(p.bg_surface))
+                                .border_1()
+                                .border_color(solid(p.border_subtle))
+                                .hover(move |s| {
+                                    s.bg(solid(p.bg_elevated)).border_color(solid(p.border))
+                                })
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|this, _: &MouseDownEvent, window, cx| {
+                                        this.open_disk_analyzer(None, false, window, cx);
+                                    }),
+                                )
+                                .child(
+                                    div()
+                                        .w(px(32.))
+                                        .h(px(32.))
+                                        .flex()
+                                        .flex_shrink_0()
+                                        .items_center()
+                                        .justify_center()
+                                        .rounded(px(RADIUS_CONTROL))
+                                        .bg(soft_tint(p.accent_primary, 0.12))
+                                        .child(
+                                            Icon::new(LucideIcon::HardDrive)
+                                                .small()
+                                                .text_color(solid(p.accent_primary)),
+                                        ),
+                                )
+                                .child(
+                                    v_flex()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .gap_0p5()
+                                        .child(
+                                            div()
+                                                .truncate()
+                                                .text_xs()
+                                                .font_semibold()
+                                                .text_color(solid(p.text_primary))
+                                                .child("Disk Space Analyzer"),
+                                        )
+                                        .child(
+                                            div()
+                                                .truncate()
+                                                .text_size(px(13.))
+                                                .text_color(solid(p.text_muted))
+                                                .child(subtitle),
+                                        ),
+                                )
                         }),
                 ),
         )

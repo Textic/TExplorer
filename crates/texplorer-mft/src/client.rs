@@ -1,9 +1,10 @@
 //! IPC client and Windows SCM lifecycle helper for `TExplorerIndexService` (`texplorer-service.exe`).
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::protocol::{
-    FolderSizeEntry, IndexServiceStatus, SearchResponse,
+    ExportedMftNode, FolderSizeEntry, IndexServiceStatus, SearchResponse,
 };
 
 /// Installation & runtime state of the optional Windows background index service.
@@ -258,4 +259,105 @@ pub fn rebuild_index_via_service() -> Result<(), String> {
         crate::protocol::IndexResponse::Error(err) => Err(err),
         _ => Err("Unexpected rebuild response from TExplorer Index Service.".to_string()),
     }
+}
+
+/// Streams a complete NTFS volume tree (or a scoped folder subtree) from `TExplorerIndexService`
+/// in compact binary chunks.
+#[cfg(target_os = "windows")]
+pub fn export_volume_tree_via_service<F>(
+    drive_letter: char,
+    scope_path: Option<String>,
+    cancel: &AtomicBool,
+    mut on_chunk: F,
+) -> Result<(), String>
+where
+    F: FnMut(Vec<ExportedMftNode>),
+{
+    use std::fs::OpenOptions;
+    use std::io::{BufReader, BufWriter};
+    use windows_sys::Win32::Foundation::ERROR_PIPE_BUSY;
+    use windows_sys::Win32::System::Pipes::WaitNamedPipeW;
+
+    use crate::protocol::{
+        FRAME_JSON_REQ, FRAME_JSON_RESP, FRAME_TREE_CHUNK, FRAME_TREE_DONE, IndexRequest,
+        IndexResponse, PIPE_NAME, decode_tree_chunk, read_frame, write_json_frame,
+    };
+
+    let wide_pipe: Vec<u16> = PIPE_NAME.encode_utf16().chain(std::iter::once(0)).collect();
+    let mut pipe_file = None;
+    for attempt in 0..8 {
+        if cancel.load(Ordering::Relaxed) {
+            return Err("Scan cancelled.".to_string());
+        }
+        match OpenOptions::new().read(true).write(true).open(PIPE_NAME) {
+            Ok(f) => {
+                pipe_file = Some(f);
+                break;
+            }
+            Err(err) => {
+                if err.raw_os_error() == Some(ERROR_PIPE_BUSY as i32) && attempt < 7 {
+                    unsafe {
+                        let _ = WaitNamedPipeW(wide_pipe.as_ptr(), 800);
+                    }
+                    continue;
+                }
+                return Err(format!("TExplorer Index Service unavailable: {err}"));
+            }
+        }
+    }
+    let pipe = pipe_file.ok_or_else(|| "TExplorer Index Service pipe busy.".to_string())?;
+    let pipe_read = pipe
+        .try_clone()
+        .map_err(|e| format!("Failed cloning IPC pipe handle: {e}"))?;
+    let mut writer = BufWriter::new(pipe);
+    let mut reader = BufReader::with_capacity(256 * 1024, pipe_read);
+
+    write_json_frame(
+        &mut writer,
+        FRAME_JSON_REQ,
+        &IndexRequest::ExportVolumeTree {
+            drive_letter: drive_letter.to_ascii_uppercase(),
+            scope_path,
+        },
+    )?;
+
+    loop {
+        if cancel.load(Ordering::Relaxed) {
+            return Err("Scan cancelled.".to_string());
+        }
+        let (kind, payload) = read_frame(&mut reader)?;
+        match kind {
+            FRAME_TREE_CHUNK => {
+                let nodes = decode_tree_chunk(&payload)?;
+                on_chunk(nodes);
+            }
+            FRAME_TREE_DONE => return Ok(()),
+            FRAME_JSON_RESP => {
+                let resp: IndexResponse = serde_json::from_slice(&payload).map_err(|e| {
+                    format!("Invalid JSON response from TExplorer Index Service: {e}")
+                })?;
+                return match resp {
+                    IndexResponse::Error(msg) => Err(msg),
+                    _ => Err("Unexpected response to ExportVolumeTree request.".to_string()),
+                };
+            }
+            _ => {
+                return Err("Unexpected frame kind from TExplorer Index Service.".to_string());
+            }
+        }
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn export_volume_tree_via_service<F>(
+    _drive_letter: char,
+    _scope_path: Option<String>,
+    _cancel: &AtomicBool,
+    _on_chunk: F,
+) -> Result<(), String>
+where
+    F: FnMut(Vec<ExportedMftNode>),
+{
+    let _ = Ordering::Relaxed;
+    Err("TExplorer Index Service is only available on Windows.".to_string())
 }

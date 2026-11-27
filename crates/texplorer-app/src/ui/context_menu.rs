@@ -10,6 +10,7 @@ use texplorer_core::{
     FileEntry, KnownFolder, KnownFolderKind, Location, NetworkConnection, NetworkProtocol,
     PaneSide, SidebarSection, VolumeInfo,
 };
+use texplorer_disk::{DiskScanTarget, NodeId};
 use uuid::Uuid;
 
 use crate::theme::{RADIUS_CONTROL, RADIUS_ROW, soft_tint, solid};
@@ -36,6 +37,14 @@ pub enum ContextMenuTarget {
     NetworkConnection(NetworkConnection),
     SidebarSection(SidebarSection),
     SidebarBackground,
+    DiskNode {
+        node_id: NodeId,
+        path: Option<PathBuf>,
+        is_dir: bool,
+        can_zoom_in: bool,
+        can_zoom_out: bool,
+        can_delete: bool,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -95,6 +104,12 @@ enum MenuAction {
     HideSidebarSection(SidebarSection),
     OpenSidebarSettings,
     SendViaP2p(Vec<PathBuf>),
+    AnalyzeDiskTarget(DiskScanTarget),
+    DiskRevealInExplorer(NodeId),
+    DiskOpenItem(NodeId),
+    DiskZoomIn(NodeId),
+    DiskZoomOut,
+    DiskPromptTrash(NodeId),
     OpenNetworkConn(Box<NetworkConnection>, bool),
     OpenNetworkConnSplit(Box<NetworkConnection>),
     OpenSshTerminal(Box<NetworkConnection>),
@@ -461,6 +476,16 @@ fn build_rows(ws: &Workspace, target: &ContextMenuTarget) -> Vec<MenuRow> {
                 });
                 if is_dir {
                     rows.push(MenuRow::Item {
+                        id: "ctx-analyze-folder",
+                        label: "Analyze Folder Space".into(),
+                        shortcut: None,
+                        icon: MenuIcon::Lucide(LucideIcon::HardDrive),
+                        danger: false,
+                        action: MenuAction::AnalyzeDiskTarget(DiskScanTarget::Folder(
+                            path_buf.clone(),
+                        )),
+                    });
+                    rows.push(MenuRow::Item {
                         id: "ctx-pin",
                         label: "Pin to Sidebar".into(),
                         shortcut: None,
@@ -710,6 +735,14 @@ fn build_rows(ws: &Workspace, target: &ContextMenuTarget) -> Vec<MenuRow> {
                 action: MenuAction::OpenTerminal(directory.clone()),
             },
             MenuRow::Item {
+                id: "ctx-bg-analyze",
+                label: "Analyze Folder Space".into(),
+                shortcut: None,
+                icon: MenuIcon::Lucide(LucideIcon::HardDrive),
+                danger: false,
+                action: MenuAction::AnalyzeDiskTarget(DiskScanTarget::Folder(directory.clone())),
+            },
+            MenuRow::Item {
                 id: "ctx-bg-pin",
                 label: "Pin Current Folder".into(),
                 shortcut: None,
@@ -765,6 +798,16 @@ fn build_rows(ws: &Workspace, target: &ContextMenuTarget) -> Vec<MenuRow> {
                     action: MenuAction::OpenOppositePane(loc),
                 },
                 MenuRow::Separator,
+                MenuRow::Item {
+                    id: "ctx-qa-analyze",
+                    label: "Analyze Folder Space".into(),
+                    shortcut: None,
+                    icon: MenuIcon::Lucide(LucideIcon::HardDrive),
+                    danger: false,
+                    action: MenuAction::AnalyzeDiskTarget(DiskScanTarget::Folder(
+                        folder.path.clone(),
+                    )),
+                },
                 MenuRow::Item {
                     id: "ctx-qa-copy-path",
                     label: "Copy Path".into(),
@@ -831,6 +874,14 @@ fn build_rows(ws: &Workspace, target: &ContextMenuTarget) -> Vec<MenuRow> {
                     action: MenuAction::OpenOppositePane(loc),
                 },
                 MenuRow::Separator,
+                MenuRow::Item {
+                    id: "ctx-vol-analyze",
+                    label: "Analyze Disk Space".into(),
+                    shortcut: None,
+                    icon: MenuIcon::Lucide(LucideIcon::HardDrive),
+                    danger: false,
+                    action: MenuAction::AnalyzeDiskTarget(DiskScanTarget::Volume(vol.clone())),
+                },
                 MenuRow::Item {
                     id: "ctx-vol-terminal",
                     label: "Open Terminal Here".into(),
@@ -981,6 +1032,127 @@ fn build_rows(ws: &Workspace, target: &ContextMenuTarget) -> Vec<MenuRow> {
             danger: false,
             action: MenuAction::OpenSidebarSettings,
         }],
+        ContextMenuTarget::DiskNode {
+            node_id,
+            path,
+            is_dir,
+            can_zoom_in,
+            can_zoom_out,
+            can_delete,
+        } => {
+            let mut rows = Vec::new();
+            if path.is_some() {
+                rows.push(MenuRow::Item {
+                    id: "ctx-da-reveal",
+                    label: "Open in TExplorer".into(),
+                    shortcut: None,
+                    icon: MenuIcon::Lucide(LucideIcon::FolderOpen),
+                    danger: false,
+                    action: MenuAction::DiskRevealInExplorer(*node_id),
+                });
+                if !*is_dir {
+                    rows.push(MenuRow::Item {
+                        id: "ctx-da-open",
+                        label: "Open File".into(),
+                        shortcut: None,
+                        icon: MenuIcon::Lucide(LucideIcon::ExternalLink),
+                        danger: false,
+                        action: MenuAction::DiskOpenItem(*node_id),
+                    });
+                }
+            }
+            if *can_zoom_in {
+                rows.push(MenuRow::Item {
+                    id: "ctx-da-zoom-in",
+                    label: "Zoom In Treemap".into(),
+                    shortcut: None,
+                    icon: MenuIcon::Lucide(LucideIcon::LayoutGrid),
+                    danger: false,
+                    action: MenuAction::DiskZoomIn(*node_id),
+                });
+            }
+            if *can_zoom_out {
+                rows.push(MenuRow::Item {
+                    id: "ctx-da-zoom-out",
+                    label: "Zoom Out Treemap".into(),
+                    shortcut: None,
+                    icon: MenuIcon::Lucide(LucideIcon::ArrowUp),
+                    danger: false,
+                    action: MenuAction::DiskZoomOut,
+                });
+            }
+            if *is_dir
+                && let Some(dir_path) = path
+            {
+                rows.push(MenuRow::Item {
+                    id: "ctx-da-scan-folder",
+                    label: "Scan This Folder Only".into(),
+                    shortcut: None,
+                    icon: MenuIcon::Lucide(LucideIcon::HardDrive),
+                    danger: false,
+                    action: MenuAction::AnalyzeDiskTarget(DiskScanTarget::Folder(dir_path.clone())),
+                });
+            }
+            if let Some(local_path) = path {
+                if !rows.is_empty() {
+                    rows.push(MenuRow::Separator);
+                }
+                rows.push(MenuRow::Item {
+                    id: "ctx-da-copy-path",
+                    label: "Copy Path".into(),
+                    shortcut: None,
+                    icon: MenuIcon::Lucide(LucideIcon::Copy),
+                    danger: false,
+                    action: MenuAction::CopyPath(local_path.display().to_string()),
+                });
+                let term_dir = if *is_dir {
+                    local_path.clone()
+                } else {
+                    local_path
+                        .parent()
+                        .map(std::path::Path::to_path_buf)
+                        .unwrap_or_else(|| local_path.clone())
+                };
+                rows.push(MenuRow::Item {
+                    id: "ctx-da-terminal",
+                    label: "Open Terminal Here".into(),
+                    shortcut: None,
+                    icon: MenuIcon::Lucide(LucideIcon::Terminal),
+                    danger: false,
+                    action: MenuAction::OpenTerminal(term_dir),
+                });
+                rows.push(MenuRow::Item {
+                    id: "ctx-da-win-explorer",
+                    label: "Reveal in Windows Explorer".into(),
+                    shortcut: None,
+                    icon: MenuIcon::Lucide(LucideIcon::Folder),
+                    danger: false,
+                    action: MenuAction::RevealInWindowsExplorer(local_path.clone()),
+                });
+                rows.push(MenuRow::Item {
+                    id: "ctx-da-props",
+                    label: "Properties".into(),
+                    shortcut: None,
+                    icon: MenuIcon::Lucide(LucideIcon::Settings),
+                    danger: false,
+                    action: MenuAction::ShowProperties(local_path.clone()),
+                });
+            }
+            if *can_delete {
+                if !rows.is_empty() {
+                    rows.push(MenuRow::Separator);
+                }
+                rows.push(MenuRow::Item {
+                    id: "ctx-da-trash",
+                    label: "Move to Recycle Bin".into(),
+                    shortcut: None,
+                    icon: MenuIcon::Kit(IconName::Delete),
+                    danger: true,
+                    action: MenuAction::DiskPromptTrash(*node_id),
+                });
+            }
+            rows
+        }
     }
 }
 
@@ -1038,6 +1210,25 @@ fn execute_action(
         }
         MenuAction::SendViaP2p(paths) => {
             ws.open_p2p_send_modal(paths, window, cx);
+        }
+        MenuAction::AnalyzeDiskTarget(target) => {
+            ws.open_disk_analyzer(Some(target), ws.settings.show_tabs, window, cx);
+        }
+        MenuAction::DiskRevealInExplorer(nid) => {
+            ws.reveal_disk_node_in_explorer(nid, window, cx);
+        }
+        MenuAction::DiskOpenItem(nid) => {
+            ws.open_disk_node_item(nid, window, cx);
+        }
+        MenuAction::DiskZoomIn(nid) => {
+            ws.set_disk_treemap_root(nid, cx);
+            ws.select_disk_node(nid, true, cx);
+        }
+        MenuAction::DiskZoomOut => {
+            ws.disk_treemap_zoom_up(cx);
+        }
+        MenuAction::DiskPromptTrash(nid) => {
+            ws.prompt_trash_disk_node(nid, cx);
         }
         MenuAction::OpenNetworkConn(conn, new_tab) => {
             ws.open_network_connection(*conn, new_tab, window, cx);

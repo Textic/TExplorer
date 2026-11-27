@@ -22,6 +22,8 @@ pub const FLAG_IS_COMPRESSED: u16 = 1 << 5;
 
 pub const FRAME_JSON_REQ: u8 = 1;
 pub const FRAME_JSON_RESP: u8 = 2;
+pub const FRAME_TREE_CHUNK: u8 = 3;
+pub const FRAME_TREE_DONE: u8 = 4;
 
 const MAX_FRAME_BYTES: usize = 32 * 1024 * 1024;
 
@@ -38,6 +40,115 @@ pub enum IndexRequest {
         paths: Vec<String>,
     },
     RebuildIndex,
+    /// Read-only bulk export of an indexed volume (or scoped folder subtree) in compact binary chunks.
+    ExportVolumeTree {
+        drive_letter: char,
+        #[serde(default)]
+        scope_path: Option<String>,
+    },
+}
+
+/// Compact DFS-ordered node record streamed in binary `FRAME_TREE_CHUNK` frames.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExportedMftNode {
+    /// Index of the parent node in the exported stream (`u32::MAX` for the root node).
+    pub parent_idx: u32,
+    pub logical_size: u64,
+    pub allocated_size: u64,
+    pub modified_secs: i64,
+    pub flags: u16,
+    pub name: String,
+}
+
+/// Encodes a batch of `ExportedMftNode` records into a compact little-endian binary chunk.
+pub fn encode_tree_chunk(nodes: &[ExportedMftNode]) -> Vec<u8> {
+    let est_bytes = 4 + nodes.iter().map(|n| 32 + n.name.len()).sum::<usize>();
+    let mut out = Vec::with_capacity(est_bytes);
+    out.extend_from_slice(&(nodes.len() as u32).to_le_bytes());
+    for node in nodes {
+        let name_bytes = node.name.as_bytes();
+        let name_len = name_bytes.len().min(u16::MAX as usize);
+        out.extend_from_slice(&node.parent_idx.to_le_bytes());
+        out.extend_from_slice(&node.logical_size.to_le_bytes());
+        out.extend_from_slice(&node.allocated_size.to_le_bytes());
+        out.extend_from_slice(&node.modified_secs.to_le_bytes());
+        out.extend_from_slice(&node.flags.to_le_bytes());
+        out.extend_from_slice(&(name_len as u16).to_le_bytes());
+        out.extend_from_slice(&name_bytes[..name_len]);
+    }
+    out
+}
+
+/// Decodes a binary `FRAME_TREE_CHUNK` payload back into `ExportedMftNode` records.
+pub fn decode_tree_chunk(payload: &[u8]) -> Result<Vec<ExportedMftNode>, String> {
+    if payload.len() < 4 {
+        return Err("Truncated tree chunk header.".to_string());
+    }
+    let count = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]) as usize;
+    let mut out = Vec::with_capacity(count.min(65_536));
+    let mut off = 4usize;
+
+    for _ in 0..count {
+        if off + 32 > payload.len() {
+            return Err("Truncated tree chunk record header.".to_string());
+        }
+        let parent_idx = u32::from_le_bytes([
+            payload[off],
+            payload[off + 1],
+            payload[off + 2],
+            payload[off + 3],
+        ]);
+        let logical_size = u64::from_le_bytes([
+            payload[off + 4],
+            payload[off + 5],
+            payload[off + 6],
+            payload[off + 7],
+            payload[off + 8],
+            payload[off + 9],
+            payload[off + 10],
+            payload[off + 11],
+        ]);
+        let allocated_size = u64::from_le_bytes([
+            payload[off + 12],
+            payload[off + 13],
+            payload[off + 14],
+            payload[off + 15],
+            payload[off + 16],
+            payload[off + 17],
+            payload[off + 18],
+            payload[off + 19],
+        ]);
+        let modified_secs = i64::from_le_bytes([
+            payload[off + 20],
+            payload[off + 21],
+            payload[off + 22],
+            payload[off + 23],
+            payload[off + 24],
+            payload[off + 25],
+            payload[off + 26],
+            payload[off + 27],
+        ]);
+        let flags = u16::from_le_bytes([payload[off + 28], payload[off + 29]]);
+        let name_len = u16::from_le_bytes([payload[off + 30], payload[off + 31]]) as usize;
+        off += 32;
+
+        if off + name_len > payload.len() {
+            return Err("Truncated tree chunk node name.".to_string());
+        }
+        let name = String::from_utf8_lossy(&payload[off..off + name_len]).into_owned();
+        off += name_len;
+
+        out.push(ExportedMftNode {
+            parent_idx,
+            logical_size,
+            allocated_size,
+            modified_secs,
+            flags,
+            name,
+        });
+    }
+
+    Ok(out)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -182,5 +293,30 @@ mod tests {
         let (k2, b2) = read_frame(&mut cur).unwrap();
         assert_eq!(k2, FRAME_JSON_RESP);
         assert_eq!(serde_json::from_slice::<IndexResponse>(&b2).unwrap(), resp);
+    }
+
+    #[test]
+    fn round_trips_binary_tree_chunks() {
+        let nodes = vec![
+            ExportedMftNode {
+                parent_idx: u32::MAX,
+                logical_size: 0,
+                allocated_size: 0,
+                modified_secs: 1_700_000_000,
+                flags: FLAG_IS_DIR,
+                name: r"C:\".to_string(),
+            },
+            ExportedMftNode {
+                parent_idx: 0,
+                logical_size: 12_345,
+                allocated_size: 16_384,
+                modified_secs: 1_700_000_500,
+                flags: FLAG_IS_HIDDEN,
+                name: "pagefile.sys".to_string(),
+            },
+        ];
+        let encoded = encode_tree_chunk(&nodes);
+        let decoded = decode_tree_chunk(&encoded).unwrap();
+        assert_eq!(decoded, nodes);
     }
 }

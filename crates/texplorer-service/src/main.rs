@@ -45,9 +45,10 @@ mod win_service {
     use rayon::prelude::*;
     use texplorer_mft::mft_raw::scan_volume_mft_entries;
     use texplorer_mft::protocol::{
-        FLAG_IS_DIR, FRAME_JSON_REQ, FRAME_JSON_RESP, IndexRequest, IndexResponse, PIPE_NAME,
-        PROTOCOL_VERSION, SERVICE_DESCRIPTION, SERVICE_DISPLAY_NAME, SERVICE_NAME, read_frame,
-        write_json_frame,
+        FLAG_IS_DIR, FRAME_JSON_REQ, FRAME_JSON_RESP, FRAME_TREE_CHUNK, FRAME_TREE_DONE,
+        IndexRequest, IndexResponse, PIPE_NAME, PROTOCOL_VERSION, SERVICE_DESCRIPTION,
+        SERVICE_DISPLAY_NAME, SERVICE_NAME, encode_tree_chunk, read_frame, write_json_frame,
+        write_raw_frame,
     };
     use texplorer_mft::usn::{UsnDelta, poll_usn_changes, query_usn_journal};
     use texplorer_mft::{MultiVolumeIndex, VolumeIndex};
@@ -61,8 +62,8 @@ mod win_service {
     };
     use windows_sys::Win32::Security::{PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES};
     use windows_sys::Win32::Storage::FileSystem::{
-        FILE_FLAG_OVERLAPPED, FlushFileBuffers, GetDriveTypeW, GetLogicalDriveStringsW,
-        GetVolumeInformationW, PIPE_ACCESS_DUPLEX, ReadFile, WriteFile,
+        FILE_FLAG_OVERLAPPED, FlushFileBuffers, GetDiskFreeSpaceW, GetDriveTypeW,
+        GetLogicalDriveStringsW, GetVolumeInformationW, PIPE_ACCESS_DUPLEX, ReadFile, WriteFile,
     };
     use windows_sys::Win32::System::IO::{GetOverlappedResult, OVERLAPPED};
     use windows_sys::Win32::System::Pipes::{
@@ -946,8 +947,57 @@ mod win_service {
                 spawn_full_index_build(index);
                 IndexResponse::Ack
             }
+            IndexRequest::ExportVolumeTree {
+                drive_letter,
+                scope_path,
+            } => {
+                let cluster_size = query_drive_cluster_size(drive_letter);
+                let exported = match index.read() {
+                    Ok(guard) => {
+                        guard.export_volume_tree(drive_letter, scope_path.as_deref(), cluster_size)
+                    }
+                    Err(_) => Err("Index lock poisoned.".to_string()),
+                };
+                match exported {
+                    Ok(nodes) => {
+                        const CHUNK_NODES: usize = 32_768;
+                        for chunk in nodes.chunks(CHUNK_NODES) {
+                            let payload = encode_tree_chunk(chunk);
+                            if write_raw_frame(&mut stream, FRAME_TREE_CHUNK, &payload).is_err() {
+                                return;
+                            }
+                        }
+                        let _ = write_raw_frame(&mut stream, FRAME_TREE_DONE, &[]);
+                        return;
+                    }
+                    Err(err) => IndexResponse::Error(err),
+                }
+            }
         };
 
         let _ = write_json_frame(&mut stream, FRAME_JSON_RESP, &response);
+    }
+
+    fn query_drive_cluster_size(drive_letter: char) -> u64 {
+        let root = format!("{}:\\", drive_letter.to_ascii_uppercase());
+        let wide = to_wide(&root);
+        let mut sectors_per_cluster: u32 = 0;
+        let mut bytes_per_sector: u32 = 0;
+        let mut free_clusters: u32 = 0;
+        let mut total_clusters: u32 = 0;
+        let ok = unsafe {
+            GetDiskFreeSpaceW(
+                wide.as_ptr(),
+                &mut sectors_per_cluster,
+                &mut bytes_per_sector,
+                &mut free_clusters,
+                &mut total_clusters,
+            )
+        };
+        if ok != 0 && sectors_per_cluster > 0 && bytes_per_sector > 0 {
+            u64::from(sectors_per_cluster).saturating_mul(u64::from(bytes_per_sector))
+        } else {
+            4096
+        }
     }
 }

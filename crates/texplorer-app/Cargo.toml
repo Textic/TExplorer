@@ -24,6 +24,7 @@ serde.workspace = true
 sha2.workspace = true
 smallvec.workspace = true
 texplorer-core = { path = "../texplorer-core" }
+texplorer-disk = { path = "../texplorer-disk" }
 texplorer-mft = { path = "../texplorer-mft" }
 texplorer-net = { path = "../texplorer-net" }
 texplorer-ops = { path = "../texplorer-ops" }

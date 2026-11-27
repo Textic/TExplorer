@@ -42,6 +42,8 @@ pub enum Location {
         query: String,
         scope: SearchScope,
     },
+    /// Built-in Disk Space Analyzer tool view (Tree-Table, GPU Treemap, Top Files, Extensions).
+    DiskAnalyzer,
 }
 
 /// Clickable segment displayed in the pane breadcrumb bar.
@@ -126,6 +128,7 @@ impl Location {
                 SearchScope::Global => format!("search://{query}"),
                 SearchScope::Folder(dir) => format!("search://{}?in={}", query, dir.display()),
             },
+            Self::DiskAnalyzer => "Disk Space Analyzer".to_string(),
         }
     }
 
@@ -180,6 +183,7 @@ impl Location {
                     format!("Search: {}", query.trim())
                 }
             }
+            Self::DiskAnalyzer => "Disk Space Analyzer".to_string(),
         }
     }
 
@@ -232,6 +236,7 @@ impl Location {
                 SearchScope::Global => Some(Self::Home),
                 SearchScope::Folder(dir) => Some(Self::local(dir)),
             },
+            Self::DiskAnalyzer => Some(Self::Home),
         }
     }
 
@@ -326,6 +331,12 @@ impl Location {
                 out.push(BreadcrumbSegment {
                     label: format!("Search: {query}"),
                     target: self.clone(),
+                });
+            }
+            Self::DiskAnalyzer => {
+                out.push(BreadcrumbSegment {
+                    label: "Disk Space Analyzer".to_string(),
+                    target: Self::DiskAnalyzer,
                 });
             }
         }
