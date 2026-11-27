@@ -390,6 +390,46 @@ pub struct MarqueeSelection {
     pub initial_selection: Vec<usize>,
 }
 
+/// Tracks the last single-clicked target so rapid clicks after opening or navigating into a folder
+/// (where GPUI reports `click_count >= 3` at the same screen coordinates within Windows' double-click
+/// interval) never activate a newly revealed item on its first click, while still allowing fast
+/// consecutive double-clicks through nested folders without pausing.
+#[derive(Debug, Clone)]
+struct DoubleClickGuard<T> {
+    armed: Option<T>,
+}
+
+impl<T> Default for DoubleClickGuard<T> {
+    fn default() -> Self {
+        Self { armed: None }
+    }
+}
+
+impl<T: PartialEq> DoubleClickGuard<T> {
+    fn reset(&mut self) {
+        self.armed = None;
+    }
+
+    fn register_click(
+        &mut self,
+        target: T,
+        click_count: usize,
+        has_selection_modifiers: bool,
+    ) -> bool {
+        if has_selection_modifiers {
+            self.armed = None;
+            return false;
+        }
+        if click_count >= 2 && self.armed.as_ref() == Some(&target) {
+            self.armed = None;
+            true
+        } else {
+            self.armed = Some(target);
+            false
+        }
+    }
+}
+
 /// Root GPUI view coordinating tabs, dual-pane splits, transfers, preview/QuickLook, and OS shell.
 pub struct Workspace {
     focus_handle: FocusHandle,
@@ -458,6 +498,8 @@ pub struct Workspace {
     pub marquee: Option<MarqueeSelection>,
     pub column_resize: Option<ColumnResizeState>,
     entry_claimed_mouse_down: bool,
+    entry_double_click: DoubleClickGuard<(PaneSide, Location)>,
+    disk_double_click: DoubleClickGuard<NodeId>,
     remote_pool: RemoteClientPool,
     session_passwords: HashMap<Uuid, String>,
     session_sudo_passwords: HashMap<Uuid, String>,
@@ -611,6 +653,8 @@ impl Workspace {
             marquee: None,
             column_resize: None,
             entry_claimed_mouse_down: false,
+            entry_double_click: DoubleClickGuard::default(),
+            disk_double_click: DoubleClickGuard::default(),
             remote_pool: RemoteClientPool::new(),
             session_passwords: HashMap::new(),
             session_sudo_passwords: HashMap::new(),
@@ -2528,6 +2572,7 @@ impl Workspace {
     }
 
     fn reload_pane_by_id(&mut self, tab_id: Uuid, side: PaneSide, cx: &mut Context<Self>) {
+        self.entry_double_click.reset();
         if let Some(prev_cancel) = self.folder_size_cancels.remove(&(tab_id, side)) {
             prev_cancel.store(true, Ordering::Relaxed);
         }
@@ -2887,17 +2932,31 @@ impl Workspace {
         self.entry_claimed_mouse_down = true;
         self.marquee = None;
         self.context_menu = None;
+        let has_selection_modifiers = ev.modifiers.shift || ev.modifiers.control;
+        let clicked_entry = self
+            .active_tab()
+            .and_then(|tab| tab.model.pane(side).visible_entry(vis_idx))
+            .map(|e| (e.location.clone(), e.is_dir()));
+        let is_double_click = clicked_entry.as_ref().is_some_and(|(loc, _)| {
+            self.entry_double_click.register_click(
+                (side, loc.clone()),
+                ev.click_count,
+                has_selection_modifiers,
+            )
+        });
+        if clicked_entry.is_none() {
+            self.entry_double_click.reset();
+        }
         let open_target = {
             let Some(tab) = self.active_tab_mut() else {
                 return;
             };
             tab.model.active_pane = side;
             let pane = tab.model.pane_mut(side);
-            if ev.click_count >= 2 {
+            if is_double_click {
                 pane.selection.select_only(vis_idx);
                 pane.recompute_selection_bytes();
-                pane.visible_entry(vis_idx)
-                    .map(|e| (e.location.clone(), e.is_dir()))
+                clicked_entry
             } else {
                 if ev.modifiers.shift {
                     pane.selection.select_range(vis_idx, ev.modifiers.control);
@@ -2958,6 +3017,7 @@ impl Workspace {
         if std::mem::take(&mut self.entry_claimed_mouse_down) {
             return;
         }
+        self.entry_double_click.reset();
         self.context_menu = None;
         self.focus_handle.focus(window, cx);
 
@@ -3382,6 +3442,7 @@ impl Workspace {
         ev: &MouseDownEvent,
         cx: &mut Context<Self>,
     ) {
+        self.entry_double_click.reset();
         let entry_opt = {
             let Some(tab) = self.active_tab_mut() else {
                 return;
@@ -7722,6 +7783,7 @@ impl Workspace {
     }
 
     pub fn set_disk_treemap_root(&mut self, id: NodeId, cx: &mut Context<Self>) {
+        self.disk_double_click.reset();
         let Some(tree) = &self.disk_analyzer.tree else {
             return;
         };
@@ -7736,6 +7798,7 @@ impl Workspace {
     }
 
     pub fn disk_treemap_zoom_up(&mut self, cx: &mut Context<Self>) {
+        self.disk_double_click.reset();
         let Some(tree) = &self.disk_analyzer.tree else {
             return;
         };
@@ -7747,6 +7810,11 @@ impl Workspace {
             self.disk_analyzer.treemap_hovered = None;
             cx.notify();
         }
+    }
+
+    pub fn register_disk_node_click(&mut self, node_id: NodeId, click_count: usize) -> bool {
+        self.disk_double_click
+            .register_click(node_id, click_count, false)
     }
 
     pub fn handle_disk_treemap_hover(&mut self, pos: Point<Pixels>, cx: &mut Context<Self>) {
@@ -7782,9 +7850,10 @@ impl Workspace {
             cache.layout.hit_test(lx, ly)
         };
         let Some(nid) = hit else {
+            self.disk_double_click.reset();
             return;
         };
-        if click_count >= 2 {
+        if self.register_disk_node_click(nid, click_count) {
             self.set_disk_treemap_root(nid, cx);
             self.select_disk_node(nid, true, cx);
         } else {
@@ -8743,5 +8812,35 @@ mod transfer_drop_tests {
             multi,
             format!("\"C:\\Dir\\a.txt\"{expected_sep}\"C:\\Dir\\b c.txt\"")
         );
+    }
+
+    #[test]
+    fn double_click_guard_requires_two_clicks_on_same_item_after_navigation() {
+        let mut guard = DoubleClickGuard::<(PaneSide, Location)>::default();
+        let folder_a = (PaneSide::Left, Location::local(r"C:\FolderA"));
+        let folder_b = (PaneSide::Left, Location::local(r"C:\FolderA\FolderB"));
+        let file_c = (PaneSide::Left, Location::local(r"C:\FolderA\FolderB\notes.txt"));
+
+        // Click 1 & 2 on FolderA -> opens FolderA on click 2.
+        assert!(!guard.register_click(folder_a.clone(), 1, false));
+        assert!(guard.register_click(folder_a.clone(), 2, false));
+
+        // Rapid click 3 at the exact same row position now hits FolderB (GPUI emits click_count=3).
+        // Must ONLY select FolderB, NOT open it on one click.
+        assert!(!guard.register_click(folder_b.clone(), 3, false));
+        // Rapid click 4 on FolderB (second click on FolderB) DOES open FolderB cleanly.
+        assert!(guard.register_click(folder_b.clone(), 4, false));
+
+        // Slow single clicks (click_count=1 after OS double-click interval) never activate.
+        assert!(!guard.register_click(file_c.clone(), 1, false));
+        assert!(!guard.register_click(file_c.clone(), 1, false));
+
+        // Triple-clicking a file must not launch it a second time on click 3.
+        assert!(guard.register_click(file_c.clone(), 2, false));
+        assert!(!guard.register_click(file_c.clone(), 3, false));
+
+        // Holding Ctrl/Shift while clicking rapidly never activates.
+        assert!(!guard.register_click(file_c.clone(), 1, true));
+        assert!(!guard.register_click(file_c, 2, true));
     }
 }
