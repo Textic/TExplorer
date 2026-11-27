@@ -557,6 +557,11 @@ $form.ClientSize = New-Object System.Drawing.Size(430, 152)
 $form.BackColor = $bgColor
 $form.TopMost = $true
 $form.ShowInTaskbar = $true
+try {
+    if ($targetExe -and (Test-Path -LiteralPath $targetExe)) {
+        $form.Icon = [System.Drawing.Icon]::ExtractAssociatedIcon($targetExe)
+    }
+} catch {}
 
 $form.Add_Paint({
     param($s, $e)
@@ -642,12 +647,32 @@ try {
         }
         Pump-Sleep 150
     }
+    # Stop the lightweight Win+E daemon and wait for all TExplorer processes from this install folder to exit.
+    try {
+        if ($targetExe -and (Test-Path -LiteralPath $targetExe)) {
+            $stopProc = Start-Process -FilePath $targetExe -ArgumentList '--stop-win-e-daemon' -WindowStyle Hidden -PassThru
+            if ($stopProc) { $null = $stopProc.WaitForExit(3000) }
+        }
+    } catch {}
+    for ($i = 0; $i -lt 40; $i++) {
+        $others = @()
+        try {
+            $others = @(Get-Process -Name 'texplorer' -ErrorAction SilentlyContinue | Where-Object {
+                try { $_.Path -and ($_.Path -ieq $targetExe) } catch { $false }
+            })
+        } catch {}
+        if ($others.Count -eq 0) {
+            break
+        }
+        Pump-Sleep 150
+    }
     Pump-Sleep 250
 
     if ($mode -eq 'setup') {
         Set-ProgressUi "Installing TExplorer $newVersion..." 30
         $scopeArg = if ($allUsers -eq '1') { '/ALLUSERS' } else { '/CURRENTUSER' }
-        $argsLine = '/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /CLOSEAPPLICATIONS /SP- ' + $scopeArg + ' /DIR="' + $installDir + '"'
+        $innoLog = Join-Path $stageDir 'inno-setup.log'
+        $argsLine = '/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /CLOSEAPPLICATIONS /NORESTARTAPPLICATIONS /SP- ' + $scopeArg + ' /DIR="' + $installDir + '" /LOG="' + $innoLog + '"'
         if ($needsElevation -eq '1') {
             $detailLbl.Text = "Waiting for administrator approval (UAC) and installer..."
             [System.Windows.Forms.Application]::DoEvents()
@@ -733,6 +758,14 @@ try {
     $errMsg = $_.ToString()
     try {
         "$(Get-Date -Format o) UPDATE FAILED: $errMsg" | Out-File -LiteralPath $logFile -Encoding utf8
+        $innoLog = Join-Path $stageDir 'inno-setup.log'
+        if ($stageDir -and (Test-Path -LiteralPath $innoLog)) {
+            $tail = Get-Content -LiteralPath $innoLog -Tail 35 -ErrorAction SilentlyContinue
+            if ($tail) {
+                "--- Inno Setup log tail ---" | Out-File -LiteralPath $logFile -Append -Encoding utf8
+                $tail | Out-File -LiteralPath $logFile -Append -Encoding utf8
+            }
+        }
     } catch {}
     $titleLbl.Text = "TExplorer update could not complete"
     $statusLbl.Text = $errMsg

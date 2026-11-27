@@ -1,5 +1,5 @@
 #ifndef MyAppVersion
-  #define MyAppVersion "0.8.0"
+  #define MyAppVersion "0.8.1"
 #endif
 #ifndef BinaryPath
   #define BinaryPath "..\..\target\release\texplorer.exe"
@@ -11,7 +11,7 @@
   #define OutputDir "..\..\dist"
 #endif
 #ifndef OutputBaseFilename
-  #define OutputBaseFilename "texplorer-v0.8.0-windows-x86_64-setup"
+  #define OutputBaseFilename "texplorer-v0.8.1-windows-x86_64-setup"
 #endif
 
 [Setup]
@@ -39,6 +39,7 @@ LZMANumBlockThreads=4
 SolidCompression=yes
 WizardStyle=modern
 CloseApplications=yes
+RestartApplications=no
 VersionInfoVersion={#MyAppVersion}.0
 
 [Languages]
@@ -62,7 +63,7 @@ Name: "{group}\{cm:UninstallProgram,TExplorer}"; Filename: "{uninstallexe}"
 Name: "{autodesktop}\TExplorer"; Filename: "{app}\texplorer.exe"; IconFilename: "{app}\texplorer.exe"; Tasks: desktopicon
 
 [Run]
-Filename: "{app}\texplorer-service.exe"; Parameters: "--restart-if-installed"; Flags: runhidden waituntilterminated skipifsilent
+Filename: "{app}\texplorer-service.exe"; Parameters: "--restart-if-installed"; Flags: runhidden waituntilterminated
 Filename: "{app}\texplorer-service.exe"; Parameters: "--install"; Verb: "runas"; Tasks: mftservice; Flags: shellexec runhidden waituntilterminated skipifsilent
 Filename: "{app}\texplorer.exe"; Parameters: "--enable-default-explorer"; Tasks: defaultexplorer and not defaultexplorer\wine; Flags: runhidden waituntilterminated runasoriginaluser
 Filename: "{app}\texplorer.exe"; Parameters: "--enable-default-explorer-win-e"; Tasks: defaultexplorer\wine; Flags: runhidden waituntilterminated runasoriginaluser
@@ -77,6 +78,7 @@ Filename: "{app}\texplorer.exe"; Parameters: "--restore-explorer"; RunOnceId: "R
 function PrepareToInstall(var NeedsRestart: Boolean): String;
 var
   ExePath: String;
+  ServicePath: String;
   ResultCode: Integer;
 begin
   Result := '';
@@ -85,4 +87,10 @@ begin
   begin
     Exec(ExePath, '--stop-win-e-daemon', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
   end;
+  ServicePath := ExpandConstant('{app}\texplorer-service.exe');
+  if FileExists(ServicePath) then
+  begin
+    Exec(ServicePath, '--stop', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  end;
+  Sleep(500);
 end;
