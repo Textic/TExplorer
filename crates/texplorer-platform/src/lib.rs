@@ -21,7 +21,9 @@ pub mod watcher;
 pub mod win_e_hook;
 
 pub use clipboard::{ClipboardFiles, get_clipboard_files, set_clipboard_files};
-pub use com_shell::{RawBgraImage, ShellWorker, SystemIconRequest, cursor_screen_pos};
+pub use com_shell::{
+    RawBgraImage, ShellWorker, SystemIconRequest, cursor_screen_pos, watch_file_associations,
+};
 pub use credentials::{delete_network_password, load_network_password, save_network_password};
 pub use default_explorer::{
     DefaultExplorerStatus, delegate_to_windows_explorer, enable_default_explorer,

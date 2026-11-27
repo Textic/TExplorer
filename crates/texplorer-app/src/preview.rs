@@ -198,6 +198,17 @@ impl SystemIconCache {
         self.entries.insert(key, image);
         evicted_img
     }
+
+    /// Clears all cached and in-flight system icons and returns previously cached GPU images
+    /// so the caller can dispose them cleanly via `window.drop_image`.
+    pub fn clear_and_drain_images(&mut self) -> Vec<Arc<RenderImage>> {
+        self.order.clear();
+        self.in_flight.clear();
+        self.entries
+            .drain()
+            .filter_map(|(_, img)| img)
+            .collect()
+    }
 }
 
 /// Bounded in-memory LRU-ish thumbnail store preventing duplicate COM Shell lookups.
@@ -255,6 +266,26 @@ impl ThumbnailCache {
         }
         self.order.push_back(key.clone());
         self.entries.insert(key, image);
+    }
+
+    /// Clears cached and in-flight entries that allowed Shell icon fallback (preserving pure
+    /// content thumbnails) and returns their GPU images for clean disposal.
+    pub fn clear_icon_fallbacks_and_drain_images(&mut self) -> Vec<Arc<RenderImage>> {
+        self.order.retain(|k| !k.icon_fallback);
+        self.in_flight.retain(|k| !k.icon_fallback);
+        let fallback_keys: Vec<ThumbnailKey> = self
+            .entries
+            .keys()
+            .filter(|k| k.icon_fallback)
+            .cloned()
+            .collect();
+        let mut drained = Vec::with_capacity(fallback_keys.len());
+        for key in fallback_keys {
+            if let Some(Some(img)) = self.entries.remove(&key) {
+                drained.push(img);
+            }
+        }
+        drained
     }
 }
 
@@ -1257,5 +1288,53 @@ mod tests {
             resolve_system_icon_target(&special_dir, IconStyle::SystemAll, 32),
             Some((SystemIconKey::Path { size_px: 32, .. }, SystemIconRequest::Path(_)))
         ));
+    }
+
+    #[test]
+    fn icon_cache_invalidation_clears_system_icons_and_only_icon_fallback_thumbnails() {
+        let make_img = || {
+            let buf = RgbaImage::from_pixel(2, 2, image::Rgba([10, 20, 30, 255]));
+            Arc::new(RenderImage::new(smallvec![Frame::new(buf)]))
+        };
+
+        let mut sys_cache = SystemIconCache::new(16);
+        let png_key = SystemIconKey::Extension {
+            ext: "png".to_string(),
+            size_px: 32,
+        };
+        let pdf_key = SystemIconKey::Extension {
+            ext: "pdf".to_string(),
+            size_px: 32,
+        };
+        assert!(sys_cache.try_mark_in_flight(png_key.clone()));
+        assert!(sys_cache.insert(png_key.clone(), Some(make_img())).is_none());
+        assert!(sys_cache.try_mark_in_flight(pdf_key.clone()));
+
+        let drained_sys = sys_cache.clear_and_drain_images();
+        assert_eq!(drained_sys.len(), 1);
+        assert!(sys_cache.get(&png_key).is_none());
+        assert!(sys_cache.try_mark_in_flight(png_key));
+        assert!(sys_cache.try_mark_in_flight(pdf_key));
+
+        let mut thumb_cache = ThumbnailCache::new(16);
+        let photo_key = ThumbnailKey {
+            path: PathBuf::from(r"C:\Photos\cat.png"),
+            modified_secs: 1,
+            size_px: 128,
+            icon_fallback: false,
+        };
+        let doc_key = ThumbnailKey {
+            path: PathBuf::from(r"C:\Docs\notes.txt"),
+            modified_secs: 1,
+            size_px: 128,
+            icon_fallback: true,
+        };
+        thumb_cache.insert(photo_key.clone(), Some(make_img()));
+        thumb_cache.insert(doc_key.clone(), Some(make_img()));
+
+        let drained_thumbs = thumb_cache.clear_icon_fallbacks_and_drain_images();
+        assert_eq!(drained_thumbs.len(), 1);
+        assert!(thumb_cache.get(&photo_key).is_some());
+        assert!(thumb_cache.get(&doc_key).is_none());
     }
 }

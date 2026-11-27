@@ -58,7 +58,7 @@ use texplorer_platform::{
     open_item, open_terminal_here, pick_files_dialog, pick_folder_dialog,
     query_default_explorer_status, restore_windows_explorer, reveal_in_windows_explorer,
     save_network_password, set_clipboard_files, set_win_e_interception, spawn_as_desktop_user,
-    spawn_video_player, start_native_file_drag, system_prefers_dark_mode,
+    spawn_video_player, start_native_file_drag, system_prefers_dark_mode, watch_file_associations,
 };
 use texplorer_vfs::archive::{
     compress_to_zip, extract_archive_all, extract_archive_entries, is_supported_archive,
@@ -177,13 +177,16 @@ enum BgEvent {
         result: Result<StagedUpdate, String>,
     },
     ThumbnailReady {
+        generation: u64,
         key: ThumbnailKey,
         image: Option<Arc<RenderImage>>,
     },
     SystemIconReady {
+        generation: u64,
         key: SystemIconKey,
         image: Option<Arc<RenderImage>>,
     },
+    FileAssociationsChanged,
     PreviewReady {
         generation: u64,
         location: Location,
@@ -445,6 +448,7 @@ pub struct Workspace {
     shell_worker: ShellWorker,
     thumbnails: ThumbnailCache,
     system_icons: SystemIconCache,
+    system_icon_generation: u64,
     toast: Option<ToastBanner>,
     toast_seq: u64,
     type_ahead_buf: String,
@@ -597,6 +601,7 @@ impl Workspace {
             shell_worker,
             thumbnails: ThumbnailCache::default(),
             system_icons: SystemIconCache::default(),
+            system_icon_generation: 0,
             toast: None,
             toast_seq: 0,
             type_ahead_buf: String::new(),
@@ -656,6 +661,10 @@ impl Workspace {
         }
 
         ws.refresh_service_status(cx);
+        let assoc_tx = ws.bg_tx.clone();
+        watch_file_associations(move || {
+            let _ = assoc_tx.unbounded_send(BgEvent::FileAssociationsChanged);
+        });
         if ws.settings.auto_check_updates {
             ws.check_for_updates(false, cx);
         }
@@ -703,6 +712,7 @@ impl Workspace {
         }
         if self.thumbnails.try_mark_in_flight(key.clone()) {
             let tx = self.bg_tx.clone();
+            let generation = self.system_icon_generation;
             let path_owned = path.to_path_buf();
             self.shell_worker.request_thumbnail(
                 path_owned,
@@ -710,7 +720,11 @@ impl Workspace {
                 icon_fallback,
                 move |raw| {
                     let image = raw.and_then(raw_bgra_to_render_image);
-                    let _ = tx.unbounded_send(BgEvent::ThumbnailReady { key, image });
+                    let _ = tx.unbounded_send(BgEvent::ThumbnailReady {
+                        generation,
+                        key,
+                        image,
+                    });
                 },
             );
         }
@@ -731,12 +745,30 @@ impl Workspace {
         }
         if self.system_icons.try_mark_in_flight(key.clone()) {
             let tx = self.bg_tx.clone();
+            let generation = self.system_icon_generation;
             self.shell_worker.request_system_icon(req, size_px, move |raw| {
                 let image = raw.and_then(raw_bgra_to_render_image);
-                let _ = tx.unbounded_send(BgEvent::SystemIconReady { key, image });
+                let _ = tx.unbounded_send(BgEvent::SystemIconReady {
+                    generation,
+                    key,
+                    image,
+                });
             });
         }
         None
+    }
+
+    /// Invalidates all cached Windows system icons (and icon-fallback Grid thumbnails) and
+    /// refreshes the process Shell icon list so default-app association changes (e.g.
+    /// "Open With -> Always") appear live without restart.
+    pub fn invalidate_system_icons(&mut self, cx: &mut Context<Self>) {
+        self.system_icon_generation = self.system_icon_generation.wrapping_add(1);
+        self.stale_gpu_images
+            .extend(self.system_icons.clear_and_drain_images());
+        self.stale_gpu_images
+            .extend(self.thumbnails.clear_icon_fallbacks_and_drain_images());
+        self.shell_worker.refresh_icon_cache();
+        cx.notify();
     }
 
     fn create_pane_ui(
@@ -1005,15 +1037,38 @@ impl Workspace {
                     cx.notify();
                 }
             },
-            BgEvent::ThumbnailReady { key, image } => {
+            BgEvent::ThumbnailReady {
+                generation,
+                key,
+                image,
+            } => {
+                if key.icon_fallback && generation != self.system_icon_generation {
+                    if let Some(stale) = image {
+                        let _ = window.drop_image(stale);
+                    }
+                    return;
+                }
                 self.thumbnails.insert(key, image);
                 cx.notify();
             }
-            BgEvent::SystemIconReady { key, image } => {
+            BgEvent::SystemIconReady {
+                generation,
+                key,
+                image,
+            } => {
+                if generation != self.system_icon_generation {
+                    if let Some(stale) = image {
+                        let _ = window.drop_image(stale);
+                    }
+                    return;
+                }
                 if let Some(evicted) = self.system_icons.insert(key, image) {
                     let _ = window.drop_image(evicted);
                 }
                 cx.notify();
+            }
+            BgEvent::FileAssociationsChanged => {
+                self.invalidate_system_icons(cx);
             }
             BgEvent::PreviewReady {
                 generation,
@@ -2464,6 +2519,7 @@ impl Workspace {
             return;
         };
         let loc = self.active_tab().map(|t| t.model.pane(side).location.clone());
+        self.invalidate_system_icons(cx);
         match loc {
             Some(Location::Home) => self.refresh_volumes(cx),
             Some(Location::DiskAnalyzer) => self.rescan_disk_analyzer(cx),
