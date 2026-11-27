@@ -6976,6 +6976,11 @@ impl Workspace {
         cx.notify();
     }
 
+    /// Returns `true` while a P2P share server is hosting files or any P2P transfer is active.
+    pub fn is_p2p_active(&self) -> bool {
+        self.active_p2p_share.is_some() || !self.active_p2p_transfers.is_empty()
+    }
+
     pub fn stop_active_p2p_share(&mut self, cx: &mut Context<Self>) {
         if let Some(share) = self.active_p2p_share.take() {
             let svc = self.p2p_service.clone();

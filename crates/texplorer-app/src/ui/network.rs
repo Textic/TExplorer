@@ -5,7 +5,7 @@ use gpui_kit::{
     assets::IconName as LucideIcon,
     component::{
         Disableable as _, Icon, Sizable as _, Size, StyledExt as _,
-        button::{Button, ButtonVariants as _},
+        button::{Button, ButtonCustomVariant, ButtonVariants as _},
         h_flex,
         input::{Input, InputState},
         scroll::ScrollableElement as _,
@@ -552,6 +552,8 @@ pub fn render_p2p_modal(
     cx: &mut Context<Workspace>,
 ) -> impl IntoElement {
     let unit = ws.settings.size_unit;
+    let p2p_active = ws.is_p2p_active();
+    let share_active = ws.active_p2p_share.is_some();
     let parsed_ticket: Option<Result<P2pTicket, String>> = if modal.ticket_text.trim().is_empty() {
         None
     } else {
@@ -585,7 +587,11 @@ pub fn render_p2p_modal(
                         .child(
                             Icon::new(LucideIcon::Radio)
                                 .small()
-                                .text_color(solid(p.accent_primary)),
+                                .text_color(if p2p_active {
+                                    solid(p.status_success)
+                                } else {
+                                    solid(p.accent_primary)
+                                }),
                         )
                         .child(
                             div()
@@ -782,23 +788,71 @@ pub fn render_p2p_modal(
                         .rounded(px(RADIUS_ROW))
                         .bg(solid(p.bg_base))
                         .border_1()
-                        .border_color(solid(p.border_subtle))
+                        .border_color(if share_active {
+                            soft_tint(p.status_success, 0.45)
+                        } else {
+                            solid(p.border_subtle)
+                        })
                         .child(
                             h_flex()
                                 .items_center()
                                 .justify_between()
+                                .gap_2()
                                 .child(
-                                    div()
-                                        .text_xs()
-                                        .font_semibold()
-                                        .text_color(solid(p.text_primary))
-                                        .child("Share via Encrypted Code (Internet & LAN)"),
+                                    h_flex()
+                                        .items_center()
+                                        .gap_2()
+                                        .child(
+                                            div()
+                                                .text_xs()
+                                                .font_semibold()
+                                                .text_color(solid(p.text_primary))
+                                                .child("Share via Encrypted Code (Internet & LAN)"),
+                                        )
+                                        .when(share_active, |el| {
+                                            el.child(
+                                                h_flex()
+                                                    .px_1p5()
+                                                    .py(px(1.))
+                                                    .gap_1()
+                                                    .items_center()
+                                                    .rounded(px(3.))
+                                                    .bg(soft_tint(p.status_success, 0.16))
+                                                    .border_1()
+                                                    .border_color(soft_tint(p.status_success, 0.35))
+                                                    .child(
+                                                        div()
+                                                            .w(px(5.))
+                                                            .h(px(5.))
+                                                            .rounded(px(999.))
+                                                            .bg(solid(p.status_success)),
+                                                    )
+                                                    .child(
+                                                        div()
+                                                            .text_size(px(10.5))
+                                                            .font_semibold()
+                                                            .text_color(solid(p.status_success))
+                                                            .child("LIVE"),
+                                                    ),
+                                            )
+                                        }),
                                 )
-                                .when(ws.active_p2p_share.is_some(), |el| {
+                                .when(share_active, |el| {
+                                    let stop_red = if p.is_dark { 0xdc2626 } else { p.status_error };
+                                    let stop_hover =
+                                        if p.is_dark { 0xef4444 } else { p.danger_hover };
+                                    let stop_active =
+                                        if p.is_dark { 0xb91c1c } else { p.danger_active };
+                                    let stop_style = ButtonCustomVariant::new(cx)
+                                        .color(solid(stop_red))
+                                        .foreground(solid(0xffffff))
+                                        .hover(solid(stop_hover))
+                                        .active(solid(stop_active));
                                     el.child(
                                         Button::new("p2p-stop-share")
                                             .with_size(Size::XSmall)
-                                            .ghost()
+                                            .custom(stop_style)
+                                            .icon(LucideIcon::X)
                                             .label("Stop Sharing")
                                             .on_click(cx.listener(|this, _, _, cx| {
                                                 this.stop_active_p2p_share(cx);
