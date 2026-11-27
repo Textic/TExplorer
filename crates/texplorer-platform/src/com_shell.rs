@@ -58,6 +58,10 @@ enum ShellJob {
         path: PathBuf,
         on_done: MenuCallback,
     },
+    OpenWith {
+        path: PathBuf,
+        on_done: MenuCallback,
+    },
 }
 
 /// Handle to the background COM STA worker thread.
@@ -120,6 +124,10 @@ impl ShellWorker {
                         }
                         ShellJob::ShowProperties { path, on_done } => {
                             let res = crate::launch::show_properties_dialog(&path);
+                            on_done(res);
+                        }
+                        ShellJob::OpenWith { path, on_done } => {
+                            let res = crate::launch::open_with_dialog(&path);
                             on_done(res);
                         }
                     }
@@ -205,6 +213,18 @@ impl ShellWorker {
         on_done: impl FnOnce(Result<(), String>) + Send + 'static,
     ) {
         let _ = self.tx.send(ShellJob::ShowProperties {
+            path,
+            on_done: Box::new(on_done),
+        });
+    }
+
+    /// Opens the native Windows "Open with -> Choose another app" dialog for `path` on the COM STA thread.
+    pub fn open_with(
+        &self,
+        path: PathBuf,
+        on_done: impl FnOnce(Result<(), String>) + Send + 'static,
+    ) {
+        let _ = self.tx.send(ShellJob::OpenWith {
             path,
             on_done: Box::new(on_done),
         });

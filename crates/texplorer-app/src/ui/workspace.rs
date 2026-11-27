@@ -55,7 +55,7 @@ use texplorer_platform::{
     elevated_rename_item, enable_default_explorer, get_clipboard_files, inspect_file_lock,
     install_native_drop_target, is_access_denied_message, is_elevated, list_known_folders,
     list_volumes, list_wsl_distros, load_network_password, move_to_trash, open_in_editor,
-    open_item, open_terminal_here, open_with_dialog, pick_files_dialog, pick_folder_dialog,
+    open_item, open_terminal_here, pick_files_dialog, pick_folder_dialog,
     query_default_explorer_status, restore_windows_explorer, reveal_in_windows_explorer,
     save_network_password, set_clipboard_files, set_win_e_interception, spawn_as_desktop_user,
     spawn_video_player, start_native_file_drag, system_prefers_dark_mode,
@@ -4182,6 +4182,26 @@ impl Workspace {
         self.set_toast_simple(notice, ToastKind::Success, cx);
     }
 
+    /// Copies a single path wrapped in double quotes (`"C:\path\file.ext"`), matching Windows Explorer's "Copy as path".
+    pub fn copy_path_to_clipboard(&mut self, raw_path: &str, cx: &mut Context<Self>) {
+        let quoted = quote_path_for_clipboard(raw_path);
+        self.copy_text_to_clipboard(&quoted, "Path copied", cx);
+    }
+
+    /// Copies one or more local paths wrapped in double quotes (newline-separated for multi-select).
+    pub fn copy_paths_to_clipboard(&mut self, paths: &[PathBuf], cx: &mut Context<Self>) {
+        if paths.is_empty() {
+            return;
+        }
+        let joined = format_quoted_paths_for_clipboard(paths);
+        let notice = if paths.len() > 1 {
+            format!("{} paths copied", paths.len())
+        } else {
+            "Path copied".to_string()
+        };
+        self.copy_text_to_clipboard(&joined, &notice, cx);
+    }
+
     pub fn open_terminal_at(&mut self, path: &Path, _cx: &mut Context<Self>) {
         let path_owned = path.to_path_buf();
         let cmd = self.settings.terminal_command.clone();
@@ -4243,17 +4263,13 @@ impl Workspace {
     }
 
     pub fn open_with_for(&mut self, path: &Path, _cx: &mut Context<Self>) {
-        let path_owned = path.to_path_buf();
         let tx = self.bg_tx.clone();
-        let _ = std::thread::Builder::new()
-            .name("texplorer-open-with".to_string())
-            .spawn(move || {
-                let result = open_with_dialog(&path_owned).map(|()| None);
-                let _ = tx.unbounded_send(BgEvent::ShellOpFinished {
-                    result,
-                    refresh_side: None,
-                });
+        self.shell_worker.open_with(path.to_path_buf(), move |res| {
+            let _ = tx.unbounded_send(BgEvent::ShellOpFinished {
+                result: res.map(|()| None),
+                refresh_side: None,
             });
+        });
     }
 
     pub fn pin_folder(&mut self, path: PathBuf, cx: &mut Context<Self>) {
@@ -7838,7 +7854,7 @@ impl Workspace {
         else {
             return;
         };
-        self.copy_text_to_clipboard(&path.display().to_string(), "Path copied", cx);
+        self.copy_path_to_clipboard(&path.display().to_string(), cx);
     }
 
     pub fn prompt_trash_disk_node(&mut self, id: NodeId, cx: &mut Context<Self>) {
@@ -8520,6 +8536,25 @@ fn compute_marquee_hits(
     }
 }
 
+/// Wraps a path string in double quotes (`"..."`) matching Windows Explorer's "Copy as path".
+fn quote_path_for_clipboard(raw: &str) -> String {
+    if raw.len() >= 2 && raw.starts_with('"') && raw.ends_with('"') {
+        raw.to_string()
+    } else {
+        format!("\"{raw}\"")
+    }
+}
+
+/// Formats one or more local paths wrapped in double quotes (CRLF-separated on Windows).
+fn format_quoted_paths_for_clipboard(paths: &[PathBuf]) -> String {
+    let sep = if cfg!(target_os = "windows") { "\r\n" } else { "\n" };
+    paths
+        .iter()
+        .map(|p| quote_path_for_clipboard(&p.display().to_string()))
+        .collect::<Vec<_>>()
+        .join(sep)
+}
+
 #[cfg(test)]
 mod transfer_drop_tests {
     use super::*;
@@ -8630,6 +8665,27 @@ mod transfer_drop_tests {
                 false,
             ),
             vec![file]
+        );
+    }
+
+    #[test]
+    fn quotes_single_and_multiple_paths_like_windows_copy_as_path() {
+        assert_eq!(
+            quote_path_for_clipboard(r"C:\Program Files\TExplorer\texplorer.exe"),
+            "\"C:\\Program Files\\TExplorer\\texplorer.exe\""
+        );
+        assert_eq!(
+            quote_path_for_clipboard("\"C:\\Already\\Quoted\""),
+            "\"C:\\Already\\Quoted\""
+        );
+        let multi = format_quoted_paths_for_clipboard(&[
+            PathBuf::from(r"C:\Dir\a.txt"),
+            PathBuf::from(r"C:\Dir\b c.txt"),
+        ]);
+        let expected_sep = if cfg!(target_os = "windows") { "\r\n" } else { "\n" };
+        assert_eq!(
+            multi,
+            format!("\"C:\\Dir\\a.txt\"{expected_sep}\"C:\\Dir\\b c.txt\"")
         );
     }
 }

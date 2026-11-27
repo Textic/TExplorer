@@ -90,6 +90,7 @@ enum MenuAction {
     NewFolder(PaneSide, PathBuf),
     NewFile(PaneSide, PathBuf),
     CopyPath(String),
+    CopyPaths(Vec<PathBuf>),
     OpenTerminal(PathBuf),
     OpenEditor(PathBuf),
     PinFolder(PathBuf),
@@ -443,11 +444,15 @@ fn build_rows(ws: &Workspace, target: &ContextMenuTarget) -> Vec<MenuRow> {
                 });
                 rows.push(MenuRow::Item {
                     id: "ctx-copy-path",
-                    label: "Copy Path".into(),
+                    label: if selected_paths.len() > 1 {
+                        format!("Copy Paths ({})", selected_paths.len()).into()
+                    } else {
+                        "Copy Path".into()
+                    },
                     shortcut: None,
                     icon: MenuIcon::Lucide(LucideIcon::Link),
                     danger: false,
-                    action: MenuAction::CopyPath(entry.location.display_path()),
+                    action: MenuAction::CopyPaths(selected_paths.clone()),
                 });
 
                 if !is_dir {
@@ -1213,7 +1218,8 @@ fn execute_action(
         MenuAction::CheckFileLocks => ws.check_locks_for_selection(cx),
         MenuAction::NewFolder(side, dir) => ws.open_new_folder_prompt(side, dir, window, cx),
         MenuAction::NewFile(side, dir) => ws.open_new_file_prompt(side, dir, window, cx),
-        MenuAction::CopyPath(text) => ws.copy_text_to_clipboard(&text, "Path copied", cx),
+        MenuAction::CopyPath(text) => ws.copy_path_to_clipboard(&text, cx),
+        MenuAction::CopyPaths(paths) => ws.copy_paths_to_clipboard(&paths, cx),
         MenuAction::OpenTerminal(path) => ws.open_terminal_at(&path, cx),
         MenuAction::OpenEditor(path) => ws.open_editor_at(&path, cx),
         MenuAction::PinFolder(path) => ws.pin_folder(path, cx),
