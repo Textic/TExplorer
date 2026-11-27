@@ -80,6 +80,67 @@ pub fn open_item(path: &Path) -> Result<(), String> {
     }
 }
 
+/// Opens the native Windows "Open with" application picker (`SHOpenWithDialog`) for `path`.
+///
+/// Must be called from a dedicated background thread so the modal OS shell picker never blocks
+/// the UI thread or the COM thumbnail worker. Dismissing/cancelling the picker returns `Ok(())`.
+pub fn open_with_dialog(path: &Path) -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    {
+        use windows::Win32::Foundation::{ERROR_CANCELLED, HWND};
+        use windows::Win32::System::Com::{
+            COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE, CoInitializeEx, CoUninitialize,
+        };
+        use windows::Win32::UI::Shell::{
+            OAIF_ALLOW_REGISTRATION, OAIF_EXEC, OPENASINFO, SHOpenWithDialog,
+        };
+        use windows_core::{HSTRING, PCWSTR};
+
+        let com_inited = unsafe {
+            CoInitializeEx(None, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE).is_ok()
+        };
+        struct ComGuard(bool);
+        impl Drop for ComGuard {
+            fn drop(&mut self) {
+                if self.0 {
+                    unsafe {
+                        CoUninitialize();
+                    }
+                }
+            }
+        }
+        let _com_guard = ComGuard(com_inited);
+
+        let raw = path.to_string_lossy();
+        let clean = if let Some(unc) = raw.strip_prefix(r"\\?\UNC\") {
+            format!(r"\\{unc}")
+        } else if let Some(rest) = raw.strip_prefix(r"\\?\") {
+            rest.to_string()
+        } else {
+            raw.into_owned()
+        };
+        let wide_path = HSTRING::from(clean);
+        let info = OPENASINFO {
+            pcszFile: PCWSTR(wide_path.as_ptr()),
+            pcszClass: PCWSTR::null(),
+            oaifInFlags: OAIF_ALLOW_REGISTRATION | OAIF_EXEC,
+        };
+
+        match unsafe { SHOpenWithDialog(HWND::default(), &info) } {
+            Ok(()) => Ok(()),
+            Err(err) if err.code() == ERROR_CANCELLED.to_hresult() => Ok(()),
+            Err(err) => Err(format!(
+                "Failed to show Windows 'Open With' dialog for \"{}\": {err}",
+                path.display()
+            )),
+        }
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        open_item(path)
+    }
+}
+
 /// Reveals `path` inside the original Windows Explorer (`explorer.exe`).
 pub fn reveal_in_windows_explorer(path: &Path) -> Result<(), String> {
     #[cfg(target_os = "windows")]

@@ -55,7 +55,7 @@ use texplorer_platform::{
     elevated_rename_item, enable_default_explorer, get_clipboard_files, inspect_file_lock,
     install_native_drop_target, is_access_denied_message, is_elevated, list_known_folders,
     list_volumes, list_wsl_distros, load_network_password, move_to_trash, open_in_editor,
-    open_item, open_terminal_here, pick_files_dialog, pick_folder_dialog,
+    open_item, open_terminal_here, open_with_dialog, pick_files_dialog, pick_folder_dialog,
     query_default_explorer_status, restore_windows_explorer, reveal_in_windows_explorer,
     save_network_password, set_clipboard_files, set_win_e_interception, spawn_as_desktop_user,
     spawn_video_player, start_native_file_drag, system_prefers_dark_mode,
@@ -4240,6 +4240,20 @@ impl Workspace {
                 refresh_side: None,
             });
         });
+    }
+
+    pub fn open_with_for(&mut self, path: &Path, _cx: &mut Context<Self>) {
+        let path_owned = path.to_path_buf();
+        let tx = self.bg_tx.clone();
+        let _ = std::thread::Builder::new()
+            .name("texplorer-open-with".to_string())
+            .spawn(move || {
+                let result = open_with_dialog(&path_owned).map(|()| None);
+                let _ = tx.unbounded_send(BgEvent::ShellOpFinished {
+                    result,
+                    refresh_side: None,
+                });
+            });
     }
 
     pub fn pin_folder(&mut self, path: PathBuf, cx: &mut Context<Self>) {
