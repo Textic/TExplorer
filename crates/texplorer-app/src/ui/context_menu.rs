@@ -73,6 +73,7 @@ enum MenuIcon {
 #[derive(Clone)]
 enum MenuAction {
     OpenEntry(Location, bool),
+    OpenWith(PathBuf),
     QuickLook,
     OpenNewTab(Location),
     OpenOppositePane(Location),
@@ -314,6 +315,18 @@ fn build_rows(ws: &Workspace, target: &ContextMenuTarget) -> Vec<MenuRow> {
                 danger: false,
                 action: MenuAction::OpenEntry(entry.location.clone(), is_dir),
             });
+            if !is_dir
+                && let Some(local_path) = entry.location.as_local_path()
+            {
+                rows.push(MenuRow::Item {
+                    id: "ctx-open-with",
+                    label: "Open With...".into(),
+                    shortcut: None,
+                    icon: MenuIcon::Lucide(LucideIcon::LayoutGrid),
+                    danger: false,
+                    action: MenuAction::OpenWith(local_path.to_path_buf()),
+                });
+            }
             rows.push(MenuRow::Item {
                 id: "ctx-quicklook",
                 label: "QuickLook Preview".into(),
@@ -1059,6 +1072,16 @@ fn build_rows(ws: &Workspace, target: &ContextMenuTarget) -> Vec<MenuRow> {
                         danger: false,
                         action: MenuAction::DiskOpenItem(*node_id),
                     });
+                    if let Some(local_path) = path {
+                        rows.push(MenuRow::Item {
+                            id: "ctx-da-open-with",
+                            label: "Open With...".into(),
+                            shortcut: None,
+                            icon: MenuIcon::Lucide(LucideIcon::LayoutGrid),
+                            danger: false,
+                            action: MenuAction::OpenWith(local_path.clone()),
+                        });
+                    }
                 }
             }
             if *can_zoom_in {
@@ -1164,6 +1187,7 @@ fn execute_action(
 ) {
     match action {
         MenuAction::OpenEntry(loc, is_dir) => ws.open_location_or_file(loc, is_dir, window, cx),
+        MenuAction::OpenWith(path) => ws.open_with_for(&path, cx),
         MenuAction::QuickLook => ws.toggle_quicklook(cx),
         MenuAction::OpenNewTab(loc) => ws.open_new_tab(loc, window, cx),
         MenuAction::OpenOppositePane(loc) => ws.open_in_opposite_pane(loc, window, cx),

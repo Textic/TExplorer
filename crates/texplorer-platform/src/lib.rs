@@ -36,7 +36,8 @@ pub use elevated_fs::{
 pub use elevation::is_elevated;
 pub use launch::{
     delete_permanently, delete_permanently_batch, move_to_trash, open_in_editor, open_item,
-    open_terminal_here, reveal_in_windows_explorer, show_properties_dialog, spawn_as_desktop_user,
+    open_terminal_here, open_with_dialog, reveal_in_windows_explorer, show_properties_dialog,
+    spawn_as_desktop_user,
 };
 pub use locks::{FileLockStatus, LockingProcess, inspect_file_lock};
 pub use network_share::{connect_smb_share, disconnect_smb_share};
