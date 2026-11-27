@@ -1,4 +1,4 @@
-use std::cell::{Cell, RefCell};
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -9,9 +9,10 @@ use std::time::{Duration, Instant};
 use futures_channel::mpsc::{UnboundedReceiver, UnboundedSender, unbounded};
 use futures_util::StreamExt as _;
 use gpui_kit::{
-    Bounds, ClipboardItem, Context, Entity, FocusHandle, Focusable, KeyDownEvent, MouseButton,
-    MouseDownEvent, MouseMoveEvent, MouseUpEvent, NavigationDirection, Pixels, Point, RenderImage,
-    ScrollStrategy, SharedString, Subscription, UniformListScrollHandle, Window, WindowBounds,
+    Bounds, ClipboardItem, Context, DragMoveEvent, Entity, FocusHandle, Focusable, KeyDownEvent,
+    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, NavigationDirection, Pixels, Point,
+    RenderImage, ScrollStrategy, SharedString, Subscription, UniformListScrollHandle, Window,
+    WindowBounds,
     component::{
         h_flex,
         input::{InputEvent, InputState},
@@ -22,10 +23,10 @@ use gpui_kit::{
 };
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use texplorer_core::{
-    AccentPreset, AppSession, AppSettings, FileEntry, FileKind, KnownFolder, KnownFolderKind,
-    Location, NetworkConnection, NetworkProtocol, PaneSide, ParsedNetworkUri, SavedPaneState,
-    SavedTabState, SearchScope, SidebarSection, SizeUnit, SortColumn, SortSpec, SshAuthMode,
-    TabModel, ThemePreset, ViewMode, VolumeInfo, WindowGeometry, join_remote_path,
+    AccentPreset, AppSession, AppSettings, FileEntry, FileKind, IconStyle, KnownFolder,
+    KnownFolderKind, Location, NetworkConnection, NetworkProtocol, PaneSide, ParsedNetworkUri,
+    SavedPaneState, SavedTabState, SearchScope, SidebarSection, SizeUnit, SortColumn, SortSpec,
+    SshAuthMode, TabModel, ThemePreset, ViewMode, VolumeInfo, WindowGeometry, join_remote_path,
     normalize_remote_path, normalize_smb_share_path, parse_network_uri, sort_entries,
 };
 use texplorer_mft::{
@@ -47,10 +48,11 @@ use texplorer_platform::{
     DefaultExplorerStatus, DirectoryWatcher, FileLockStatus, LaunchIntent, NativeDragOutcome,
     NativeDropEvent, ShellWorker, VideoNotify, VideoPlayerHandle, VideoStartOptions,
     bring_current_process_window_to_front, connect_smb_share, cursor_screen_pos,
-    delete_network_password, delete_permanently, disconnect_smb_share, enable_default_explorer,
-    get_clipboard_files, inspect_file_lock, install_native_drop_target, is_elevated,
-    list_known_folders, list_volumes, list_wsl_distros, load_network_password, move_to_trash,
-    open_in_editor, open_item, open_terminal_here, pick_files_dialog, pick_folder_dialog,
+    delete_network_password, delete_permanently_batch, disconnect_smb_share, elevated_new_item,
+    elevated_rename_item, enable_default_explorer, get_clipboard_files, inspect_file_lock,
+    install_native_drop_target, is_access_denied_message, is_elevated, list_known_folders,
+    list_volumes, list_wsl_distros, load_network_password, move_to_trash, open_in_editor,
+    open_item, open_terminal_here, pick_files_dialog, pick_folder_dialog,
     query_default_explorer_status, restore_windows_explorer, reveal_in_windows_explorer,
     save_network_password, set_clipboard_files, set_win_e_interception, spawn_as_desktop_user,
     spawn_video_player, start_native_file_drag, system_prefers_dark_mode,
@@ -64,9 +66,10 @@ use texplorer_vfs::search::{SearchOutcome, execute_search};
 use uuid::Uuid;
 
 use crate::preview::{
-    PDF_PREVIEW_MAX_DIM, PreviewPayload, ThumbnailCache, ThumbnailKey, decode_pdf_page_from_bytes,
-    decode_pdf_page_from_path, load_archive_entry_preview_blocking, load_preview_blocking,
-    preview_from_remote_bytes, raw_bgra_to_render_image,
+    PDF_PREVIEW_MAX_DIM, PreviewPayload, SystemIconCache, SystemIconKey, ThumbnailCache,
+    ThumbnailKey, decode_pdf_page_from_bytes, decode_pdf_page_from_path,
+    load_archive_entry_preview_blocking, load_preview_blocking, preview_from_remote_bytes,
+    raw_bgra_to_render_image, resolve_system_icon_target,
 };
 use crate::theme::{
     Palette, RADIUS_ROW, apply_theme, crisp_resize_handle_appearance, resolve_palette, solid,
@@ -88,6 +91,7 @@ use crate::ui::pane::render_pane;
 use crate::ui::quicklook::render_quicklook_modal;
 use crate::ui::sidebar::render_sidebar;
 use crate::ui::transfers::{render_conflict_modal, render_transfer_drawer};
+use crate::ui::views::DraggedEntries;
 use crate::updater::{
     self, REPO_URL, StagedUpdate, UpdateInfo, UpdateState, open_url_in_browser,
     spawn_detached_updater,
@@ -172,6 +176,10 @@ enum BgEvent {
         key: ThumbnailKey,
         image: Option<Arc<RenderImage>>,
     },
+    SystemIconReady {
+        key: SystemIconKey,
+        image: Option<Arc<RenderImage>>,
+    },
     PreviewReady {
         generation: u64,
         location: Location,
@@ -205,6 +213,10 @@ enum BgEvent {
     ShellOpFinished {
         result: Result<Option<String>, String>,
         refresh_side: Option<PaneSide>,
+    },
+    ElevatedTextOpFinished {
+        side: PaneSide,
+        result: Result<(PathBuf, UndoAction), String>,
     },
     DismissToast(u64),
     FolderSizesReady {
@@ -398,7 +410,6 @@ pub struct Workspace {
     pub video_playback: Option<VideoPlaybackState>,
     video_generation: u64,
     stale_gpu_images: Vec<Arc<RenderImage>>,
-    pub active_local_drag_paths: Rc<RefCell<Option<Vec<PathBuf>>>>,
     external_ole_drag_active: bool,
     pub hash_target: Option<PathBuf>,
     pub hash_state: HashInspectState,
@@ -417,6 +428,7 @@ pub struct Workspace {
     cut_paths: HashSet<PathBuf>,
     shell_worker: ShellWorker,
     thumbnails: ThumbnailCache,
+    system_icons: SystemIconCache,
     toast: Option<ToastBanner>,
     toast_seq: u64,
     type_ahead_buf: String,
@@ -427,6 +439,7 @@ pub struct Workspace {
     entry_claimed_mouse_down: bool,
     remote_pool: RemoteClientPool,
     session_passwords: HashMap<Uuid, String>,
+    session_sudo_passwords: HashMap<Uuid, String>,
     p2p_service: P2pService,
     pub p2p_device_name: String,
     pub p2p_nearby_peers: Vec<NearbyPeer>,
@@ -541,7 +554,6 @@ impl Workspace {
             video_playback: None,
             video_generation: 0,
             stale_gpu_images: Vec::new(),
-            active_local_drag_paths: Rc::new(RefCell::new(None)),
             external_ole_drag_active: false,
             hash_target: None,
             hash_state: HashInspectState::Idle,
@@ -560,6 +572,7 @@ impl Workspace {
             cut_paths: HashSet::new(),
             shell_worker,
             thumbnails: ThumbnailCache::default(),
+            system_icons: SystemIconCache::default(),
             toast: None,
             toast_seq: 0,
             type_ahead_buf: String::new(),
@@ -570,6 +583,7 @@ impl Workspace {
             entry_claimed_mouse_down: false,
             remote_pool: RemoteClientPool::new(),
             session_passwords: HashMap::new(),
+            session_sudo_passwords: HashMap::new(),
             p2p_service,
             p2p_device_name,
             p2p_nearby_peers: Vec::new(),
@@ -650,11 +664,13 @@ impl Workspace {
         path: &Path,
         modified_secs: i64,
         size_px: i32,
+        icon_fallback: bool,
     ) -> Option<Arc<RenderImage>> {
         let key = ThumbnailKey {
             path: path.to_path_buf(),
             modified_secs,
             size_px,
+            icon_fallback,
         };
         if let Some(cached) = self.thumbnails.get(&key) {
             return cached.clone();
@@ -662,9 +678,36 @@ impl Workspace {
         if self.thumbnails.try_mark_in_flight(key.clone()) {
             let tx = self.bg_tx.clone();
             let path_owned = path.to_path_buf();
-            self.shell_worker.request_thumbnail(path_owned, size_px, move |raw| {
+            self.shell_worker.request_thumbnail(
+                path_owned,
+                size_px,
+                icon_fallback,
+                move |raw| {
+                    let image = raw.and_then(raw_bgra_to_render_image);
+                    let _ = tx.unbounded_send(BgEvent::ThumbnailReady { key, image });
+                },
+            );
+        }
+        None
+    }
+
+    /// Returns a cached native Windows system icon for `entry` (respecting `settings.icon_style`)
+    /// or queues a deduplicated COM STA lookup, returning `None` when TExplorer's built-in vector
+    /// icon should be rendered (or while the first lookup is in flight).
+    pub fn get_or_request_entry_icon(
+        &mut self,
+        entry: &FileEntry,
+        size_px: i32,
+    ) -> Option<Arc<RenderImage>> {
+        let (key, req) = resolve_system_icon_target(entry, self.settings.icon_style, size_px)?;
+        if let Some(cached) = self.system_icons.get(&key) {
+            return cached.clone();
+        }
+        if self.system_icons.try_mark_in_flight(key.clone()) {
+            let tx = self.bg_tx.clone();
+            self.shell_worker.request_system_icon(req, size_px, move |raw| {
                 let image = raw.and_then(raw_bgra_to_render_image);
-                let _ = tx.unbounded_send(BgEvent::ThumbnailReady { key, image });
+                let _ = tx.unbounded_send(BgEvent::SystemIconReady { key, image });
             });
         }
         None
@@ -940,6 +983,12 @@ impl Workspace {
                 self.thumbnails.insert(key, image);
                 cx.notify();
             }
+            BgEvent::SystemIconReady { key, image } => {
+                if let Some(evicted) = self.system_icons.insert(key, image) {
+                    let _ = window.drop_image(evicted);
+                }
+                cx.notify();
+            }
             BgEvent::PreviewReady {
                 generation,
                 location,
@@ -1213,6 +1262,22 @@ impl Workspace {
                     Err(err) => self.show_toast(err, ToastKind::Error, window, cx),
                 }
             }
+            BgEvent::ElevatedTextOpFinished { side, result } => match result {
+                Ok((created_path, undo_action)) => {
+                    self.undo_history.push(undo_action);
+                    let name = created_path
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned());
+                    if let Some(tab) = self.active_tab_mut() {
+                        tab.model.pane_mut(side).pending_select_name = name;
+                    }
+                    self.refresh_pane(side, window, cx);
+                    self.focus_handle.focus(window, cx);
+                }
+                Err(err) => {
+                    self.show_toast(err, ToastKind::Error, window, cx);
+                }
+            },
             BgEvent::FolderSizesReady {
                 tab_id,
                 side,
@@ -1677,6 +1742,8 @@ impl Workspace {
                 client_y,
                 paths,
                 stage_dir,
+                from_self_drag,
+                ctrl_held,
             } => {
                 self.native_drop_hover_side = None;
                 cx.notify();
@@ -1700,26 +1767,18 @@ impl Workspace {
                             Self::cleanup_stage_dir_async(stage_dir);
                             return;
                         }
-                        if self.external_ole_drag_active && stage_dir.is_none() {
-                            self.handle_dropped_paths(paths, dest_dir, false, window, cx);
-                            return;
-                        }
-                        let effective = filter_effective_transfer_sources(
-                            TransferKind::Copy,
+                        let Some((kind, effective)) = resolve_native_drop_transfer(
                             paths,
                             &dest_dir,
-                            true,
-                        );
-                        if effective.is_empty() {
+                            from_self_drag,
+                            ctrl_held,
+                            stage_dir.is_some(),
+                        ) else {
                             Self::cleanup_stage_dir_async(stage_dir);
                             return;
-                        }
+                        };
                         self.enqueue_transfer_with_cleanup(
-                            TransferKind::Copy,
-                            effective,
-                            dest_dir,
-                            stage_dir,
-                            cx,
+                            kind, effective, dest_dir, stage_dir, cx,
                         );
                     }
                     Some(Location::Remote { .. }) => {
@@ -2777,52 +2836,63 @@ impl Workspace {
         cx.notify();
     }
 
-    /// Tracks rubber-band drag motion, Details column resize drag, and outbound native OLE drag handoff.
-    fn handle_mouse_move(
+    /// Hands off an active local file drag to Windows native OLE (`SHDoDragDrop`) the moment
+    /// the pointer crosses outside TExplorer's window bounds. Uses `on_drag_move` (capture phase,
+    /// unbounded by element hitbox) so fast mouse movements out of the window into Chrome, Discord,
+    /// Desktop, or Explorer ALWAYS trigger reliably.
+    fn handle_entries_drag_move(
         &mut self,
-        ev: &MouseMoveEvent,
+        ev: &DragMoveEvent<DraggedEntries>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        // When dragging local files out of the TExplorer window edge, hand off cleanly to
-        // native Windows OLE Shell drag-and-drop so Chrome, Discord, Explorer, and other apps
-        // accept the dropped files with native icons and cursors.
-        if ev.dragging() && cx.has_active_drag() && !self.external_ole_drag_active {
-            let vp = window.viewport_size();
-            let x: f32 = ev.position.x.into();
-            let y: f32 = ev.position.y.into();
-            let vw: f32 = vp.width.into();
-            let vh: f32 = vp.height.into();
-            let left_window = x <= 1.0 || y <= 1.0 || x >= vw - 1.0 || y >= vh - 1.0;
-            if left_window
-                && let Some(paths) = self.active_local_drag_paths.borrow_mut().take()
-                && !paths.is_empty()
-            {
-                cx.stop_active_drag(window);
-                let hwnd_raw = HasWindowHandle::window_handle(window)
-                    .ok()
-                    .and_then(|wh| match wh.as_raw() {
-                        RawWindowHandle::Win32(win32) => Some(win32.hwnd.get()),
-                        _ => None,
-                    })
-                    .unwrap_or(0);
-                self.external_ole_drag_active = true;
-                cx.spawn(async move |weak, cx| {
-                    let outcome = start_native_file_drag(hwnd_raw, &paths);
-                    let _ = weak.update(cx, |this, cx| {
-                        this.external_ole_drag_active = false;
-                        if matches!(outcome, Ok(NativeDragOutcome::Moved)) {
-                            this.refresh_visible_panes(cx);
-                        }
-                        cx.notify();
-                    });
-                })
-                .detach();
-                return;
-            }
-        } else if !ev.dragging() && !cx.has_active_drag() {
-            *self.active_local_drag_paths.borrow_mut() = None;
+        if self.external_ole_drag_active || !ev.event.dragging() {
+            return;
         }
+        let vp = window.viewport_size();
+        let x: f32 = ev.event.position.x.into();
+        let y: f32 = ev.event.position.y.into();
+        let vw: f32 = vp.width.into();
+        let vh: f32 = vp.height.into();
+        let outside_window = x <= 2.0 || y <= 2.0 || x >= vw - 2.0 || y >= vh - 2.0;
+        if !outside_window {
+            return;
+        }
+        let paths = ev.drag(cx).paths.clone();
+        if paths.is_empty() {
+            return;
+        }
+
+        cx.stop_active_drag(window);
+        let hwnd_raw = HasWindowHandle::window_handle(window)
+            .ok()
+            .and_then(|wh| match wh.as_raw() {
+                RawWindowHandle::Win32(win32) => Some(win32.hwnd.get()),
+                _ => None,
+            })
+            .unwrap_or(0);
+        self.external_ole_drag_active = true;
+        cx.spawn(async move |weak, cx| {
+            let outcome = start_native_file_drag(hwnd_raw, &paths);
+            let _ = weak.update(cx, |this, cx| {
+                this.external_ole_drag_active = false;
+                this.entry_claimed_mouse_down = false;
+                if matches!(outcome, Ok(NativeDragOutcome::Moved)) {
+                    this.refresh_visible_panes(cx);
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Tracks rubber-band drag motion and Details column resize drag.
+    fn handle_mouse_move(
+        &mut self,
+        ev: &MouseMoveEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self
             .video_playback
             .as_ref()
@@ -3031,7 +3101,6 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         self.entry_claimed_mouse_down = false;
-        *self.active_local_drag_paths.borrow_mut() = None;
         let mut save_video_prefs = false;
         if let Some(video) = self.video_playback.as_mut() {
             if video.scrubbing {
@@ -5166,6 +5235,7 @@ impl Workspace {
             _ => {}
         }
 
+        let kind_for_elev = kind.clone();
         let outcome = match kind {
             TextPromptKind::NewFolder { side, parent } => {
                 texplorer_vfs::create_folder(&parent, &value)
@@ -5206,6 +5276,79 @@ impl Workspace {
                 self.focus_handle.focus(window, cx);
             }
             Err(err) => {
+                if !is_elevated() && is_access_denied_message(&err) {
+                    let trimmed = match texplorer_vfs::validate_entry_name(&value) {
+                        Ok(t) => t.to_string(),
+                        Err(v_err) => {
+                            self.show_toast(v_err, ToastKind::Error, window, cx);
+                            return;
+                        }
+                    };
+                    let tx = self.bg_tx.clone();
+                    match kind_for_elev {
+                        TextPromptKind::NewFolder { side, parent } => {
+                            self.close_modal(cx);
+                            tokio_runtime().spawn(async move {
+                                let res = tokio::task::spawn_blocking(move || {
+                                    elevated_new_item(&parent, &trimmed, true)
+                                        .map(|p| (p.clone(), UndoAction::CreateDir { path: p }))
+                                        .map_err(|e| e.into_message())
+                                })
+                                .await
+                                .unwrap_or_else(|e| Err(format!("Elevated folder worker failed: {e}")));
+                                let _ = tx.unbounded_send(BgEvent::ElevatedTextOpFinished {
+                                    side,
+                                    result: res,
+                                });
+                            });
+                            return;
+                        }
+                        TextPromptKind::NewFile { side, parent } => {
+                            self.close_modal(cx);
+                            tokio_runtime().spawn(async move {
+                                let res = tokio::task::spawn_blocking(move || {
+                                    elevated_new_item(&parent, &trimmed, false)
+                                        .map(|p| (p.clone(), UndoAction::CreateFile { path: p }))
+                                        .map_err(|e| e.into_message())
+                                })
+                                .await
+                                .unwrap_or_else(|e| Err(format!("Elevated file worker failed: {e}")));
+                                let _ = tx.unbounded_send(BgEvent::ElevatedTextOpFinished {
+                                    side,
+                                    result: res,
+                                });
+                            });
+                            return;
+                        }
+                        TextPromptKind::Rename { side, target } => {
+                            self.close_modal(cx);
+                            tokio_runtime().spawn(async move {
+                                let res = tokio::task::spawn_blocking(move || {
+                                    elevated_rename_item(&target, &trimmed)
+                                        .map(|new_p| {
+                                            (
+                                                new_p.clone(),
+                                                UndoAction::Rename {
+                                                    from: target,
+                                                    to: new_p,
+                                                },
+                                            )
+                                        })
+                                        .map_err(|e| e.into_message())
+                                })
+                                .await
+                                .unwrap_or_else(|e| Err(format!("Elevated rename worker failed: {e}")));
+                                let _ = tx.unbounded_send(BgEvent::ElevatedTextOpFinished {
+                                    side,
+                                    result: res,
+                                });
+                            });
+                            return;
+                        }
+                        TextPromptKind::RemoteNewFolder { .. }
+                        | TextPromptKind::RemoteRename { .. } => {}
+                    }
+                }
                 self.show_toast(err, ToastKind::Error, window, cx);
             }
         }
@@ -5258,18 +5401,8 @@ impl Workspace {
         let tx = self.bg_tx.clone();
         tokio_runtime().spawn(async move {
             let result = tokio::task::spawn_blocking(move || {
-                let mut first_err: Option<String> = None;
-                for path in &paths {
-                    if let Err(err) = delete_permanently(path)
-                        && first_err.is_none()
-                    {
-                        first_err = Some(err);
-                    }
-                }
-                match first_err {
-                    Some(err) => Err(err),
-                    None => Ok(Some(format!("Permanently deleted {total} item(s)"))),
-                }
+                delete_permanently_batch(&paths)
+                    .map(|()| Some(format!("Permanently deleted {total} item(s)")))
             })
             .await
             .unwrap_or_else(|e| Err(format!("Delete worker failed: {e}")));
@@ -5319,6 +5452,15 @@ impl Workspace {
 
     pub fn set_size_unit(&mut self, unit: SizeUnit, cx: &mut Context<Self>) {
         self.settings.size_unit = unit;
+        let _ = self.settings.save();
+        cx.notify();
+    }
+
+    pub fn set_icon_style(&mut self, style: IconStyle, cx: &mut Context<Self>) {
+        if self.settings.icon_style == style {
+            return;
+        }
+        self.settings.icon_style = style;
         let _ = self.settings.save();
         cx.notify();
     }
@@ -5572,7 +5714,15 @@ impl Workspace {
             .get(&id)
             .cloned()
             .or_else(|| load_network_password(&id.to_string()));
-        RemoteCredentials { password }
+        let sudo_password = self
+            .session_sudo_passwords
+            .get(&id)
+            .cloned()
+            .or_else(|| load_network_password(&format!("{id}:sudo")));
+        RemoteCredentials {
+            password,
+            sudo_password,
+        }
     }
 
     pub fn open_network_connect_modal(
@@ -5587,68 +5737,92 @@ impl Workspace {
         self.stop_video_playback();
         self.modal_subs.clear();
 
-        let (editing_id, protocol, auth_mode, init_name, init_host, init_port, init_rpath, init_user, init_key, init_pass) =
-            if let Some(conn) = editing {
-                let stored_pass = self
-                    .session_passwords
-                    .get(&conn.id)
-                    .cloned()
-                    .or_else(|| load_network_password(&conn.id.to_string()))
-                    .unwrap_or_default();
-                let key_str = conn
-                    .private_key_path
-                    .as_ref()
-                    .map(|p| p.display().to_string())
-                    .or_else(|| {
-                        detect_default_ssh_key(Some(&conn.host)).map(|p| p.display().to_string())
-                    })
-                    .unwrap_or_default();
-                (
-                    Some(conn.id),
-                    conn.protocol,
-                    conn.auth_mode,
-                    conn.name,
-                    conn.host,
-                    conn.port.to_string(),
-                    conn.remote_path,
-                    conn.username,
-                    key_str,
-                    stored_pass,
-                )
-            } else if let Some(uri) = prefill {
-                let name_guess = uri.host.clone();
-                let key_str = detect_default_ssh_key(Some(&uri.host))
-                    .map(|p| p.display().to_string())
-                    .unwrap_or_default();
-                (
-                    None,
-                    uri.protocol,
-                    SshAuthMode::Password,
-                    name_guess,
-                    uri.host,
-                    uri.port.to_string(),
-                    uri.remote_path,
-                    uri.username,
-                    key_str,
-                    String::new(),
-                )
-            } else {
-                let key_str = detect_default_ssh_key(None)
-                    .map(|p| p.display().to_string())
-                    .unwrap_or_default();
-                (
-                    None,
-                    NetworkProtocol::Smb,
-                    SshAuthMode::Password,
-                    String::new(),
-                    String::new(),
-                    NetworkProtocol::Smb.default_port().to_string(),
-                    "/".to_string(),
-                    String::new(),
-                    key_str,
-                    String::new(),
-                )
-            };
+        let (
+            editing_id,
+            protocol,
+            auth_mode,
+            sftp_sudo,
+            init_name,
+            init_host,
+            init_port,
+            init_rpath,
+            init_user,
+            init_key,
+            init_pass,
+            init_sudo_pass,
+        ) = if let Some(conn) = editing {
+            let stored_pass = self
+                .session_passwords
+                .get(&conn.id)
+                .cloned()
+                .or_else(|| load_network_password(&conn.id.to_string()))
+                .unwrap_or_default();
+            let stored_sudo_pass = self
+                .session_sudo_passwords
+                .get(&conn.id)
+                .cloned()
+                .or_else(|| load_network_password(&format!("{}:sudo", conn.id)))
+                .unwrap_or_default();
+            let key_str = conn
+                .private_key_path
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .or_else(|| {
+                    detect_default_ssh_key(Some(&conn.host)).map(|p| p.display().to_string())
+                })
+                .unwrap_or_default();
+            (
+                Some(conn.id),
+                conn.protocol,
+                conn.auth_mode,
+                conn.sftp_sudo,
+                conn.name,
+                conn.host,
+                conn.port.to_string(),
+                conn.remote_path,
+                conn.username,
+                key_str,
+                stored_pass,
+                stored_sudo_pass,
+            )
+        } else if let Some(uri) = prefill {
+            let name_guess = uri.host.clone();
+            let key_str = detect_default_ssh_key(Some(&uri.host))
+                .map(|p| p.display().to_string())
+                .unwrap_or_default();
+            (
+                None,
+                uri.protocol,
+                SshAuthMode::Password,
+                false,
+                name_guess,
+                uri.host,
+                uri.port.to_string(),
+                uri.remote_path,
+                uri.username,
+                key_str,
+                String::new(),
+                String::new(),
+            )
+        } else {
+            let key_str = detect_default_ssh_key(None)
+                .map(|p| p.display().to_string())
+                .unwrap_or_default();
+            (
+                None,
+                NetworkProtocol::Smb,
+                SshAuthMode::Password,
+                false,
+                String::new(),
+                String::new(),
+                NetworkProtocol::Smb.default_port().to_string(),
+                "/".to_string(),
+                String::new(),
+                key_str,
+                String::new(),
+                String::new(),
+            )
+        };
 
         let name_input = cx.new(|cx| InputState::new(window, cx).placeholder("e.g. Home NAS or Prod VPS"));
         let host_placeholder = if protocol == NetworkProtocol::Smb {
@@ -5665,6 +5839,11 @@ impl Workspace {
                 .placeholder("Password")
                 .masked(true)
         });
+        let sudo_password_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("Leave empty if server has NOPASSWD sudo")
+                .masked(true)
+        });
         let key_path_input = cx.new(|cx| {
             InputState::new(window, cx).placeholder("Auto-detected from system ~/.ssh")
         });
@@ -5675,6 +5854,7 @@ impl Workspace {
         remote_path_input.update(cx, |s, cx| s.set_value(init_rpath, window, cx));
         username_input.update(cx, |s, cx| s.set_value(init_user, window, cx));
         password_input.update(cx, |s, cx| s.set_value(init_pass, window, cx));
+        sudo_password_input.update(cx, |s, cx| s.set_value(init_sudo_pass, window, cx));
         key_path_input.update(cx, |s, cx| s.set_value(init_key, window, cx));
         host_input.update(cx, |s, cx| s.focus(window, cx));
 
@@ -5682,12 +5862,14 @@ impl Workspace {
             editing_id,
             protocol,
             auth_mode,
+            sftp_sudo,
             name_input,
             host_input,
             port_input,
             remote_path_input,
             username_input,
             password_input,
+            sudo_password_input,
             key_path_input,
             busy: false,
             status_message: None,
@@ -5746,6 +5928,14 @@ impl Workspace {
         cx.notify();
     }
 
+    pub fn toggle_network_modal_sftp_sudo(&mut self, cx: &mut Context<Self>) {
+        if let Some(ActiveModal::NetworkConnect(ref mut form)) = self.active_modal {
+            form.sftp_sudo = !form.sftp_sudo;
+            form.status_message = None;
+            cx.notify();
+        }
+    }
+
     pub fn network_pick_ssh_key_file(&mut self, _cx: &mut Context<Self>) {
         let ssh_dir = dirs::home_dir()
             .map(|h| h.join(".ssh"))
@@ -5765,7 +5955,7 @@ impl Workspace {
     fn build_network_conn_from_modal(
         &self,
         cx: &Context<Self>,
-    ) -> Result<(NetworkConnection, String), String> {
+    ) -> Result<(NetworkConnection, String, String), String> {
         let Some(ActiveModal::NetworkConnect(ref form)) = self.active_modal else {
             return Err("No active network form.".to_string());
         };
@@ -5795,6 +5985,7 @@ impl Workspace {
         let name = form.name_input.read(cx).value().trim().to_string();
         let username = form.username_input.read(cx).value().trim().to_string();
         let password = form.password_input.read(cx).value().to_string();
+        let sudo_password = form.sudo_password_input.read(cx).value().to_string();
         let remote_path = normalize_remote_path(form.remote_path_input.read(cx).value().trim());
         let key_str = form.key_path_input.read(cx).value().trim().to_string();
         let private_key_path = if form.protocol == NetworkProtocol::Sftp
@@ -5805,6 +5996,7 @@ impl Workspace {
         } else {
             None
         };
+        let sftp_sudo = form.protocol == NetworkProtocol::Sftp && form.sftp_sudo;
 
         let conn = NetworkConnection {
             id: form.editing_id.unwrap_or_else(Uuid::new_v4),
@@ -5816,13 +6008,14 @@ impl Workspace {
             remote_path,
             auth_mode: form.auth_mode,
             private_key_path,
+            sftp_sudo,
             save_password: true,
         };
-        Ok((conn, password))
+        Ok((conn, password, sudo_password))
     }
 
     pub fn test_network_modal_connection(&mut self, cx: &mut Context<Self>) {
-        let (conn, password) = match self.build_network_conn_from_modal(cx) {
+        let (conn, password, sudo_password) = match self.build_network_conn_from_modal(cx) {
             Ok(v) => v,
             Err(err) => {
                 if let Some(ActiveModal::NetworkConnect(ref mut form)) = self.active_modal {
@@ -5865,6 +6058,7 @@ impl Workspace {
                 _ => {
                     let creds = RemoteCredentials {
                         password: (!password.is_empty()).then_some(password),
+                        sudo_password: (!sudo_password.is_empty()).then_some(sudo_password),
                     };
                     pool.test_connection(&conn, &creds).await
                 }
@@ -5878,7 +6072,7 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let (conn, password) = match self.build_network_conn_from_modal(cx) {
+        let (conn, password, sudo_password) = match self.build_network_conn_from_modal(cx) {
             Ok(v) => v,
             Err(err) => {
                 if let Some(ActiveModal::NetworkConnect(ref mut form)) = self.active_modal {
@@ -5904,6 +6098,19 @@ impl Workspace {
         } else if !conn.save_password {
             self.session_passwords.remove(&conn.id);
             let _ = delete_network_password(&conn.id.to_string());
+        }
+
+        let sudo_cred_key = format!("{}:sudo", conn.id);
+        if conn.sftp_sudo && !sudo_password.is_empty() {
+            self.session_sudo_passwords
+                .insert(conn.id, sudo_password.clone());
+            if let Err(err) = save_network_password(&sudo_cred_key, &conn.username, &sudo_password)
+            {
+                self.show_toast(err, ToastKind::Error, window, cx);
+            }
+        } else {
+            self.session_sudo_passwords.remove(&conn.id);
+            let _ = delete_network_password(&sudo_cred_key);
         }
 
         self.settings.upsert_network_connection(conn.clone());
@@ -6095,7 +6302,9 @@ impl Workspace {
         if self.settings.remove_network_connection(id) {
             let _ = self.settings.save();
             self.session_passwords.remove(&id);
+            self.session_sudo_passwords.remove(&id);
             let _ = delete_network_password(&id.to_string());
+            let _ = delete_network_password(&format!("{id}:sudo"));
             let pool = self.remote_pool.clone();
             tokio_runtime().spawn(async move {
                 pool.disconnect(id).await;
@@ -6995,6 +7204,53 @@ fn filter_effective_transfer_sources(
         .collect()
 }
 
+/// Resolves the transfer kind and effective source paths for an incoming native OLE drop.
+///
+/// Guarantees that dragging a file out of TExplorer (e.g. over Chrome) and bringing it back to
+/// drop onto its own folder never duplicates the file unless `Ctrl` is explicitly held, while
+/// still allowing drops into subfolders, the opposite split pane, and WinRAR/7-Zip extracts.
+fn resolve_native_drop_transfer(
+    sources: Vec<PathBuf>,
+    dest_dir: &Path,
+    from_self_drag: bool,
+    ctrl_held: bool,
+    has_stage_dir: bool,
+) -> Option<(TransferKind, Vec<PathBuf>)> {
+    if sources.is_empty() {
+        return None;
+    }
+    let kind = if from_self_drag && !has_stage_dir {
+        if ctrl_held || !same_volume(&sources[0], dest_dir) {
+            TransferKind::Copy
+        } else {
+            TransferKind::Move
+        }
+    } else {
+        TransferKind::Copy
+    };
+
+    let filtered: Vec<PathBuf> = if !has_stage_dir && !ctrl_held {
+        sources
+            .into_iter()
+            .filter(|src| {
+                let Some(name) = src.file_name() else {
+                    return false;
+                };
+                !paths_same(src, &dest_dir.join(name))
+            })
+            .collect()
+    } else {
+        sources
+    };
+
+    let effective = filter_effective_transfer_sources(kind, filtered, dest_dir, true);
+    if effective.is_empty() {
+        None
+    } else {
+        Some((kind, effective))
+    }
+}
+
 /// Returns `true` when dropping `sources` into `dest_dir` via internal drag-and-drop
 /// would actually move or copy at least one item.
 pub fn is_valid_internal_drop_target(sources: &[PathBuf], dest_dir: &Path) -> bool {
@@ -7101,6 +7357,7 @@ impl Render for Workspace {
             .text_color(solid(p.text_primary))
             .overflow_hidden()
             .on_key_down(cx.listener(Self::handle_key_down))
+            .on_drag_move::<DraggedEntries>(cx.listener(Self::handle_entries_drag_move))
             .on_mouse_move(cx.listener(Self::handle_mouse_move))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::handle_mouse_up))
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::handle_mouse_up))
@@ -7639,6 +7896,41 @@ fn compute_marquee_hits(
 #[cfg(test)]
 mod transfer_drop_tests {
     use super::*;
+
+    #[test]
+    fn native_drop_never_duplicates_file_dragged_back_into_same_folder() {
+        let dir = PathBuf::from(r"C:\Photos");
+        let img = PathBuf::from(r"C:\Photos\20260912_175648.jpg");
+        let sub = PathBuf::from(r"C:\Photos\Subfolder");
+        let other_drive = PathBuf::from(r"D:\Backup");
+
+        // Dragged out of TExplorer (e.g. toward Chrome) and dropped back into the same folder:
+        // must be a complete no-op instead of creating `... (2).jpg`.
+        assert_eq!(
+            resolve_native_drop_transfer(vec![img.clone()], &dir, true, false, false),
+            None
+        );
+        // Same-folder drop from another window without Ctrl: also a no-op.
+        assert_eq!(
+            resolve_native_drop_transfer(vec![img.clone()], &dir, false, false, false),
+            None
+        );
+        // Explicit Ctrl+Drag copy into same folder is allowed.
+        assert_eq!(
+            resolve_native_drop_transfer(vec![img.clone()], &dir, true, true, false),
+            Some((TransferKind::Copy, vec![img.clone()]))
+        );
+        // Dropping self-drag into a subfolder on the same drive moves it.
+        assert_eq!(
+            resolve_native_drop_transfer(vec![img.clone()], &sub, true, false, false),
+            Some((TransferKind::Move, vec![img.clone()]))
+        );
+        // Dropping self-drag onto another drive copies it.
+        assert_eq!(
+            resolve_native_drop_transfer(vec![img.clone()], &other_drive, true, false, false),
+            Some((TransferKind::Copy, vec![img]))
+        );
+    }
 
     #[test]
     fn marquee_selects_items_dragging_upward_in_details_and_grid() {

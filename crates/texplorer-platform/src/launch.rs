@@ -425,34 +425,119 @@ pub fn show_properties_dialog(path: &Path) -> Result<(), String> {
 }
 
 /// Moves one or more files/folders to the OS Recycle Bin / Trash.
+///
+/// On Windows, if the standard non-elevated deletion fails with `Access is denied` (e.g. inside
+/// `C:\Program Files`), automatically retries remaining items via an elevated `IFileOperation`
+/// triggering a single native Windows UAC prompt.
 pub fn move_to_trash(paths: &[PathBuf]) -> Result<(), String> {
     if paths.is_empty() {
         return Ok(());
     }
-    trash::delete_all(paths).map_err(|e| format!("Failed to move items to Recycle Bin: {e}"))
+    match trash::delete_all(paths) {
+        Ok(()) => Ok(()),
+        Err(err) => {
+            let err_str = err.to_string();
+            if !crate::is_elevated() && crate::is_access_denied_message(&err_str) {
+                let remaining: Vec<PathBuf> = paths
+                    .iter()
+                    .filter(|p| p.symlink_metadata().is_ok())
+                    .cloned()
+                    .collect();
+                if remaining.is_empty() {
+                    return Ok(());
+                }
+                return crate::elevated_delete_paths(&remaining, true)
+                    .map_err(crate::ElevatedOpError::into_message);
+            }
+            Err(format!("Failed to move items to Recycle Bin: {err_str}"))
+        }
+    }
 }
 
-/// Permanently removes a file, symlink, or directory iteratively without following symlinks/junctions.
+enum DeleteRawError {
+    PermissionDenied(String),
+    Other(String),
+}
+
+/// Permanently removes a single file, symlink, or directory iteratively without following symlinks,
+/// falling back to an elevated Windows UAC `IFileOperation` on `Access is denied`.
 pub fn delete_permanently(path: &Path) -> Result<(), String> {
+    delete_permanently_batch(std::slice::from_ref(&path.to_path_buf()))
+}
+
+/// Permanently removes a batch of local paths, consolidating any `Access is denied` items into a
+/// single elevated Windows UAC `IFileOperation` prompt.
+pub fn delete_permanently_batch(paths: &[PathBuf]) -> Result<(), String> {
+    let mut denied_paths: Vec<PathBuf> = Vec::new();
+    let mut first_denied_msg: Option<String> = None;
+    let mut first_other_err: Option<String> = None;
+
+    for path in paths {
+        match delete_permanently_local_raw(path) {
+            Ok(()) => {}
+            Err(DeleteRawError::PermissionDenied(msg)) => {
+                if first_denied_msg.is_none() {
+                    first_denied_msg = Some(msg);
+                }
+                denied_paths.push(path.clone());
+            }
+            Err(DeleteRawError::Other(msg)) => {
+                if first_other_err.is_none() {
+                    first_other_err = Some(msg);
+                }
+            }
+        }
+    }
+
+    if !denied_paths.is_empty() {
+        if !crate::is_elevated() {
+            let remaining: Vec<PathBuf> = denied_paths
+                .into_iter()
+                .filter(|p| p.symlink_metadata().is_ok())
+                .collect();
+            if !remaining.is_empty() {
+                crate::elevated_delete_paths(&remaining, false)
+                    .map_err(crate::ElevatedOpError::into_message)?;
+            }
+        } else if let Some(msg) = first_denied_msg {
+            return Err(msg);
+        }
+    }
+
+    match first_other_err {
+        Some(err) => Err(err),
+        None => Ok(()),
+    }
+}
+
+fn delete_permanently_local_raw(path: &Path) -> Result<(), DeleteRawError> {
     let mut stack: Vec<(PathBuf, bool)> = vec![(path.to_path_buf(), false)];
     while let Some((cur, ready)) = stack.pop() {
         if ready {
             remove_dir_readonly(&cur)?;
             continue;
         }
-        let meta = std::fs::symlink_metadata(&cur)
-            .map_err(|e| format!("Failed to inspect \"{}\": {e}", cur.display()))?;
+        let meta = std::fs::symlink_metadata(&cur).map_err(|e| {
+            classify_io_delete_err(format!("Failed to inspect \"{}\": {e}", cur.display()), &e)
+        })?;
         let ft = meta.file_type();
         if ft.is_symlink() {
-            if std::fs::remove_file(&cur).is_err() {
-                remove_dir_readonly(&cur)?;
+            if let Err(file_err) = std::fs::remove_file(&cur)
+                && remove_dir_readonly(&cur).is_err()
+            {
+                return Err(classify_io_delete_err(
+                    format!("Failed to delete \"{}\": {file_err}", cur.display()),
+                    &file_err,
+                ));
             }
         } else if ft.is_dir() {
             stack.push((cur.clone(), true));
-            for entry in std::fs::read_dir(&cur)
-                .map_err(|e| format!("Failed to read \"{}\": {e}", cur.display()))?
-            {
-                let entry = entry.map_err(|e| format!("Failed enumerating directory: {e}"))?;
+            for entry in std::fs::read_dir(&cur).map_err(|e| {
+                classify_io_delete_err(format!("Failed to read \"{}\": {e}", cur.display()), &e)
+            })? {
+                let entry = entry.map_err(|e| {
+                    classify_io_delete_err(format!("Failed enumerating directory: {e}"), &e)
+                })?;
                 stack.push((entry.path(), false));
             }
         } else {
@@ -460,6 +545,14 @@ pub fn delete_permanently(path: &Path) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+fn classify_io_delete_err(msg: String, err: &std::io::Error) -> DeleteRawError {
+    if err.kind() == std::io::ErrorKind::PermissionDenied || err.raw_os_error() == Some(5) {
+        DeleteRawError::PermissionDenied(msg)
+    } else {
+        DeleteRawError::Other(msg)
+    }
 }
 
 fn clear_readonly(path: &Path) {
@@ -473,27 +566,38 @@ fn clear_readonly(path: &Path) {
     }
 }
 
-fn remove_file_readonly(path: &Path) -> Result<(), String> {
+fn remove_file_readonly(path: &Path) -> Result<(), DeleteRawError> {
     match std::fs::remove_file(path) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
             clear_readonly(path);
-            std::fs::remove_file(path)
-                .map_err(|err| format!("Failed to delete \"{}\": {err}", path.display()))
+            std::fs::remove_file(path).map_err(|err| {
+                classify_io_delete_err(format!("Failed to delete \"{}\": {err}", path.display()), &err)
+            })
         }
-        Err(e) => Err(format!("Failed to delete \"{}\": {e}", path.display())),
+        Err(e) => Err(classify_io_delete_err(
+            format!("Failed to delete \"{}\": {e}", path.display()),
+            &e,
+        )),
     }
 }
 
-fn remove_dir_readonly(path: &Path) -> Result<(), String> {
+fn remove_dir_readonly(path: &Path) -> Result<(), DeleteRawError> {
     match std::fs::remove_dir(path) {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
             clear_readonly(path);
-            std::fs::remove_dir(path)
-                .map_err(|err| format!("Failed to delete folder \"{}\": {err}", path.display()))
+            std::fs::remove_dir(path).map_err(|err| {
+                classify_io_delete_err(
+                    format!("Failed to delete folder \"{}\": {err}", path.display()),
+                    &err,
+                )
+            })
         }
-        Err(e) => Err(format!("Failed to delete folder \"{}\": {e}", path.display())),
+        Err(e) => Err(classify_io_delete_err(
+            format!("Failed to delete folder \"{}\": {e}", path.display()),
+            &e,
+        )),
     }
 }
 

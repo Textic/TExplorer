@@ -28,12 +28,14 @@ pub struct NetworkConnectModalState {
     pub editing_id: Option<Uuid>,
     pub protocol: NetworkProtocol,
     pub auth_mode: SshAuthMode,
+    pub sftp_sudo: bool,
     pub name_input: Entity<InputState>,
     pub host_input: Entity<InputState>,
     pub port_input: Entity<InputState>,
     pub remote_path_input: Entity<InputState>,
     pub username_input: Entity<InputState>,
     pub password_input: Entity<InputState>,
+    pub sudo_password_input: Entity<InputState>,
     pub key_path_input: Entity<InputState>,
     pub busy: bool,
     pub status_message: Option<String>,
@@ -388,6 +390,91 @@ pub fn render_network_connect_modal(
                                             })),
                                     ),
                             ),
+                    )
+                })
+                // SFTP root elevation via sudo (`sudo sftp-server`)
+                .when(is_sftp, |el| {
+                    let sudo_on = form.sftp_sudo;
+                    el.child(
+                        v_flex()
+                            .w_full()
+                            .gap_2()
+                            .child(
+                                h_flex()
+                                    .w_full()
+                                    .px_2p5()
+                                    .py_2()
+                                    .items_center()
+                                    .justify_between()
+                                    .gap_3()
+                                    .rounded(px(RADIUS_CONTROL))
+                                    .bg(solid(p.bg_base))
+                                    .border_1()
+                                    .border_color(if sudo_on {
+                                        solid(p.accent_primary)
+                                    } else {
+                                        solid(p.border_subtle)
+                                    })
+                                    .child(
+                                        v_flex()
+                                            .flex_1()
+                                            .min_w_0()
+                                            .gap(px(1.))
+                                            .child(
+                                                div()
+                                                    .text_xs()
+                                                    .font_medium()
+                                                    .text_color(solid(p.text_primary))
+                                                    .child("Elevate with sudo (root SFTP)"),
+                                            )
+                                            .child(
+                                                div()
+                                                    .text_size(px(11.5))
+                                                    .text_color(solid(p.text_muted))
+                                                    .child("Access /root, /etc, and protected folders via sudo sftp-server."),
+                                            ),
+                                    )
+                                    .child(
+                                        div()
+                                            .id("net-sftp-sudo-toggle")
+                                            .flex_shrink_0()
+                                            .px_2p5()
+                                            .py_1()
+                                            .rounded(px(RADIUS_CONTROL))
+                                            .cursor_pointer()
+                                            .bg(if sudo_on {
+                                                soft_tint(p.accent_primary, 0.16)
+                                            } else {
+                                                solid(p.bg_elevated)
+                                            })
+                                            .border_1()
+                                            .border_color(if sudo_on {
+                                                solid(p.accent_primary)
+                                            } else {
+                                                solid(p.border)
+                                            })
+                                            .text_xs()
+                                            .font_medium()
+                                            .text_color(if sudo_on {
+                                                solid(p.accent_primary)
+                                            } else {
+                                                solid(p.text_secondary)
+                                            })
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.toggle_network_modal_sftp_sudo(cx);
+                                            }))
+                                            .child(if sudo_on { "Enabled" } else { "Off" }),
+                                    ),
+                            )
+                            .when(sudo_on && is_key_auth, |inner| {
+                                inner.child(labeled_input_row(
+                                    "Sudo Password (optional — leave empty if NOPASSWD)",
+                                    "net-in-sudopass",
+                                    &form.sudo_password_input,
+                                    true,
+                                    p,
+                                ))
+                            }),
                     )
                 })
                 // Status / error feedback banner

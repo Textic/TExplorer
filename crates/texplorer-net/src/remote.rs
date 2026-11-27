@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, UNIX_EPOCH};
 
+use russh::{Channel, ChannelMsg};
 use russh::client::{self, Handle};
 use russh::keys::{PrivateKeyWithHashAlg, load_secret_key};
 use russh_sftp::client::SftpSession;
@@ -25,6 +26,9 @@ use uuid::Uuid;
 #[derive(Debug, Clone, Default)]
 pub struct RemoteCredentials {
     pub password: Option<String>,
+    /// Optional separate sudo password used when `sftp_sudo` is enabled alongside SSH key auth.
+    /// When `auth_mode == Password`, `password` is automatically reused if `sudo_password` is unset.
+    pub sudo_password: Option<String>,
 }
 
 struct SshClientHandler;
@@ -633,13 +637,118 @@ impl RemoteClientPool {
 
 fn endpoint_signature(conn: &NetworkConnection) -> String {
     format!(
-        "{}:{}:{}:{:?}:{:?}",
+        "{}:{}:{}:{:?}:{:?}:sudo={}",
         conn.host.trim(),
         conn.port,
         conn.username.trim(),
         conn.auth_mode,
-        conn.private_key_path
+        conn.private_key_path,
+        conn.sftp_sudo
     )
+}
+
+/// Parses the `<sftp_server_path>|<0_or_1>` line returned by the remote SFTP sudo discovery probe.
+/// Strictly validates the path characters to prevent any shell injection.
+fn parse_sftp_sudo_probe(raw: &str) -> Result<(String, bool), String> {
+    let line = raw
+        .lines()
+        .rev()
+        .find(|l| l.contains('|'))
+        .unwrap_or(raw)
+        .trim();
+    let Some((path_raw, flag_raw)) = line.rsplit_once('|') else {
+        return Err("Unexpected response while locating remote sftp-server.".to_string());
+    };
+    let path = path_raw.trim();
+    if path.is_empty() {
+        return Err(
+            "Could not locate the `sftp-server` binary on the remote host for sudo elevation."
+                .to_string(),
+        );
+    }
+    if !path.starts_with('/')
+        || !path
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'/' | b'.' | b'_' | b'-'))
+    {
+        return Err(format!("Refusing unsafe remote sftp-server path: \"{path}\""));
+    }
+    let nopasswd = flag_raw.trim() == "1";
+    Ok((path.to_string(), nopasswd))
+}
+
+async fn run_ssh_probe(handle: &Handle<SshClientHandler>, command: &str) -> Result<String, String> {
+    let mut channel = handle
+        .channel_open_session()
+        .await
+        .map_err(|e| format!("Failed opening SSH probe channel: {e}"))?;
+    channel
+        .exec(true, command)
+        .await
+        .map_err(|e| format!("Failed executing remote sudo probe: {e}"))?;
+
+    let mut out = Vec::new();
+    let deadline = tokio::time::sleep(Duration::from_secs(6));
+    tokio::pin!(deadline);
+    loop {
+        tokio::select! {
+            _ = &mut deadline => {
+                let _ = channel.close().await;
+                return Err("Timed out probing remote sftp-server / sudo capabilities.".to_string());
+            }
+            msg = channel.wait() => {
+                match msg {
+                    Some(ChannelMsg::Data { data }) => out.extend_from_slice(&data),
+                    Some(ChannelMsg::Close) | None => break,
+                    _ => {}
+                }
+            }
+        }
+    }
+    Ok(String::from_utf8_lossy(&out).trim().to_string())
+}
+
+async fn open_sudo_sftp_channel(
+    handle: &Handle<SshClientHandler>,
+    sudo_password: Option<&str>,
+) -> Result<Channel<client::Msg>, String> {
+    const PROBE_CMD: &str = "S=''; for p in /usr/lib/openssh/sftp-server /usr/libexec/openssh/sftp-server /usr/lib/ssh/sftp-server /usr/libexec/ssh/sftp-server /usr/libexec/sftp-server; do if [ -x \"$p\" ]; then S=\"$p\"; break; fi; done; if [ -z \"$S\" ]; then S=$(command -v sftp-server 2>/dev/null || true); fi; if sudo -n true 2>/dev/null; then N=1; else N=0; fi; printf '%s|%s\\n' \"$S\" \"$N\"";
+
+    let probe_out = run_ssh_probe(handle, PROBE_CMD).await?;
+    let (sftp_server_path, nopasswd) = parse_sftp_sudo_probe(&probe_out)?;
+
+    let channel = handle
+        .channel_open_session()
+        .await
+        .map_err(|e| format!("Failed opening elevated SSH session channel: {e}"))?;
+
+    if nopasswd {
+        channel
+            .exec(true, format!("exec sudo -n {sftp_server_path}"))
+            .await
+            .map_err(|e| format!("Failed starting elevated SFTP server (`sudo -n`): {e}"))?;
+        return Ok(channel);
+    }
+
+    let Some(pw) = sudo_password.filter(|s| !s.is_empty()) else {
+        return Err(
+            "Remote sudo requires a password. Enter a Sudo Password in Edit Connection (or configure NOPASSWD in sudoers)."
+                .to_string(),
+        );
+    };
+
+    channel
+        .exec(true, format!("exec sudo -S -p '' {sftp_server_path}"))
+        .await
+        .map_err(|e| format!("Failed starting elevated SFTP server (`sudo -S`): {e}"))?;
+    let mut pw_line = String::with_capacity(pw.len() + 1);
+    pw_line.push_str(pw);
+    pw_line.push('\n');
+    channel
+        .data(pw_line.as_bytes())
+        .await
+        .map_err(|e| format!("Failed sending sudo password to remote host: {e}"))?;
+    Ok(channel)
 }
 
 async fn establish_sftp_session(
@@ -719,17 +828,38 @@ async fn establish_sftp_session(
         ));
     }
 
-    let channel = handle
-        .channel_open_session()
-        .await
-        .map_err(|e| format!("Failed opening SSH session channel: {e}"))?;
-    channel
-        .request_subsystem(true, "sftp")
-        .await
-        .map_err(|e| format!("Server does not expose the SFTP subsystem: {e}"))?;
+    let channel = if conn.sftp_sudo {
+        let effective_sudo_pw = creds
+            .sudo_password
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .or_else(|| {
+                if conn.auth_mode == SshAuthMode::Password {
+                    creds.password.as_deref().filter(|s| !s.is_empty())
+                } else {
+                    None
+                }
+            });
+        open_sudo_sftp_channel(&handle, effective_sudo_pw).await?
+    } else {
+        let ch = handle
+            .channel_open_session()
+            .await
+            .map_err(|e| format!("Failed opening SSH session channel: {e}"))?;
+        ch.request_subsystem(true, "sftp")
+            .await
+            .map_err(|e| format!("Server does not expose the SFTP subsystem: {e}"))?;
+        ch
+    };
     let sftp = SftpSession::new(channel.into_stream())
         .await
-        .map_err(|e| format!("Failed initializing SFTP protocol: {e}"))?;
+        .map_err(|e| {
+            if conn.sftp_sudo {
+                format!("Failed initializing elevated (sudo) SFTP session — check sudo password or sudoers rules: {e}")
+            } else {
+                format!("Failed initializing SFTP protocol: {e}")
+            }
+        })?;
     sftp.set_timeout(20);
 
     Ok(CachedSftpSession {
@@ -1139,6 +1269,20 @@ mod tests {
         assert_eq!(entries.len(), 2);
         assert!(entries.iter().any(|e| e.name == "releases" && e.is_dir()));
         assert!(entries.iter().any(|e| e.name == "app.zip" && e.size == Some(4096)));
+    }
+
+    #[test]
+    fn parses_and_validates_sftp_sudo_probe_output() {
+        assert_eq!(
+            parse_sftp_sudo_probe("/usr/lib/openssh/sftp-server|1"),
+            Ok(("/usr/lib/openssh/sftp-server".to_string(), true))
+        );
+        assert_eq!(
+            parse_sftp_sudo_probe("MOTD line\n/usr/libexec/openssh/sftp-server|0\n"),
+            Ok(("/usr/libexec/openssh/sftp-server".to_string(), false))
+        );
+        assert!(parse_sftp_sudo_probe("|1").is_err());
+        assert!(parse_sftp_sudo_probe("/usr/bin/sftp-server; rm -rf /|1").is_err());
     }
 
     #[test]

@@ -13,12 +13,32 @@ pub struct RawBgraImage {
     pub bgra: Vec<u8>,
 }
 
+/// Target for native Windows Shell icon extraction (icon-only, never file content thumbnails).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum SystemIconRequest {
+    /// Specific local file or folder path (used for `.exe`, `.lnk`, `.ico`, `.url`, and
+    /// special/custom folders with `READONLY` or `SYSTEM` attributes).
+    Path(PathBuf),
+    /// Generic registered Windows file-type icon by extension (lowercased without leading dot;
+    /// empty string = extensionless file). Uses `SHGFI_USEFILEATTRIBUTES` without touching disk,
+    /// enabling instant caching across thousands of files and remote/archive listings.
+    Extension(String),
+    /// Generic Windows folder icon (`FILE_ATTRIBUTE_DIRECTORY` + `SHGFI_USEFILEATTRIBUTES`).
+    GenericFolder,
+}
+
 type ThumbCallback = Box<dyn FnOnce(Option<RawBgraImage>) + Send>;
 type MenuCallback = Box<dyn FnOnce(Result<(), String>) + Send>;
 
 enum ShellJob {
     Thumbnail {
         path: PathBuf,
+        size_px: i32,
+        allow_icon_fallback: bool,
+        on_ready: ThumbCallback,
+    },
+    SystemIcon {
+        target: SystemIconRequest,
         size_px: i32,
         on_ready: ThumbCallback,
     },
@@ -64,9 +84,18 @@ impl ShellWorker {
                         ShellJob::Thumbnail {
                             path,
                             size_px,
+                            allow_icon_fallback,
                             on_ready,
                         } => {
-                            let img = extract_shell_thumbnail(&path, size_px);
+                            let img = extract_shell_thumbnail(&path, size_px, allow_icon_fallback);
+                            on_ready(img);
+                        }
+                        ShellJob::SystemIcon {
+                            target,
+                            size_px,
+                            on_ready,
+                        } => {
+                            let img = extract_system_icon(&target, size_px);
                             on_ready(img);
                         }
                         ShellJob::NativeContextMenu {
@@ -105,15 +134,32 @@ impl ShellWorker {
         Self { tx }
     }
 
-    /// Queues an asynchronous native Shell thumbnail/icon lookup for `path`.
+    /// Queues an asynchronous native Shell thumbnail lookup for `path`
+    /// (optionally falling back to the item's Shell icon when no content thumbnail exists).
     pub fn request_thumbnail(
         &self,
         path: PathBuf,
         size_px: i32,
+        allow_icon_fallback: bool,
         on_ready: impl FnOnce(Option<RawBgraImage>) + Send + 'static,
     ) {
         let _ = self.tx.send(ShellJob::Thumbnail {
             path,
+            size_px,
+            allow_icon_fallback,
+            on_ready: Box::new(on_ready),
+        });
+    }
+
+    /// Queues an asynchronous native Windows system icon lookup (icon-only, never content thumbnail).
+    pub fn request_system_icon(
+        &self,
+        target: SystemIconRequest,
+        size_px: i32,
+        on_ready: impl FnOnce(Option<RawBgraImage>) + Send + 'static,
+    ) {
+        let _ = self.tx.send(ShellJob::SystemIcon {
+            target,
             size_px,
             on_ready: Box::new(on_ready),
         });
@@ -183,50 +229,74 @@ pub fn cursor_screen_pos() -> (i32, i32) {
     }
 }
 
+/// Unpremultiplies 32-bit BGRA pixels in place when the bitmap carries valid premultiplied alpha
+/// (`b <= a && g <= a && r <= a` for all pixels), matching GPUI's straight-alpha sprite blending.
+fn unpremultiply_bgra_if_valid(bgra: &mut [u8]) {
+    let mut has_semi_transparent = false;
+    for px in bgra.as_chunks::<4>().0 {
+        let a = px[3];
+        if px[0] > a || px[1] > a || px[2] > a {
+            return;
+        }
+        if a > 0 && a < 255 {
+            has_semi_transparent = true;
+        }
+    }
+    if !has_semi_transparent {
+        return;
+    }
+    for px in bgra.as_chunks_mut::<4>().0 {
+        let a = px[3] as u16;
+        if a > 0 && a < 255 {
+            let half = a / 2;
+            px[0] = (((px[0] as u16) * 255 + half) / a).min(255) as u8;
+            px[1] = (((px[1] as u16) * 255 + half) / a).min(255) as u8;
+            px[2] = (((px[2] as u16) * 255 + half) / a).min(255) as u8;
+        }
+    }
+}
+
 #[cfg(target_os = "windows")]
-fn extract_shell_thumbnail(path: &std::path::Path, size_px: i32) -> Option<RawBgraImage> {
-    use std::os::windows::ffi::OsStrExt;
-    use windows::Win32::Foundation::SIZE;
-    use windows::Win32::Graphics::Gdi::{
-        BI_RGB, BITMAP, BITMAPINFO, BITMAPINFOHEADER, CreateCompatibleDC, DIB_RGB_COLORS,
-        DeleteDC, DeleteObject, GetDIBits, GetObjectW, HBITMAP,
-    };
-    use windows::Win32::UI::Shell::{
-        IShellItemImageFactory, SHCreateItemFromParsingName, SIIGBF_BIGGERSIZEOK, SIIGBF_ICONONLY,
-        SIIGBF_THUMBNAILONLY,
-    };
-    use windows::core::PCWSTR;
+struct BitmapGuard(windows::Win32::Graphics::Gdi::HBITMAP);
 
-    let wide: Vec<u16> = path
-        .as_os_str()
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect();
-
-    let factory: IShellItemImageFactory =
-        unsafe { SHCreateItemFromParsingName(PCWSTR(wide.as_ptr()), None).ok()? };
-    let target_size = SIZE {
-        cx: size_px,
-        cy: size_px,
-    };
-
-    // Try rich thumbnail first (videos, photos, PDFs), then fall back to crisp Shell icon.
-    let hbitmap: HBITMAP = unsafe {
-        factory
-            .GetImage(target_size, SIIGBF_BIGGERSIZEOK | SIIGBF_THUMBNAILONLY)
-            .or_else(|_| factory.GetImage(target_size, SIIGBF_BIGGERSIZEOK | SIIGBF_ICONONLY))
-            .ok()?
-    };
-
-    struct BitmapGuard(HBITMAP);
-    impl Drop for BitmapGuard {
-        fn drop(&mut self) {
+#[cfg(target_os = "windows")]
+impl Drop for BitmapGuard {
+    fn drop(&mut self) {
+        if !self.0.is_invalid() {
             unsafe {
-                let _ = DeleteObject(self.0);
+                let _ = windows::Win32::Graphics::Gdi::DeleteObject(self.0);
             }
         }
     }
-    let _bmp_guard = BitmapGuard(hbitmap);
+}
+
+#[cfg(target_os = "windows")]
+struct IconGuard(windows::Win32::UI::WindowsAndMessaging::HICON);
+
+#[cfg(target_os = "windows")]
+impl Drop for IconGuard {
+    fn drop(&mut self) {
+        if !self.0.is_invalid() {
+            unsafe {
+                let _ = windows::Win32::UI::WindowsAndMessaging::DestroyIcon(self.0);
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn hbitmap_to_bgra(
+    hbitmap: windows::Win32::Graphics::Gdi::HBITMAP,
+    unpremultiply_alpha: bool,
+) -> Option<RawBgraImage> {
+    use windows::Win32::Graphics::Gdi::{
+        BI_RGB, BITMAP, BITMAPINFO, BITMAPINFOHEADER, CreateCompatibleDC, DIB_RGB_COLORS, DeleteDC,
+        GetDIBits, GetObjectW,
+    };
+
+    if hbitmap.is_invalid() {
+        return None;
+    }
 
     let mut bm = BITMAP::default();
     let got = unsafe {
@@ -287,6 +357,8 @@ fn extract_shell_thumbnail(path: &std::path::Path, size_px: i32) -> Option<RawBg
         for px in bgra.as_chunks_mut::<4>().0 {
             px[3] = 255;
         }
+    } else if unpremultiply_alpha {
+        unpremultiply_bgra_if_valid(&mut bgra);
     }
 
     Some(RawBgraImage {
@@ -296,8 +368,325 @@ fn extract_shell_thumbnail(path: &std::path::Path, size_px: i32) -> Option<RawBg
     })
 }
 
+#[cfg(target_os = "windows")]
+fn hicon_to_bgra(hicon: windows::Win32::UI::WindowsAndMessaging::HICON) -> Option<RawBgraImage> {
+    use windows::Win32::Graphics::Gdi::{
+        BI_RGB, BITMAP, BITMAPINFO, BITMAPINFOHEADER, CreateCompatibleDC, DIB_RGB_COLORS, DeleteDC,
+        GetDIBits, GetObjectW,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::{GetIconInfo, ICONINFO};
+
+    if hicon.is_invalid() {
+        return None;
+    }
+
+    let mut info = ICONINFO::default();
+    unsafe { GetIconInfo(hicon, &mut info).ok()? };
+    let _color_guard = BitmapGuard(info.hbmColor);
+    let _mask_guard = BitmapGuard(info.hbmMask);
+
+    if info.hbmColor.is_invalid() {
+        return None;
+    }
+
+    let mut bm = BITMAP::default();
+    let got = unsafe {
+        GetObjectW(
+            info.hbmColor,
+            std::mem::size_of::<BITMAP>() as i32,
+            Some(&mut bm as *mut BITMAP as *mut core::ffi::c_void),
+        )
+    };
+    if got == 0 || bm.bmWidth <= 0 || bm.bmHeight <= 0 {
+        return None;
+    }
+
+    let width = bm.bmWidth as u32;
+    let height = bm.bmHeight as u32;
+    let byte_len = (width as usize) * (height as usize) * 4;
+    let mut bgra = vec![0u8; byte_len];
+
+    let mut bmi = BITMAPINFO {
+        bmiHeader: BITMAPINFOHEADER {
+            biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+            biWidth: bm.bmWidth,
+            biHeight: -bm.bmHeight,
+            biPlanes: 1,
+            biBitCount: 32,
+            biCompression: BI_RGB.0,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    let hdc = unsafe { CreateCompatibleDC(None) };
+    if hdc.is_invalid() {
+        return None;
+    }
+    let scanlines = unsafe {
+        GetDIBits(
+            hdc,
+            info.hbmColor,
+            0,
+            height,
+            Some(bgra.as_mut_ptr() as *mut core::ffi::c_void),
+            &mut bmi,
+            DIB_RGB_COLORS,
+        )
+    };
+    if scanlines == 0 {
+        unsafe {
+            let _ = DeleteDC(hdc);
+        }
+        return None;
+    }
+
+    let any_alpha = bgra.as_chunks::<4>().0.iter().any(|px| px[3] != 0);
+    if !any_alpha {
+        // Legacy 24-bit/8-bit/4-bit icon: reconstruct transparency from the monochrome AND mask.
+        let mut mask_applied = false;
+        if !info.hbmMask.is_invalid() {
+            let mut mask = vec![0u8; byte_len];
+            let mask_lines = unsafe {
+                GetDIBits(
+                    hdc,
+                    info.hbmMask,
+                    0,
+                    height,
+                    Some(mask.as_mut_ptr() as *mut core::ffi::c_void),
+                    &mut bmi,
+                    DIB_RGB_COLORS,
+                )
+            };
+            if mask_lines > 0 {
+                for (px, m) in bgra.as_chunks_mut::<4>().0.iter_mut().zip(mask.as_chunks::<4>().0) {
+                    if m[0] == 0 && m[1] == 0 && m[2] == 0 {
+                        px[3] = 255;
+                    } else {
+                        *px = [0, 0, 0, 0];
+                    }
+                }
+                mask_applied = true;
+            }
+        }
+        if !mask_applied {
+            for px in bgra.as_chunks_mut::<4>().0 {
+                px[3] = 255;
+            }
+        }
+    }
+
+    unsafe {
+        let _ = DeleteDC(hdc);
+    }
+
+    Some(RawBgraImage {
+        width,
+        height,
+        bgra,
+    })
+}
+
+#[cfg(target_os = "windows")]
+fn extract_shell_thumbnail(
+    path: &std::path::Path,
+    size_px: i32,
+    allow_icon_fallback: bool,
+) -> Option<RawBgraImage> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::Win32::Foundation::SIZE;
+    use windows::Win32::UI::Shell::{
+        IShellItemImageFactory, SHCreateItemFromParsingName, SIIGBF_BIGGERSIZEOK, SIIGBF_ICONONLY,
+        SIIGBF_THUMBNAILONLY,
+    };
+    use windows::core::PCWSTR;
+
+    let wide: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+
+    let factory: IShellItemImageFactory =
+        unsafe { SHCreateItemFromParsingName(PCWSTR(wide.as_ptr()), None).ok()? };
+    let target_size = SIZE {
+        cx: size_px,
+        cy: size_px,
+    };
+
+    let (hbitmap, is_icon_fallback) = match unsafe {
+        factory.GetImage(target_size, SIIGBF_BIGGERSIZEOK | SIIGBF_THUMBNAILONLY)
+    } {
+        Ok(bmp) => (bmp, false),
+        Err(_) if allow_icon_fallback => (
+            unsafe {
+                factory
+                    .GetImage(target_size, SIIGBF_BIGGERSIZEOK | SIIGBF_ICONONLY)
+                    .ok()?
+            },
+            true,
+        ),
+        Err(_) => return None,
+    };
+    let _bmp_guard = BitmapGuard(hbitmap);
+    hbitmap_to_bgra(hbitmap, is_icon_fallback)
+}
+
+#[cfg(target_os = "windows")]
+fn extract_shell_icon_by_attributes(
+    virtual_name: &str,
+    file_attrs: windows::Win32::Storage::FileSystem::FILE_FLAGS_AND_ATTRIBUTES,
+    size_px: i32,
+) -> Option<RawBgraImage> {
+    use windows::Win32::UI::Controls::{IImageList, ILD_TRANSPARENT};
+    use windows::Win32::UI::Shell::{
+        SHFILEINFOW, SHGFI_ICON, SHGFI_LARGEICON, SHGFI_SYSICONINDEX, SHGFI_USEFILEATTRIBUTES,
+        SHGetFileInfoW, SHGetImageList, SHIL_EXTRALARGE, SHIL_LARGE,
+    };
+    use windows::core::PCWSTR;
+
+    let wide: Vec<u16> = virtual_name
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+
+    // Primary: fetch the exact resolution icon from the Windows Shell system image list
+    // (`SHIL_LARGE` 32x32 for lists, `SHIL_EXTRALARGE` 48x48 for Grid/Inspector).
+    let mut shfi = SHFILEINFOW::default();
+    let idx_ok = unsafe {
+        SHGetFileInfoW(
+            PCWSTR(wide.as_ptr()),
+            file_attrs,
+            Some(&mut shfi),
+            std::mem::size_of::<SHFILEINFOW>() as u32,
+            SHGFI_USEFILEATTRIBUTES | SHGFI_SYSICONINDEX,
+        )
+    };
+    if idx_ok != 0 {
+        let shil = if size_px > 32 {
+            SHIL_EXTRALARGE as i32
+        } else {
+            SHIL_LARGE as i32
+        };
+        if let Ok(image_list) = unsafe { SHGetImageList::<IImageList>(shil) }
+            && let Ok(hicon) = unsafe { image_list.GetIcon(shfi.iIcon, ILD_TRANSPARENT.0) }
+        {
+            let _icon_guard = IconGuard(hicon);
+            if let Some(img) = hicon_to_bgra(hicon) {
+                return Some(img);
+            }
+        }
+    }
+
+    // Fallback: direct `SHGetFileInfoW` HICON handle.
+    let mut shfi_icon = SHFILEINFOW::default();
+    let icon_ok = unsafe {
+        SHGetFileInfoW(
+            PCWSTR(wide.as_ptr()),
+            file_attrs,
+            Some(&mut shfi_icon),
+            std::mem::size_of::<SHFILEINFOW>() as u32,
+            SHGFI_USEFILEATTRIBUTES | SHGFI_ICON | SHGFI_LARGEICON,
+        )
+    };
+    if icon_ok == 0 || shfi_icon.hIcon.is_invalid() {
+        return None;
+    }
+    let _icon_guard = IconGuard(shfi_icon.hIcon);
+    hicon_to_bgra(shfi_icon.hIcon)
+}
+
+#[cfg(target_os = "windows")]
+fn extract_shell_icon_for_path(path: &std::path::Path, size_px: i32) -> Option<RawBgraImage> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::Win32::Foundation::SIZE;
+    use windows::Win32::Storage::FileSystem::FILE_FLAGS_AND_ATTRIBUTES;
+    use windows::Win32::UI::Shell::{
+        IShellItemImageFactory, SHCreateItemFromParsingName, SHFILEINFOW, SHGFI_ICON,
+        SHGFI_LARGEICON, SHGetFileInfoW, SIIGBF_BIGGERSIZEOK, SIIGBF_ICONONLY,
+    };
+    use windows::core::PCWSTR;
+
+    let wide: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+
+    if let Ok(factory) =
+        unsafe { SHCreateItemFromParsingName::<_, _, IShellItemImageFactory>(PCWSTR(wide.as_ptr()), None) }
+    {
+        let target_size = SIZE {
+            cx: size_px,
+            cy: size_px,
+        };
+        if let Ok(hbitmap) =
+            unsafe { factory.GetImage(target_size, SIIGBF_BIGGERSIZEOK | SIIGBF_ICONONLY) }
+        {
+            let _bmp_guard = BitmapGuard(hbitmap);
+            if let Some(img) = hbitmap_to_bgra(hbitmap, true) {
+                return Some(img);
+            }
+        }
+    }
+
+    let mut shfi = SHFILEINFOW::default();
+    let ok = unsafe {
+        SHGetFileInfoW(
+            PCWSTR(wide.as_ptr()),
+            FILE_FLAGS_AND_ATTRIBUTES(0),
+            Some(&mut shfi),
+            std::mem::size_of::<SHFILEINFOW>() as u32,
+            SHGFI_ICON | SHGFI_LARGEICON,
+        )
+    };
+    if ok == 0 || shfi.hIcon.is_invalid() {
+        return None;
+    }
+    let _icon_guard = IconGuard(shfi.hIcon);
+    hicon_to_bgra(shfi.hIcon)
+}
+
+#[cfg(target_os = "windows")]
+fn extract_system_icon(target: &SystemIconRequest, size_px: i32) -> Option<RawBgraImage> {
+    use windows::Win32::Storage::FileSystem::{FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL};
+
+    match target {
+        SystemIconRequest::Path(path) => extract_shell_icon_for_path(path, size_px),
+        SystemIconRequest::Extension(ext) => {
+            let clean: String = ext
+                .trim()
+                .trim_start_matches('.')
+                .chars()
+                .filter(|c| {
+                    !matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' | '\0')
+                        && !c.is_control()
+                })
+                .collect();
+            let virtual_name = if clean.is_empty() {
+                "file".to_string()
+            } else {
+                format!("file.{clean}")
+            };
+            extract_shell_icon_by_attributes(&virtual_name, FILE_ATTRIBUTE_NORMAL, size_px)
+        }
+        SystemIconRequest::GenericFolder => {
+            extract_shell_icon_by_attributes("folder", FILE_ATTRIBUTE_DIRECTORY, size_px)
+        }
+    }
+}
+
 #[cfg(not(target_os = "windows"))]
-fn extract_shell_thumbnail(_path: &std::path::Path, _size_px: i32) -> Option<RawBgraImage> {
+fn extract_shell_thumbnail(
+    _path: &std::path::Path,
+    _size_px: i32,
+    _allow_icon_fallback: bool,
+) -> Option<RawBgraImage> {
+    None
+}
+
+#[cfg(not(target_os = "windows"))]
+fn extract_system_icon(_target: &SystemIconRequest, _size_px: i32) -> Option<RawBgraImage> {
     None
 }
 
@@ -623,4 +1012,66 @@ fn invoke_native_background_context_menu(
     _screen_y: i32,
 ) -> Result<(), String> {
     Err("Native Windows context menu is only supported on Windows.".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unpremultiplies_valid_premultiplied_bgra_and_leaves_straight_alpha_untouched() {
+        // Premultiplied 50% white (128, 128, 128, 128) -> straight white (255, 255, 255, 128).
+        let mut premul = vec![128, 128, 128, 128, 0, 0, 0, 0, 200, 100, 50, 255];
+        unpremultiply_bgra_if_valid(&mut premul);
+        assert_eq!(premul, vec![255, 255, 255, 128, 0, 0, 0, 0, 200, 100, 50, 255]);
+
+        // Straight alpha pixel with channel > alpha must NOT be modified.
+        let mut straight = vec![255, 200, 100, 128];
+        unpremultiply_bgra_if_valid(&mut straight);
+        assert_eq!(straight, vec![255, 200, 100, 128]);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn extracts_native_windows_system_icons_for_dll_folder_and_exe() {
+        let worker = ShellWorker::spawn();
+
+        let (tx_dll, rx_dll) = channel();
+        worker.request_system_icon(SystemIconRequest::Extension("dll".to_string()), 32, move |img| {
+            let _ = tx_dll.send(img);
+        });
+        let dll_img = rx_dll
+            .recv()
+            .expect("worker response")
+            .expect("Windows DLL icon should resolve");
+        assert!(dll_img.width >= 16 && dll_img.height >= 16);
+        assert_eq!(
+            dll_img.bgra.len(),
+            (dll_img.width as usize) * (dll_img.height as usize) * 4
+        );
+        assert!(dll_img.bgra.as_chunks::<4>().0.iter().any(|px| px[3] > 0));
+
+        let (tx_dir, rx_dir) = channel();
+        worker.request_system_icon(SystemIconRequest::GenericFolder, 48, move |img| {
+            let _ = tx_dir.send(img);
+        });
+        let dir_img = rx_dir
+            .recv()
+            .expect("worker response")
+            .expect("Windows generic folder icon should resolve");
+        assert!(dir_img.width >= 32 && dir_img.height >= 32);
+        assert!(dir_img.bgra.as_chunks::<4>().0.iter().any(|px| px[3] > 0));
+
+        if let Ok(exe) = std::env::current_exe() {
+            let (tx_exe, rx_exe) = channel();
+            worker.request_system_icon(SystemIconRequest::Path(exe), 32, move |img| {
+                let _ = tx_exe.send(img);
+            });
+            let exe_img = rx_exe
+                .recv()
+                .expect("worker response")
+                .expect("Windows per-file executable icon should resolve");
+            assert!(exe_img.width >= 16 && exe_img.height >= 16);
+        }
+    }
 }

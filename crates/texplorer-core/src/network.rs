@@ -93,6 +93,9 @@ pub struct NetworkConnection {
     pub remote_path: String,
     pub auth_mode: SshAuthMode,
     pub private_key_path: Option<PathBuf>,
+    /// When `true` on SFTP connections, launches `sftp-server` via `sudo` so root-owned paths
+    /// such as `/root` and `/etc` can be browsed without enabling direct root SSH login.
+    pub sftp_sudo: bool,
     pub save_password: bool,
 }
 
@@ -108,6 +111,7 @@ impl Default for NetworkConnection {
             remote_path: "/".to_string(),
             auth_mode: SshAuthMode::Password,
             private_key_path: None,
+            sftp_sudo: false,
             save_password: true,
         }
     }

@@ -831,6 +831,7 @@ fn render_network_connection_row(
     };
     let label: SharedString = conn.display_name().into();
     let badge = conn.protocol.short_badge();
+    let is_sudo_sftp = conn.protocol == NetworkProtocol::Sftp && conn.sftp_sudo;
     let conn_open = conn.clone();
     let conn_mid = conn.clone();
     let conn_ctx = conn.clone();
@@ -899,6 +900,22 @@ fn render_network_connection_row(
                     .flex_shrink_0()
                     .rounded(px(999.))
                     .bg(solid(p.status_success)),
+            )
+        })
+        .when(is_sudo_sftp, |el| {
+            el.child(
+                div()
+                    .flex_shrink_0()
+                    .px_1()
+                    .py(px(1.))
+                    .rounded(px(3.))
+                    .bg(soft_tint(p.accent_primary, 0.14))
+                    .border_1()
+                    .border_color(soft_tint(p.accent_primary, 0.35))
+                    .text_size(px(9.5))
+                    .font_semibold()
+                    .text_color(solid(p.accent_primary))
+                    .child("ROOT"),
             )
         })
         .child(
