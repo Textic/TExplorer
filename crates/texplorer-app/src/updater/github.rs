@@ -647,18 +647,26 @@ try {
         }
         Pump-Sleep 150
     }
-    # Stop the lightweight Win+E daemon and wait for all TExplorer processes from this install folder to exit.
+    # Stop the lightweight Win+E daemon and cleanly close any remaining TExplorer instances from this install folder.
     try {
         if ($targetExe -and (Test-Path -LiteralPath $targetExe)) {
             $stopProc = Start-Process -FilePath $targetExe -ArgumentList '--stop-win-e-daemon' -WindowStyle Hidden -PassThru
             if ($stopProc) { $null = $stopProc.WaitForExit(3000) }
         }
     } catch {}
-    for ($i = 0; $i -lt 40; $i++) {
+    try {
+        $remaining = @(Get-Process -Name 'texplorer' -ErrorAction SilentlyContinue | Where-Object {
+            try { (-not $_.Path) -or ($_.Path -ieq $targetExe) } catch { $true }
+        })
+        foreach ($p in $remaining) {
+            try { $null = $p.CloseMainWindow() } catch {}
+        }
+    } catch {}
+    for ($i = 0; $i -lt 15; $i++) {
         $others = @()
         try {
             $others = @(Get-Process -Name 'texplorer' -ErrorAction SilentlyContinue | Where-Object {
-                try { $_.Path -and ($_.Path -ieq $targetExe) } catch { $false }
+                try { (-not $_.Path) -or ($_.Path -ieq $targetExe) } catch { $true }
             })
         } catch {}
         if ($others.Count -eq 0) {
@@ -666,13 +674,21 @@ try {
         }
         Pump-Sleep 150
     }
-    Pump-Sleep 250
+    try {
+        $stubborn = @(Get-Process -Name 'texplorer' -ErrorAction SilentlyContinue | Where-Object {
+            try { (-not $_.Path) -or ($_.Path -ieq $targetExe) } catch { $true }
+        })
+        foreach ($p in $stubborn) {
+            try { Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue } catch {}
+        }
+    } catch {}
+    Pump-Sleep 300
 
     if ($mode -eq 'setup') {
         Set-ProgressUi "Installing TExplorer $newVersion..." 30
         $scopeArg = if ($allUsers -eq '1') { '/ALLUSERS' } else { '/CURRENTUSER' }
         $innoLog = Join-Path $stageDir 'inno-setup.log'
-        $argsLine = '/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /CLOSEAPPLICATIONS /NORESTARTAPPLICATIONS /SP- ' + $scopeArg + ' /DIR="' + $installDir + '" /LOG="' + $innoLog + '"'
+        $argsLine = '/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /CLOSEAPPLICATIONS /FORCECLOSEAPPLICATIONS /NORESTARTAPPLICATIONS /SP- ' + $scopeArg + ' /DIR="' + $installDir + '" /LOG="' + $innoLog + '"'
         if ($needsElevation -eq '1') {
             $detailLbl.Text = "Waiting for administrator approval (UAC) and installer..."
             [System.Windows.Forms.Application]::DoEvents()

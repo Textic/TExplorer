@@ -1,5 +1,5 @@
 #ifndef MyAppVersion
-  #define MyAppVersion "0.9.1"
+  #define MyAppVersion "0.9.2"
 #endif
 #ifndef BinaryPath
   #define BinaryPath "..\..\target\release\texplorer.exe"
@@ -11,7 +11,7 @@
   #define OutputDir "..\..\dist"
 #endif
 #ifndef OutputBaseFilename
-  #define OutputBaseFilename "texplorer-v0.9.1-windows-x86_64-setup"
+  #define OutputBaseFilename "texplorer-v0.9.2-windows-x86_64-setup"
 #endif
 
 [Setup]
@@ -38,7 +38,7 @@ LZMAUseSeparateProcess=yes
 LZMANumBlockThreads=4
 SolidCompression=yes
 WizardStyle=modern
-CloseApplications=yes
+CloseApplications=force
 RestartApplications=no
 VersionInfoVersion={#MyAppVersion}.0
 
@@ -79,6 +79,7 @@ function PrepareToInstall(var NeedsRestart: Boolean): String;
 var
   ExePath: String;
   ServicePath: String;
+  TaskkillPath: String;
   ResultCode: Integer;
 begin
   Result := '';
@@ -92,5 +93,13 @@ begin
   begin
     Exec(ServicePath, '--stop', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
   end;
-  Sleep(500);
+  Sleep(300);
+  { Ensure zero lingering texplorer.exe instances (secondary windows or elevated Win+E daemon)
+    remain open before RestartManager runs RmGetList/RmShutdown in /VERYSILENT updates. }
+  TaskkillPath := ExpandConstant('{sys}\taskkill.exe');
+  if FileExists(TaskkillPath) then
+  begin
+    Exec(TaskkillPath, '/F /IM texplorer.exe', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  end;
+  Sleep(400);
 end;
